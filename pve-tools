@@ -1,0 +1,2500 @@
+#!/bin/bash
+
+export LANG=en_US.UTF-8
+export LC_ALL=en_US.UTF-8
+export NCURSES_NO_UTF8_ACS=1
+
+# GLOBAL VARIABLES
+
+# Product information
+VENDOR="Open-E"
+PRODUCT="JovianDSS"
+
+CONFIG_DIR="/etc/$(basename "$0" .sh)"
+CONFIG_FILE="$CONFIG_DIR/config.conf"
+LOGS_DIR="/var/log/$(basename "$0" .sh)"
+LOG_FILE="$LOGS_DIR/$(basename "$0" .sh).log"
+
+# Script state variables
+selected_confs=()  # Array of selected config files
+selected_host=""
+selected_host_index=""
+current_step=1
+total_steps=3
+select_all_mode=false
+
+# Conflict resolution variables
+new_vmct_id=""
+conflict_selected_host=""
+
+# API configuration
+rest_api_user=admin
+rest_api_password=admin
+rest_api_port=82
+selected_nfs_ip=""
+
+# NFS wizard variables
+selected_pool=""
+selected_dataset=""
+selected_snapshot=""
+selected_nfs_ip_index=""
+selected_pool_index=""
+selected_dataset_index=""
+selected_snapshot_index=""
+nfs_current_step=1
+nfs_total_steps=5
+
+# LOGGING FUNCTIONS
+
+# Initialize logging system
+init_logging() {
+    if [ ! -d "$LOGS_DIR" ]; then
+        mkdir -p "$LOGS_DIR" || {
+            echo "Error: Cannot create log directory $LOGS_DIR" >&2
+            return 1
+        }
+    fi
+    
+    if [ ! -f "$LOG_FILE" ]; then
+        touch "$LOG_FILE" || {
+            echo "Error: Cannot create log file $LOG_FILE" >&2
+            return 1
+        }
+    fi
+    
+    return 0
+}
+
+# Base logging function with timestamp
+log() {
+    local level="$1"
+    local message="$2"
+    local timestamp
+    timestamp=$(date '+[%Y-%m-%d %H:%M:%S]')
+    
+    echo "${timestamp} ${level}: ${message}" >> "$LOG_FILE"
+}
+
+# Log info message
+log_info() {
+    log "INFO" "$1"
+}
+
+# Log error message
+log_error() {
+    log "ERROR" "$1"
+}
+
+# Log debug message
+log_debug() {
+    log "DEBUG" "$1"
+}
+
+# CONFIGURATION MANAGEMENT
+
+# Initialize configuration system
+init_config() {
+    log_info "Initializing configuration system"
+    
+    if [ ! -d "$CONFIG_DIR" ]; then
+        mkdir -p "$CONFIG_DIR" || {
+            log_error "Cannot create config directory $CONFIG_DIR"
+            return 1
+        }
+        log_info "Created config directory: $CONFIG_DIR"
+    fi
+
+    if [ ! -f "$CONFIG_FILE" ]; then
+        cat > "$CONFIG_FILE" << EOF
+rest_api_user=admin
+rest_api_password=admin
+rest_api_port=82
+EOF
+        log_info "Created default config file: $CONFIG_FILE"
+    fi
+
+    # Load configuration
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        log_info "Loaded configuration from $CONFIG_FILE"
+    else
+        log_error "Config file not found: $CONFIG_FILE"
+        return 1
+    fi
+}
+
+# UTILITY FUNCTIONS
+
+# Cleanup inactive NFS storage on all cluster nodes
+cleanup_inactive_nfs_storage() {
+    log_info "Starting NFS cleanup on all cluster nodes"
+    
+    dialog --infobox "Cleaning up inactive NFS storage on all nodes..." 5 60
+    sleep 1
+
+    # Get node list from corosync configuration
+    local node_list
+    node_list=$(awk '
+        $1 == "name:" {node=$2}
+        $1 == "ring0_addr:" {print node, $2}
+    ' /etc/pve/corosync.conf)
+    
+    if [ -z "$node_list" ]; then
+        log_error "No nodes found in corosync configuration"
+        dialog --msgbox "Error: No cluster nodes found" 8 40
+        return 1
+    fi
+    
+    log_info "Found cluster nodes: $(echo "$node_list" | wc -l) nodes"
+    
+    # Process each node
+    echo "$node_list" | while read -r node ip; do
+        log_info "Processing cleanup for node: $node ($ip)"
+        (
+        ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
+log_info() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $1"; }
+log_debug() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] DEBUG: $1"; }
+log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1"; }
+log_info "Running cleanup on remote node"
+
+# Get all mounted NFS directories
+all_nfs_mounts=$(mount | grep -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:/\S+\s.+\snfs\s' | awk '{print $3}' | sort)
+echo "$all_nfs_mounts" | while read -r mount; do
+done
+
+# Get active PVE storage mounts
+active_pve_mounts=$(pvesm status | awk '$2 == "nfs" && $3 == "active" {print "/mnt/pve/" $1}' | sort)
+echo "$active_pve_mounts" | while read -r mount; do
+done
+
+# Calculate inactive mounts
+inactive_mounts=$(comm -23 <(echo "$all_nfs_mounts") <(echo "$active_pve_mounts"))
+log_info "Inactive mounts to process: $(echo $inactive_mounts | wc -w) mounts"
+
+if [ -z "$inactive_mounts" ]; then
+  log_info "No inactive mounts found to clean up"
+else
+  echo "$inactive_mounts" | while read -r mount; do
+  done
+fi
+
+for mount_point in $inactive_mounts; do
+  [ -z "$mount_point" ] && continue
+  log_info "Processing mount point: $mount_point"
+  
+  # Check if mount point is actually mounted
+  if mount | grep -q "$mount_point"; then
+    log_info "Unmounting $mount_point"
+    if umount "$mount_point"; then
+      log_info "Unmounted: $mount_point"
+    else
+      log_error "Failed to unmount: $mount_point"
+      continue
+    fi
+  else
+  fi
+  
+  # Check if directory exists
+  if [ ! -d "$mount_point" ]; then
+    continue
+  fi
+  
+  # List directory contents for debugging
+  ls_output=$(ls -la "$mount_point" 2>&1)
+  if [ $? -eq 0 ]; then
+    echo "$ls_output" | while read -r line; do
+    done
+  else
+    log_error "Cannot list directory contents: $mount_point - $ls_output"
+  fi
+  
+  # Attempt to remove directory
+  log_info "Attempting to remove directory: $mount_point"
+  rmdir_output=$(rmdir "$mount_point" 2>&1)
+  rmdir_exit=$?
+  
+  if [ $rmdir_exit -eq 0 ]; then
+    log_info "Removed: $mount_point"
+  else
+    log_error "Failed to remove directory: $mount_point - $rmdir_output"
+    if [ -d "$mount_point" ]; then
+    fi
+  fi
+done
+
+# Also check for orphaned clone directories in /mnt/pve/
+log_info "Checking for orphaned clone directories in /mnt/pve/"
+pve_directories=$(find /mnt/pve/ -maxdepth 1 -type d -name "*clone*" 2>/dev/null | sort)
+
+echo "$pve_directories" | while read -r dir; do
+  [ -z "$dir" ] || [ "$dir" = "/mnt/pve/" ] && continue
+  
+  # Check if this directory is in active PVE storage
+  dir_name=$(basename "$dir")
+  is_active=false
+  echo "$active_pve_mounts" | while read -r active_mount; do
+    if [ "$(basename "$active_mount")" = "$dir_name" ]; then
+      is_active=true
+      break
+    fi
+  done
+  
+  if [ "$is_active" = "true" ]; then
+    continue
+  fi
+  
+  # Check if directory is currently mounted
+  if mount | grep -q "$dir"; then
+    log_info "Directory is mounted but not active, unmounting: $dir"
+    if umount "$dir"; then
+      log_info "Unmounted orphaned directory: $dir"
+    else
+      log_error "Failed to unmount orphaned directory: $dir"
+      continue
+    fi
+  else
+  fi
+  
+  # List directory contents for debugging
+  ls_output=$(ls -la "$dir" 2>&1)
+  if [ $? -eq 0 ]; then
+    echo "$ls_output" | while read -r line; do
+    done
+  else
+    log_error "Cannot list orphaned directory contents: $dir - $ls_output"
+  fi
+  
+  # Attempt to remove orphaned directory
+  log_info "Attempting to remove orphaned directory: $dir"
+  rmdir_output=$(rmdir "$dir" 2>&1)
+  rmdir_exit=$?
+  
+  if [ $rmdir_exit -eq 0 ]; then
+    log_info "Removed orphaned: $dir"
+  else
+    log_error "Failed to remove orphaned directory: $dir - $rmdir_output"
+    if [ -d "$dir" ]; then
+    fi
+  fi
+done
+ENDSCRIPT
+        ) >> "$LOGS_DIR/pve-nfs-cleanup-$node.log" 2>&1 &
+    done
+
+    wait
+    
+    log_info "NFS cleanup complete"
+    dialog --msgbox "Cleanup finished. Review $LOGS_DIR/pve-nfs-cleanup-*.log for details." 8 70
+}
+
+
+# Execute dialog menu and capture result
+dialog_menu() {
+    "${cmd[@]}" "${options[@]}" 2> "$dialog_selected"
+    dialog_exit_code=$?
+    selected_option=$(< "$dialog_selected")
+}
+
+# Show VM/CT conflict dialog and get user decision
+resolve_vmct_conflict() {
+    local vmid="$1"
+    local type="$2"
+    
+    if [ -z "$vmid" ] || [ -z "$type" ]; then
+        log_error "resolve_vmct_conflict: Missing required parameters"
+        return 1
+    fi
+    
+    log_info "Resolving VM/CT conflict for ID $vmid ($type)"
+    
+    local conflict_msg="VM/CT ID $vmid already exists in PVE repository!\n\n"
+    conflict_msg+="Choose an option:\n"
+    conflict_msg+="- Cancel: Skip this VM/CT restoration\n"
+    conflict_msg+="- New ID: Provide a different ID for restoration"
+    
+    dialog --keep-tite --title "VM/CT Conflict Detected" \
+           --yes-label "New ID" --no-label "Cancel" \
+           --yesno "$conflict_msg" 12 70
+    
+    local choice=$?
+    
+    
+    if [ $choice -eq 0 ]; then
+        # User chose "New ID", prompt for input
+        log_info "User chose New ID - prompting for input"
+        if get_new_vmct_id "$vmid" "$type"; then
+            log_info "User provided new ID: $new_vmct_id"
+            return 0
+        else
+            return 1
+        fi
+    else
+        # User chose "Cancel"
+        return 1
+    fi
+}
+
+# Get new VM/CT ID from user with validation
+get_new_vmct_id() {
+    local original_id="$1"
+    local type="$2"
+    local input_file=$(mktemp)
+    
+    log_info "Prompting user for new VM/CT ID for $type $original_id"
+    
+    while true; do
+        dialog --keep-tite --title "Enter New VM/CT ID" \
+               --ok-label "OK" --cancel-label "Cancel" \
+               --inputbox "Enter new ID for $type $original_id:" 8 50 2> "$input_file"
+        
+        local exit_code=$?
+        local user_input=$(cat "$input_file")
+        
+        
+        if [ $exit_code -ne 0 ]; then
+            # User cancelled
+            rm -f "$input_file"
+            return 1
+        fi
+        
+        # Validate input
+        if [[ ! "$user_input" =~ ^[0-9]+$ ]]; then
+            dialog --msgbox "Invalid input. Please enter a numeric ID." 8 40
+            continue
+        fi
+        
+        # Check if ID is already in use
+        if check_vmct_exists "$user_input"; then
+            dialog --msgbox "ID $user_input is already in use. Please choose another ID." 8 50
+            continue
+        fi
+        
+        # Valid new ID provided
+        new_vmct_id="$user_input"
+        rm -f "$input_file"
+        log_info "User provided new VM/CT ID: $new_vmct_id for original ID: $original_id"
+        return 0
+    done
+}
+
+# Select host for conflicting VM/CT restoration
+select_host_for_conflict() {
+    local vmid="$1"
+    local type="$2"
+    local line hosts=() menu_items=()
+    
+    if [ -z "$vmid" ] || [ -z "$type" ]; then
+        log_error "select_host_for_conflict: Missing required parameters"
+        return 1
+    fi
+    
+    log_info "Selecting host for conflicting VM/CT ID $vmid ($type)"
+    
+    # Get available hosts
+    while IFS= read -r line; do
+        hosts+=("$line")
+    done < <(get_ha_nodes)
+    
+    if [ "${#hosts[@]}" -eq 0 ]; then
+        dialog --msgbox "No PVE hosts found." 8 40
+        return 1
+    fi
+    
+    # Build menu items
+    local i
+    for ((i=0; i<${#hosts[@]}; i++)); do
+        menu_items+=("$i" "${hosts[i]}")
+    done
+    
+    local dialog_selected=$(mktemp)
+    dialog --keep-tite --title "Select Target Host for VM/CT $vmid" \
+           --ok-label "Select" --cancel-label "Cancel" \
+           --menu "Choose PVE host to restore VM/CT $vmid ($type) to:" 15 60 8 \
+           "${menu_items[@]}" 2> "$dialog_selected"
+    
+    local exit_code=$?
+    local selected_index=$(cat "$dialog_selected")
+    rm -f "$dialog_selected"
+    
+    if [ $exit_code -eq 0 ] && [ -n "$selected_index" ]; then
+        conflict_selected_host="${hosts[selected_index]}"
+        log_info "User selected host: $conflict_selected_host for VM/CT $vmid"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# MAIN MENU SYSTEM
+
+# Display main menu and handle user selections
+main_menu() {
+    local dialog_selected=$(mktemp)
+    
+
+    cmd=(dialog --keep-tite --title "$VENDOR $PRODUCT Proxmox VE (PVE) Tools - Main Menu"
+         --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
+         --menu "Choose an option:" 15 80 8)
+    options=("0" "Add Cloned NFS Storage from JovianDSS Snapshot"
+             "1" "Restore VM/CT from Cloned NFS Storage"
+             "2" "Delete Cloned NFS Storage and cloned dataset in JovianDSS     "
+             "3" "Cleanup inactive NFS storage")
+
+    dialog_menu
+    rm -f "$dialog_selected"
+
+    case $dialog_exit_code in
+        0)  # Select
+            case "$selected_option" in
+                0)  # Add Cloned NFS Storage from JovianDSS Snapshot
+                    add_nfs_storage_wizard
+                    ;;
+                1)  # Restore VM/CT from Cloned NFS Storage
+                    restore_from_clone_wizard
+                    ;;
+                2)  # Delete Cloned NFS Storage
+                    delete_cloned_nfs_storage_wizard
+                    ;;
+                3)  # Cleanup inactive NFS storage
+                    cleanup_inactive_nfs_storage
+                    ;;
+            esac
+            ;;
+        1)  # Cancel
+            clear
+            exit 0
+            ;;
+        3)  # Setup
+            setup_dialog
+            ;;
+    esac
+    
+    return 0
+}
+
+# Display setup dialog for REST API configuration
+setup_dialog() {
+    local dialog_selected=$(mktemp)
+    local form_data=$(mktemp)
+    
+
+    # Create form with current values
+    dialog --keep-tite --title "Setup Configuration" \
+           --ok-label "Save" --cancel-label "Back" \
+           --form "Configure REST API settings:" 12 60 3 \
+           "REST API User:" 1 1 "$rest_api_user" 1 20 20 0 \
+           "REST API Password:" 2 1 "$rest_api_password" 2 20 20 0 \
+           "REST API Port:" 3 1 "$rest_api_port" 3 20 10 0 \
+           2> "$form_data"
+
+    local exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        log_info "User saved configuration changes"
+        
+        # Parse form data and save to config
+        local line_count=1
+        while IFS= read -r line; do
+            case $line_count in
+                1) rest_api_user="$line" ;;
+                2) rest_api_password="$line" ;;
+                3) rest_api_port="$line" ;;
+            esac
+            ((line_count++))
+        done < "$form_data"
+
+        # Save to config file
+        cat > "$CONFIG_FILE" << EOF
+rest_api_user=$rest_api_user
+rest_api_password=$rest_api_password
+rest_api_port=$rest_api_port
+EOF
+
+        log_info "Configuration saved to $CONFIG_FILE"
+        dialog --msgbox "Configuration saved successfully!" 6 40
+        
+        rm -f "$form_data"
+        rm -f "$dialog_selected"
+        return 0
+    else
+        rm -f "$form_data"
+        rm -f "$dialog_selected"
+        return 1
+    fi
+}
+
+# RESTORE FROM CLONE WIZARD FUNCTIONS
+
+get_ha_nodes() {
+    local ha_nodes
+    ha_nodes=$(sed -n '/^group: ha-nodes$/,/^group:/p' /etc/pve/ha/groups.cfg | \
+        grep -E '\s+nodes\s' | \
+        cut -d' ' -f2 | tr ',' '\n' | sort)
+    if [[ -n "$ha_nodes" ]]; then
+        echo "$ha_nodes"
+    else
+        pvecm nodes 2>/dev/null | grep -E '\s+[0-9]+\s+[0-9]+\s+\S+' | awk '{print $3}' | sort
+    fi
+}
+
+# Determine configuration file type (VM or Container)
+config_file_type() {
+    local config_file="$1"
+    
+    if [ -z "$config_file" ]; then
+        log_error "config_file_type: No file path provided"
+        return 1
+    fi
+    
+    if [ ! -f "$config_file" ]; then
+        log_error "config_file_type: File not found: $config_file"
+        echo "Error: file not found: $config_file" >&2
+        return 1
+    fi
+    
+    # Check for VM-specific configuration
+    if grep -q '^vmgenid:' "$config_file"; then
+        echo "vm"
+    # Check for Container-specific configuration
+    elif grep -q '^rootfs:' "$config_file"; then
+        echo "ct"
+    else
+        echo "unknown"
+    fi
+    
+    return 0
+}
+
+# List existing VM/LXC IDs from Proxmox configuration files
+existing_id() {
+    log_debug "Getting existing VM/CT IDs from Proxmox configuration"
+    
+    find /etc/pve/nodes/*/{qemu-server,lxc} -name '*.conf' \
+        -printf '%f\n' 2>/dev/null | \
+    sed 's/\.conf$//' | \
+    sort -n | \
+    uniq
+}
+
+# Check if VM/CT ID exists in PVE repository
+check_vmct_exists() {
+    local vmid="$1"
+    
+    if [ -z "$vmid" ]; then
+        log_error "check_vmct_exists: No VM/CT ID provided"
+        return 1
+    fi
+    
+    log_debug "Checking if VM/CT ID $vmid exists in PVE repository"
+    
+    # Check if config file exists in any node
+    if find /etc/pve/nodes/*/{qemu-server,lxc} -name "${vmid}.conf" 2>/dev/null | grep -q .; then
+        log_debug "VM/CT ID $vmid exists in PVE repository"
+        return 0
+    else
+        log_debug "VM/CT ID $vmid does not exist in PVE repository"
+        return 1
+    fi
+}
+
+# Get next available VM/CT ID
+get_available_vmct_id() {
+    local start_id="${1:-100}"
+    local current_id="$start_id"
+    
+    log_debug "Finding next available VM/CT ID starting from $start_id"
+    
+    # Get list of existing IDs
+    local existing_ids
+    existing_ids=$(existing_id)
+    
+    # Find first available ID
+    while check_vmct_exists "$current_id"; do
+        ((current_id++))
+    done
+    
+    log_debug "Next available VM/CT ID: $current_id"
+    echo "$current_id"
+    return 0
+}
+
+# List all configuration files in mounted PVE storage
+all_mnt_confs() {
+    log_debug "Getting all mounted configuration files"
+    
+    find /mnt/pve/*/images/* -maxdepth 1 -name '*.conf' 2>/dev/null | sort
+    
+    return 0
+}
+
+
+get_id_from_conf_file() {
+  local conf="$1"
+  awk -F/ '{ sub(/\.conf$/, "", $NF); print $NF }' <<< "$conf"
+}
+
+get_storage_name_from_mnt_conf_file() {
+  local conf="$1"
+  # the storage name is the 3rd path component (after “mnt” and “pve”), which is $4 when splitting on “/”
+  awk -F/ '{ print $4 }' <<< "$conf"
+}
+
+get_etc_conf_file_for_id() {
+    local vmid="$1"
+    local conf
+
+    # Check in both qemu-server and lxc dirs
+    for conf in /etc/pve/nodes/*/qemu-server/"${vmid}".conf /etc/pve/nodes/*/lxc/"${vmid}".conf; do
+        if [[ -f "$conf" ]]; then
+            echo "$conf"
+            return 0
+        fi
+    done
+
+    # If we get here, no file was found
+    echo "Error: no config file found for VMID ${vmid}" >&2
+    return 1
+}
+
+get_storage_name_of_id() {
+    local id="$1"
+    local etc_conf conf_type storage_name
+    local disk_types="scsi|ide|sata|virtio|efidisk|tpmstate|nvme"
+    local pattern="^(${disk_types})[0-9]+:[^:]+:[0-9]+/vm"
+
+    # 1) locate the /etc/pve config file
+    etc_conf=$(get_etc_conf_file_for_id "$id") || return 1
+
+    # 2) determine if it's a CT or VM
+    conf_type=$(config_file_type "$etc_conf") || return 1
+
+    case "$conf_type" in
+        ct)
+            # parse the storage name from rootfs:
+            storage_name=$(
+                awk -F: '/^rootfs:/ {print $2}' "$etc_conf" \
+                | awk -F: '{print $1}' \
+                | xargs
+            )
+            echo "$storage_name"
+            ;;
+        vm)
+            # use the more specific pattern to find the first VM disk line
+            storage_name=$(
+                grep -E "$pattern" "$etc_conf" \
+                | head -n1 \
+                | awk -F: '{print $2}' \
+                | xargs
+            )
+            echo "$storage_name"
+            ;;
+        *)
+            echo "Error: unknown config type '$conf_type' in $etc_conf" >&2
+            return 1
+            ;;
+    esac
+
+    return 0
+}
+
+is_mnt_conf_file_form_existing_vmct() {
+    local mnt_conf_file="$1"
+    local vmid etc_conf storage_etc storage_mnt
+
+    # 1) sanity check
+    if [[ -z "$mnt_conf_file" ]]; then
+        echo "Usage: $FUNCNAME /mnt/pve/.../<vmid>.conf" >&2
+        return 2
+    fi
+    if [[ ! -f "$mnt_conf_file" ]]; then
+        echo "Error: file not found: $mnt_conf_file" >&2
+        return 1
+    fi
+
+    # 2) extract ID
+    vmid=$(get_id_from_conf_file "$mnt_conf_file")
+
+    # 3) find /etc/pve conf for that ID
+    etc_conf=$(get_etc_conf_file_for_id "$vmid") || return 1
+
+    # 4) get the storage name from the /etc/pve config
+    storage_etc=$(get_storage_name_of_id "$vmid") || return 1
+
+    # 5) get the storage name from the mounted .conf path
+    storage_mnt=$(get_storage_name_from_mnt_conf_file "$mnt_conf_file")
+
+    # 6) compare and return
+    if [[ "$storage_etc" == "$storage_mnt" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+
+# this is NEW get to restore func
+get_cloned_config_file_list() {
+    for storage in $(get_cloned_storage_list); do
+        ls -1 /mnt/pve/"$storage"/images/*/*.conf 2>/dev/null
+    done
+}
+
+
+# Step 1: Select configuration files for restoration
+step1_select_config() {
+    local line confs=() menu_items=() vmids=()
+
+    while IFS= read -r line; do
+        confs+=("$line")
+        log_debug "Added config file: $line"
+    done < <(get_cloned_config_file_list)
+
+    if [ "${#confs[@]}" -eq 0 ]; then
+        dialog --msgbox "No configs found to restore." 8 40
+        return 1
+    fi
+
+    # First pass: collect all storage names to calculate max length
+    local storage_names=()
+    for ((i=0; i<${#confs[@]}; i++)); do
+        local storage_name=$(get_storage_name_from_mnt_conf_file "${confs[i]}")
+        storage_names+=("$storage_name")
+    done
+
+    # Calculate maximum storage name length for alignment
+    local max_storage_len=0
+    for storage_name in "${storage_names[@]}"; do
+        if [ ${#storage_name} -gt $max_storage_len ]; then
+            max_storage_len=${#storage_name}
+        fi
+    done
+
+    local i vmid
+    for ((i=0; i<${#confs[@]}; i++)); do
+        # Extract VM/CT ID from path like /mnt/pve/storage/images/103/103.conf
+        local dir_name="$(dirname "${confs[i]}")"
+        vmid=$(basename "$dir_name")
+        vmids+=("$vmid")
+
+        # Get VM/CT type
+        local vm_type=$(config_file_type "${confs[i]}")
+        
+        # Get storage name
+        local storage_name="${storage_names[i]}"
+        
+        # Get NFS IP address
+        local nfs_ip=$(get_nfs_server_ip_of_given_storage "$storage_name")
+        
+        # Format storage name with left alignment
+        local formatted_storage=$(printf "%-${max_storage_len}s" "$storage_name")
+        
+        # Create display string: "vm/ct  storage_name  nfs_ip"
+        local display_string=$(printf "%-2s  %s  %s" "$vm_type" "$formatted_storage" "$nfs_ip")
+
+        # Check if this config was previously selected
+        local status="off"
+        for selected_conf in "${selected_confs[@]}"; do
+            if [[ "$selected_conf" == "${confs[i]}" ]]; then
+                status="on"
+                break
+            fi
+        done
+
+        menu_items+=("$vmid" "$display_string" "$status")
+    done
+
+    local dialog_selected=$(mktemp)
+    local select_label="Select All"
+    if [[ "$select_all_mode" == true ]]; then
+        select_label="Deselect All"
+    fi
+
+    cmd=(dialog --keep-tite --title "Step 1/$total_steps: Select VM/CT for Restore"
+         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "$select_label"
+         --checklist "Choose VM/CT for restore (use SPACE to select/deselect):" 20 100 10)
+    options=("${menu_items[@]}")
+    dialog_menu
+    rm -f "$dialog_selected"
+
+    case $dialog_exit_code in
+        0)  # Next
+            if [[ -z "$selected_option" ]]; then
+                dialog --msgbox "Please select at least one VM/CT to restore." 8 50
+                return 2  # Stay on same step
+            fi
+
+            # Parse selected VM IDs and find corresponding config files
+            selected_confs=()
+            IFS=' ' read -ra selected_vmids <<< "$selected_option"
+            for selected_vmid in "${selected_vmids[@]}"; do
+                # Remove quotes if present
+                selected_vmid=$(echo "$selected_vmid" | tr -d '"')
+                for ((i=0; i<${#vmids[@]}; i++)); do
+                    if [[ "${vmids[i]}" == "$selected_vmid" ]]; then
+                        selected_confs+=("${confs[i]}")
+                        break
+                    fi
+                done
+            done
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Select All / Deselect All
+            if [[ "$select_all_mode" == false ]]; then
+                # Select all
+                selected_confs=("${confs[@]}")
+                select_all_mode=true
+            else
+                # Deselect all
+                selected_confs=()
+                select_all_mode=false
+            fi
+            return 2  # Stay on same step
+            ;;
+    esac
+}
+
+step2_select_host() {
+    local line hosts=() menu_items=()
+    while IFS= read -r line; do
+        hosts+=("$line")
+    done < <(get_ha_nodes)
+
+    if [ "${#hosts[@]}" -eq 0 ]; then
+        dialog --msgbox "No PVE hosts found." 8 40
+        return 1
+    fi
+
+    local i
+    for ((i=0; i<${#hosts[@]}; i++)); do
+        menu_items+=("$i" "${hosts[i]}")
+    done
+
+    local dialog_selected=$(mktemp)
+    local extra_button
+    if [[ -n "$selected_host_index" ]]; then
+        extra_button="--default-item $selected_host_index"
+    fi
+
+    cmd=(dialog --keep-tite --title "Step 2/$total_steps: Select Target Host"
+         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back" $extra_button
+         --menu "Choose PVE host to restore to:" 15 60 8)
+    options=("${menu_items[@]}")
+    dialog_menu
+    rm -f "$dialog_selected"
+
+    case $dialog_exit_code in
+        0)  # Next
+            selected_host_index="$selected_option"
+            selected_host="${hosts[selected_option]}"
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Back
+            return 2
+            ;;
+    esac
+}
+
+step3_summary() {
+    local summary_text="Summary of selections:\n\n"
+    summary_text+="Target host: $selected_host\n"
+    summary_text+="Selected VM/CT configs (${#selected_confs[@]} total):\n\n"
+
+    local i=1
+    for conf in "${selected_confs[@]}"; do
+        local dir_name="$(dirname "$conf")"
+        local vmid=$(basename "$dir_name")
+        local config_type=$(config_file_type "$conf")
+        summary_text+="  $i) VM/CT ID: $vmid ($config_type)\n"
+        summary_text+="     Config: $conf\n"
+        ((i++))
+    done
+
+    summary_text+="\nClick 'Apply' to proceed with restoration or 'Back' to modify selections."
+
+    dialog --keep-tite --title "Step 3/$total_steps: Confirmation" \
+           --ok-label "Apply" --cancel-label "Back to Main" --extra-button --extra-label "Back" \
+           --msgbox "$summary_text" 25 100
+
+    case $? in
+        0)  # Apply
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Back
+            return 2
+            ;;
+    esac
+}
+
+restore_ct() {
+    local src_conf="$1"
+    local host_name="$2"
+    local new_ctid="$3"  # Optional new CT ID
+    local storage_name
+    storage_name="$(echo "$src_conf" | awk -F'/' '{print $(NF-3)}')"
+    local ctid
+    
+    # Use new ID if provided, otherwise use original ID from config path
+    if [ -n "$new_ctid" ]; then
+        ctid="$new_ctid"
+        log_info "Using new CT ID: $ctid for restoration"
+    else
+        ctid="$(echo "$src_conf" | awk -F'/' '{print $(NF-1)}')"
+        log_info "Using original CT ID: $ctid for restoration"
+    fi
+    
+    local dst_conf="/etc/pve/nodes/${host_name}/lxc/${ctid}.conf"
+    
+    log_info "Restoring CT $ctid from $src_conf to $dst_conf"
+    
+    # Copy configuration file
+    if ! cp "$src_conf" "$dst_conf"; then
+        log_error "Failed to copy CT configuration from $src_conf to $dst_conf"
+        return 1
+    fi
+    
+    # Update storage reference in config
+    local current_storage_name
+    current_storage_name=$(awk -F: '/^rootfs:/ {print $2}' "$dst_conf" | awk -F: '{print $1}' | awk '{$1=$1};1')
+    
+    if [ -n "$current_storage_name" ]; then
+        sed -i "s|^rootfs: *${current_storage_name}:|rootfs: ${storage_name}:|" "$dst_conf"
+        log_info "Updated storage reference from $current_storage_name to $storage_name in CT $ctid config"
+    else
+        log_error "Could not find rootfs storage reference in CT $ctid config"
+        return 1
+    fi
+    
+    # Start the start-and-stop sequence in background
+    # Use nohup to fully detach the job
+    nohup bash -c "pct start $ctid; pct stop $ctid" > "$LOGS_DIR/restore_ct_${ctid}.log" 2>&1 < /dev/null &
+    
+    log_info "CT $ctid restored"
+    return 0
+}
+
+
+restore_vm() {
+    local src_conf="$1"
+    local host_name="$2"
+    local new_vmid="$3"  # Optional new VM ID
+    local storage_name
+    storage_name="$(echo "$src_conf" | awk -F'/' '{print $(NF-3)}')"
+    local vmid
+    
+    # Use new ID if provided, otherwise use original ID from config path
+    if [ -n "$new_vmid" ]; then
+        vmid="$new_vmid"
+        log_info "Using new VM ID: $vmid for restoration"
+    else
+        vmid="$(echo "$src_conf" | awk -F'/' '{print $(NF-1)}')"
+        log_info "Using original VM ID: $vmid for restoration"
+    fi
+    
+    local dst_conf="/etc/pve/nodes/${host_name}/qemu-server/${vmid}.conf"
+    
+    log_info "Restoring VM $vmid from $src_conf to $dst_conf"
+    
+    # Copy configuration file
+    if ! cp "$src_conf" "$dst_conf"; then
+        log_error "Failed to copy VM configuration from $src_conf to $dst_conf"
+        return 1
+    fi
+
+    # Update storage references in config
+    local disk_types="scsi|ide|sata|virtio|efidisk|tpmstate|nvme"
+    local pattern="^("${disk_types}")[0-9]+:[^:]+:[0-9]+/vm"
+    local current_storage_name
+    current_storage_name="$(grep -E "$pattern" "$dst_conf" | awk -F':' '{print $2}' | xargs)"
+
+    if [[ -n "$current_storage_name" ]]; then
+        sed -i -E "s@^((${disk_types})[0-9]+:[[:space:]]+)${current_storage_name}:@\1${storage_name}:@g" "$dst_conf"
+        log_info "Updated storage reference from $current_storage_name to $storage_name in VM $vmid config"
+    else
+        log_error "Could not find storage reference in VM $vmid config"
+        return 1
+    fi
+    
+    log_info "VM $vmid restored"
+    return 0
+}
+
+
+perform_restore() {
+    local total=${#selected_confs[@]}
+    local current=0
+    local failed=0
+    local success=0
+    local skipped=0
+
+    for conf in "${selected_confs[@]}"; do
+        ((current++))
+        local dir_name="$(dirname "$conf")"
+        local vmid=$(basename "$dir_name")
+        local type=$(config_file_type "$conf")
+
+        # Show progress
+        dialog --title "Restoring..." --infobox "Processing VM/CT $vmid ($current/$total)\nType: $type\nFile: $conf" 8 60
+        sleep 1
+
+        log_info "Processing VM/CT $vmid ($current/$total) - Type: $type"
+
+        # Check if VM/CT already exists in PVE repository
+        if check_vmct_exists "$vmid"; then
+            log_info "VM/CT $vmid already exists - initiating conflict resolution"
+            
+            # Reset conflict resolution variables
+            new_vmct_id=""
+            conflict_selected_host=""
+            
+            # Show conflict resolution dialog
+            if resolve_vmct_conflict "$vmid" "$type"; then
+                # User provided new ID, now ask for host selection
+                if select_host_for_conflict "$new_vmct_id" "$type"; then
+                    # User selected host, proceed with restore using new ID and host
+                    log_info "Restoring VM/CT $vmid as $new_vmct_id to host $conflict_selected_host"
+                    
+                    case "$type" in
+                        ct)
+                            if restore_ct "$conf" "$conflict_selected_host" "$new_vmct_id"; then
+                                ((success++))
+                                log_info "Successfully restored CT $vmid as $new_vmct_id"
+                            else
+                                ((failed++))
+                                log_error "Failed to restore CT $vmid as $new_vmct_id"
+                            fi
+                            ;;
+                        vm)
+                            if restore_vm "$conf" "$conflict_selected_host" "$new_vmct_id"; then
+                                ((success++))
+                                log_info "Successfully restored VM $vmid as $new_vmct_id"
+                            else
+                                ((failed++))
+                                log_error "Failed to restore VM $vmid as $new_vmct_id"
+                            fi
+                            ;;
+                        *)
+                            ((failed++))
+                            log_error "Unknown VM/CT type: $type"
+                            ;;
+                    esac
+                else
+                    # User cancelled host selection
+                    ((skipped++))
+                fi
+            else
+                # User cancelled conflict resolution
+                ((skipped++))
+            fi
+        else
+            # VM/CT doesn't exist, proceed with normal restore
+            log_info "VM/CT $vmid does not exist - proceeding with normal restore"
+            
+            case "$type" in
+                ct)
+                    if restore_ct "$conf" "$selected_host"; then
+                        ((success++))
+                        log_info "Successfully restored CT $vmid"
+                    else
+                        ((failed++))
+                        log_error "Failed to restore CT $vmid"
+                    fi
+                    ;;
+                vm)
+                    if restore_vm "$conf" "$selected_host"; then
+                        ((success++))
+                        log_info "Successfully restored VM $vmid"
+                    else
+                        ((failed++))
+                        log_error "Failed to restore VM $vmid"
+                    fi
+                    ;;
+                *)
+                    ((failed++))
+                    log_error "Unknown VM/CT type: $type"
+                    ;;
+            esac
+        fi
+    done
+
+    # Show final result
+    local result_text="Restoration completed!\n\n"
+    result_text+="Total processed: $total\n"
+    result_text+="Successful: $success\n"
+    result_text+="Failed: $failed\n"
+    result_text+="Skipped: $skipped\n"
+    result_text+="Target host: $selected_host"
+
+    log_info "Restoration completed - Total: $total, Success: $success, Failed: $failed, Skipped: $skipped"
+    dialog --msgbox "$result_text" 15 50
+}
+
+restore_from_clone_wizard() {
+    # Reset variables for restore wizard
+    selected_confs=()
+    selected_host=""
+    selected_host_index=""
+    current_step=1
+    select_all_mode=false
+    
+    # Reset conflict resolution variables
+    new_vmct_id=""
+    conflict_selected_host=""
+
+    while true; do
+        case $current_step in
+            1)
+                step1_select_config
+                case $? in
+                    0)  # Next
+                        clear
+                        current_step=2
+                        ;;
+                    1)  # Back to Main
+                        clear
+                        return
+                        ;;
+                    2)  # Stay on same step (retry)
+                        clear
+                        ;;
+                esac
+                ;;
+            2)
+                step2_select_host
+                case $? in
+                    0)  # Next
+                        clear
+                        current_step=3
+                        ;;
+                    1)  # Back to Main
+                        clear
+                        return
+                        ;;
+                    2)  # Back
+                        clear
+                        current_step=1
+                        ;;
+                esac
+                ;;
+            3)
+                step3_summary
+                case $? in
+                    0)  # Apply
+                        clear
+                        perform_restore
+                        return
+                        ;;
+                    1)  # Back to Main
+                        clear
+                        return
+                        ;;
+                    2)  # Back
+                        clear
+                        current_step=2
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+# ADD NFS STORAGE WIZARD FUNCTIONS
+
+# NFS wizard specific variables
+selected_nfs_ip=""
+selected_pool=""
+selected_dataset=""
+selected_snapshot=""
+selected_nfs_ip_index=""
+selected_pool_index=""
+selected_dataset_index=""
+selected_snapshot_index=""
+nfs_current_step=1
+nfs_total_steps=5
+
+rest_api_connection_test() {
+    local response status
+
+    response=$(curl -k -s -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/conn_test")
+    status=$(echo "$response" | tail -n1)
+
+    if [[ "$status" == "200" ]]; then
+        return 0
+    else
+        echo "REST API connection test failed (HTTP $status)" >&2
+        return 1
+    fi
+}
+
+get_current_storage_servers_ip() {
+    local storage_cfg="/etc/pve/storage.cfg"
+    local ips=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && ips+=("$line")
+    done < <(grep server "$storage_cfg" | awk '{print $2}')
+
+    # Remove duplicates
+    readarray -t uniq_ips < <(printf "%s\n" "${ips[@]}" | sort -u)
+    uniq_ips+=("Enter new IP")
+
+    printf '%s\n' "${uniq_ips[@]}"
+}
+
+get_pool_names() {
+    local addr="$1"
+    local response
+
+    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" -H 'Content-Type: application/json' \
+        "https://$addr:$rest_api_port/api/v4/pools")
+
+    local curl_exit=$?
+
+    if [[ $curl_exit -ne 0 ]]; then
+        echo "Error: Failed to connect to NFS server at $addr:$rest_api_port" >&2
+        return 1
+    fi
+
+    if [[ -z "$response" ]]; then
+        echo "Error: Empty response from server" >&2
+        return 1
+    fi
+
+    printf '%s' "$response" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    pools = data.get("data", [])
+    if not pools:
+        sys.exit(1)
+    for pool in pools:
+        name = pool.get("name")
+        if name:
+            print(name)
+except Exception:
+    sys.exit(1)
+'
+}
+
+get_datasets_in_pool() {
+    local pool_name="$1"
+    local response
+
+    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" -H 'Content-Type: application/json' \
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes")
+
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        echo "Error: Failed to connect to server for datasets." >&2
+        return 1
+    fi
+
+    if [[ -z "$response" ]]; then
+        echo "Error: Empty response from server (datasets)." >&2
+        return 1
+    fi
+
+    printf '%s' "$response" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    entries = data.get("data", {}).get("entries", [])
+    if not entries:
+        sys.exit(1)
+    for d in entries:
+        name = d.get("name")
+        origin = d.get("origin")
+        if name and origin is None:
+            print(name)
+except Exception:
+    sys.exit(1)
+'
+}
+
+get_snapshots_in_dataset() {
+    local pool_name="$1"
+    local dataset_name="$2"
+    local response
+
+    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" -H 'Content-Type: application/json' \
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
+
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        echo "Error: Failed to connect to server for snapshots." >&2
+        return 1
+    fi
+
+    if [[ -z "$response" ]]; then
+        echo "Error: Empty response from server (snapshots)." >&2
+        return 1
+    fi
+
+    printf '%s' "$response" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    entries = data.get("data", {}).get("entries", [])
+    if not entries:
+        sys.exit(1)
+
+    # Create list of snapshots with creation timestamps
+    snapshots = []
+    for s in entries:
+        name = s.get("name")
+        creation = s.get("properties", {}).get("creation")
+        if name and creation:
+            snapshots.append((int(creation), name))
+
+    # Sort by creation timestamp in descending order (newest first)
+    snapshots.sort(reverse=True)
+
+    # Print snapshot names in sorted order
+    for _, name in snapshots:
+        print(name)
+except Exception:
+    sys.exit(1)
+'
+}
+
+nfs_step1_select_ip() {
+    local line ips=() menu_items=()
+    while IFS= read -r line; do
+        ips+=("$line")
+    done < <(get_current_storage_servers_ip)
+
+    if [ "${#ips[@]}" -eq 0 ]; then
+        dialog --msgbox "No IPs found." 8 40
+        return 1
+    fi
+
+    local i
+    for ((i=0; i<${#ips[@]}; i++)); do
+        menu_items+=("$i" "${ips[i]}")
+    done
+
+    local dialog_selected=$(mktemp)
+    local extra_button
+    if [[ -n "$selected_nfs_ip_index" ]]; then
+        extra_button="--default-item $selected_nfs_ip_index"
+    fi
+
+    cmd=(dialog --keep-tite --title "Step 1/$nfs_total_steps: Select JovianDSS NFS Storage IP (VIP)"
+         --ok-label "Next" --cancel-label "Back to Main" $extra_button
+         --menu "Choose JovianDSS NFS Storage IP (VIP):" 15 60 8)
+    options=("${menu_items[@]}")
+    dialog_menu
+    rm -f "$dialog_selected"
+
+    case $dialog_exit_code in
+        0)  # Next
+            selected_nfs_ip_index="$selected_option"
+            if [[ "${ips[selected_option]}" == "Enter new IP" ]]; then
+                # Get custom IP input
+                local input_ip
+                input_ip=$(dialog --keep-tite --title "Enter New IP" --inputbox "Enter the NFS Storage IP address:" 8 40 3>&1 1>&2 2>&3)
+                if [[ $? -eq 0 && -n "$input_ip" ]]; then
+                    if [[ "$input_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                        selected_nfs_ip="$input_ip"
+                        return 0
+                    else
+                        dialog --msgbox "Invalid IP address format." 8 40
+                        return 2  # Retry same step
+                    fi
+                else
+                    return 2  # Retry same step
+                fi
+            else
+                selected_nfs_ip="${ips[selected_option]}"
+                return 0
+            fi
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+    esac
+}
+
+nfs_step2_select_pool() {
+    # Test API connection first
+    if ! rest_api_connection_test; then
+        dialog --msgbox "API connection test failed for $selected_nfs_ip" 8 50
+        return 2  # Go back
+    fi
+
+    local line pools=() menu_items=()
+    while IFS= read -r line; do
+        pools+=("$line")
+    done < <(get_pool_names "$selected_nfs_ip")
+
+    if [ "${#pools[@]}" -eq 0 ]; then
+        dialog --msgbox "No pools found on server $selected_nfs_ip" 8 50
+        return 2  # Go back
+    fi
+
+    local i
+    for ((i=0; i<${#pools[@]}; i++)); do
+        menu_items+=("$i" "${pools[i]}")
+    done
+
+    local dialog_selected=$(mktemp)
+    local extra_button
+    if [[ -n "$selected_pool_index" ]]; then
+        extra_button="--default-item $selected_pool_index"
+    fi
+
+    cmd=(dialog --keep-tite --title "Step 2/$nfs_total_steps: Select Pool"
+         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back" $extra_button
+         --menu "Choose JovianDSS Pool from $selected_nfs_ip:" 15 60 8)
+    options=("${menu_items[@]}")
+    dialog_menu
+    rm -f "$dialog_selected"
+
+    case $dialog_exit_code in
+        0)  # Next
+            selected_pool_index="$selected_option"
+            selected_pool="${pools[selected_option]}"
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Back
+            return 2
+            ;;
+    esac
+}
+
+nfs_step3_select_dataset() {
+    local line datasets=() menu_items=()
+    while IFS= read -r line; do
+        datasets+=("$line")
+    done < <(get_datasets_in_pool "$selected_pool")
+
+    if [ "${#datasets[@]}" -eq 0 ]; then
+        dialog --msgbox "No datasets found in pool $selected_pool" 8 50
+        return 2  # Go back
+    fi
+
+    local i
+    for ((i=0; i<${#datasets[@]}; i++)); do
+        menu_items+=("$i" "${datasets[i]}")
+    done
+
+    local dialog_selected=$(mktemp)
+    local extra_button
+    if [[ -n "$selected_dataset_index" ]]; then
+        extra_button="--default-item $selected_dataset_index"
+    fi
+
+    cmd=(dialog --keep-tite --title "Step 3/$nfs_total_steps: Select Dataset"
+         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back" $extra_button
+         --menu "Choose JovianDSS Dataset from Pool $selected_pool:" 15 60 8)
+    options=("${menu_items[@]}")
+    dialog_menu
+    rm -f "$dialog_selected"
+
+    case $dialog_exit_code in
+        0)  # Next
+            selected_dataset_index="$selected_option"
+            selected_dataset="${datasets[selected_option]}"
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Back
+            return 2
+            ;;
+    esac
+}
+
+nfs_step4_select_snapshot() {
+    local line snapshots=() menu_items=()
+    while IFS= read -r line; do
+        snapshots+=("$line")
+    done < <(get_snapshots_in_dataset "$selected_pool" "$selected_dataset")
+
+    if [ "${#snapshots[@]}" -eq 0 ]; then
+        dialog --msgbox "No snapshots found in dataset $selected_dataset" 8 50
+        return 2  # Go back
+    fi
+
+    local i
+    for ((i=0; i<${#snapshots[@]}; i++)); do
+        menu_items+=("$i" "${snapshots[i]}")
+    done
+
+    local dialog_selected=$(mktemp)
+    local extra_button
+    if [[ -n "$selected_snapshot_index" ]]; then
+        extra_button="--default-item $selected_snapshot_index"
+    fi
+
+    cmd=(dialog --keep-tite --title "Step 4/$nfs_total_steps: Select Snapshot"
+         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back" $extra_button
+         --menu "Choose JovianDSS Snapshot from Dataset $selected_dataset:" 15 60 8)
+    options=("${menu_items[@]}")
+    dialog_menu
+    rm -f "$dialog_selected"
+
+    case $dialog_exit_code in
+        0)  # Next
+            selected_snapshot_index="$selected_option"
+            selected_snapshot="${snapshots[selected_option]}"
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Back
+            return 2
+            ;;
+    esac
+}
+
+nfs_step5_summary() {
+    local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot")
+    local summary_text="Summary of selections:\n\n"
+    summary_text+="NFS Server IP: $selected_nfs_ip\n"
+    summary_text+="Pool: $selected_pool\n"
+    summary_text+="Dataset: $selected_dataset\n"
+    summary_text+="Snapshot: $selected_snapshot\n"
+    summary_text+="Clone name: $clone_name\n\n"
+    summary_text+="Click 'Apply' to create clone and NFS share or 'Back' to modify selections."
+
+    dialog --keep-tite --title "Step 5/$nfs_total_steps: Confirmation" \
+           --ok-label "Apply" --cancel-label "Back to Main" --extra-button --extra-label "Back" \
+           --msgbox "$summary_text" 18 80
+
+    case $? in
+        0)  # Apply
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Back
+            return 2
+            ;;
+    esac
+}
+
+extract_timestamp_from_snapname() {
+    local pool_name="$1"
+    local dataset_name="$2"
+    local snapname="$3"
+
+    if [[ $snapname =~ ([0-9]{4}-[0-9]{2}-[0-9]{2})-([0-9]{6}) ]]; then
+        local day_part="${BASH_REMATCH[1]}"
+        local time_part="${BASH_REMATCH[2]}"
+        local hourmin="${time_part:0:4}"
+        echo "${day_part}-${hourmin}"
+    else
+        local response
+        response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" -H 'Content-Type: application/json' \
+            "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
+        local curl_exit=$?
+        if [[ $curl_exit -ne 0 ]]; then
+            echo "Error: Failed to connect to server for snapshot creation time." >&2
+            return 1
+        fi
+
+        local creation
+        creation=$(printf '%s' "$response" | python3 -c "
+import sys, json, datetime
+try:
+    data = json.load(sys.stdin)
+    entries = data.get('data', {}).get('entries', [])
+    found = False
+    for snap in entries:
+        if snap.get('name') == sys.argv[1]:
+            creation = snap.get('properties', {}).get('creation')
+            if creation:
+                dt = datetime.datetime.fromtimestamp(int(creation))
+                print(dt.strftime('%Y-%m-%d-%H%M'))
+                found = True
+                break
+    if not found:
+        sys.exit(1)
+except Exception:
+    sys.exit(1)
+" "$snapname")
+
+        if [[ -z "$creation" ]]; then
+            echo "Error: Failed to extract creation time from snapshot data." >&2
+            return 1
+        fi
+        echo "$creation"
+    fi
+}
+
+make_clone_name() {
+    local pool_name="$1"
+    local dataset_name="$2"
+    local snapshot_name="$3"
+    local ts
+    ts=$(extract_timestamp_from_snapname "$pool_name" "$dataset_name" "$snapshot_name")
+    echo "${dataset_name}_clone_${ts}"
+}
+
+create_clone_from_snapshot() {
+    local pool_name="$1"
+    local dataset_name="$2"
+    local snapshot_name="$3"
+    local clone_name="$4"
+
+    local json_input="{\"name\": \"${clone_name}\"}"
+
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X POST -u "$rest_api_user:$rest_api_password" \
+        -H 'Content-Type: application/json' \
+        -d "$json_input" \
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots/$snapshot_name/clones")
+
+    local body=$(echo "$response" | sed '$d')
+    local status=$(echo "$response" | tail -n1)
+
+    if [[ $status -eq 200 ]]; then
+        log_info "Clone '$clone_name' created"
+    else
+        log_error "Failed to create clone. Status: $status"
+        log_error "Response: $body"
+        return 1
+    fi
+}
+
+create_nfs_share_for_clone() {
+    local pool_name="$1"
+    local clone_name="$2"
+
+    local path="${pool_name}/${clone_name}"
+    local json_input
+    json_input=$(cat <<EOF
+{
+    "name": "$clone_name",
+    "path": "$path",
+    "nfs": {
+        "enabled": true
+    }
+}
+EOF
+)
+
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X POST -u "$rest_api_user:$rest_api_password" \
+        -H 'Content-Type: application/json' \
+        -d "$json_input" \
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/shares")
+
+    local body=$(echo "$response" | sed '$d')
+    local status=$(echo "$response" | tail -n1)
+
+    if [[ $status -eq 201 ]]; then
+        log_info "NFS share '$clone_name' created at: $path"
+    else
+        log_error "Failed to create NFS share. Status: $status"
+        log_error "Response: $body"
+        return 1
+    fi
+}
+
+get_ha_nodes_csv() {
+    get_ha_nodes | paste -sd,
+}
+
+add_nfs_storage_to_proxmox() {
+    local storage_id="$1"
+    local server="$2"
+    local export="/$storage_id"
+    local nodes_csv="$3"
+
+    local content="images,iso,vztmpl,backup,rootdir,snippets"
+
+    # echo "Adding NFS storage '$storage_id' with:"  :to-do: send all lines to logs
+    # echo "  Server: $server"
+    # echo "  Export: $export"
+    # echo "  Nodes:  $nodes_csv"
+    # echo
+
+    pvesh create /storage \
+        --storage "$storage_id" \
+        --type nfs \
+        --server "$server" \
+        --export "$export" \
+        --content "$content" \
+        --nodes "$nodes_csv" > /dev/null 2>&1
+}
+
+perform_clone_and_setup() {
+    local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot")
+
+    # Show progress
+    dialog --title "Processing..." --infobox "Creating clone: $clone_name..." 6 50
+    sleep 1
+
+    if ! create_clone_from_snapshot "$selected_pool" "$selected_dataset" "$selected_snapshot" "$clone_name"; then
+        dialog --msgbox "Failed to create clone!" 8 40
+        return 1
+    fi
+
+    dialog --title "Processing..." --infobox "Creating NFS share..." 6 50
+    sleep 1
+
+    if ! create_nfs_share_for_clone "$selected_pool" "$clone_name"; then
+        dialog --msgbox "Failed to create NFS share!" 8 40
+        return 1
+    fi
+
+    dialog --title "Processing..." --infobox "Adding storage to Proxmox..." 6 50
+    sleep 1
+
+    local nodes_csv=$(get_ha_nodes_csv)
+    if ! add_nfs_storage_to_proxmox "$clone_name" "$selected_nfs_ip" "$nodes_csv"; then
+        dialog --msgbox "Failed to add storage to Proxmox!" 8 40
+        return 1
+    fi
+
+    dialog --msgbox "Clone and NFS setup completed successfully!\n\nClone: $clone_name\nNFS Share: $clone_name\nProxmox Storage: $clone_name" 10 60
+}
+
+add_nfs_storage_wizard() {
+    # Reset NFS wizard variables
+    selected_nfs_ip=""
+    selected_pool=""
+    selected_dataset=""
+    selected_snapshot=""
+    selected_nfs_ip_index=""
+    selected_pool_index=""
+    selected_dataset_index=""
+    selected_snapshot_index=""
+    nfs_current_step=1
+
+    while true; do
+        case $nfs_current_step in
+            1)
+                nfs_step1_select_ip
+                case $? in
+                    0)  # Next
+                        clear
+                        nfs_current_step=2
+                        ;;
+                    1)  # Back to Main
+                        clear
+                        return
+                        ;;
+                    2)  # Retry same step
+                        clear
+                        ;;
+                esac
+                ;;
+            2)
+                nfs_step2_select_pool
+                case $? in
+                    0)  # Next
+                        clear
+                        nfs_current_step=3
+                        ;;
+                    1)  # Back to Main
+                        clear
+                        return
+                        ;;
+                    2)  # Back
+                        clear
+                        nfs_current_step=1
+                        ;;
+                esac
+                ;;
+            3)
+                nfs_step3_select_dataset
+                case $? in
+                    0)  # Next
+                        clear
+                        nfs_current_step=4
+                        ;;
+                    1)  # Back to Main
+                        clear
+                        return
+                        ;;
+                    2)  # Back
+                        clear
+                        nfs_current_step=2
+                        ;;
+                esac
+                ;;
+            4)
+                nfs_step4_select_snapshot
+                case $? in
+                    0)  # Next
+                        clear
+                        nfs_current_step=5
+                        ;;
+                    1)  # Back to Main
+                        clear
+                        return
+                        ;;
+                    2)  # Back
+                        clear
+                        nfs_current_step=3
+                        ;;
+                esac
+                ;;
+            5)
+                nfs_step5_summary
+                case $? in
+                    0)  # Apply
+                        clear
+                        perform_clone_and_setup
+                        return
+                        ;;
+                    1)  # Back to Main
+                        clear
+                        return
+                        ;;
+                    2)  # Back
+                        clear
+                        nfs_current_step=4
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+# DELETE CLONED NFS STORAGE FUNCTIONS
+
+# Function: get_server_ip_address_of_given_nfs_storage
+get_server_ip_address_of_given_nfs_storage() {
+    awk -v name="$1" '
+    $1 == "nfs:" && $2 == name { in_block = 1; next }
+    in_block && $1 == "server" { print $2; exit }
+    /^nfs:/ && $2 != name { in_block = 0 }
+    ' /etc/pve/storage.cfg
+}
+
+# Function: get_pve_NFS_storage
+get_pve_NFS_storage() {
+    local storage_cfg="/etc/pve/storage.cfg"
+
+    if [[ ! -f "$storage_cfg" ]]; then
+        echo "Error: $storage_cfg not found" >&2
+        return 1
+    fi
+
+    # Parse storage.cfg to extract NFS storage names
+    awk '
+    /^nfs:/ {
+        # Extract storage name after "nfs: "
+        storage_name = $2
+        print storage_name
+    }
+    ' "$storage_cfg"
+}
+
+# Function: get_pools
+get_pools() {
+    # Check if we have NFS IP configured
+    if [[ -z "$selected_nfs_ip" ]]; then
+        echo "Error: selected_nfs_ip is not set" >&2
+        return 1
+    fi
+
+    # Make REST API call to get all pools
+    local response
+    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" \
+        -H 'Content-Type: application/json' \
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools" 2>/dev/null)
+
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        echo "Error: Failed to connect to server" >&2
+        return 1
+    fi
+
+    # Parse JSON response to extract pool names
+    printf '%s' "$response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    pools = data.get('data', [])
+    for pool in pools:
+        name = pool.get('name')
+        if name:
+            print(name)
+except Exception as e:
+    print('Error: Failed to parse JSON response', file=sys.stderr)
+    sys.exit(1)
+"
+
+    local python_exit=$?
+    if [[ $python_exit -ne 0 ]]; then
+        echo "Error: Failed to parse JSON response" >&2
+        return 1
+    fi
+}
+
+get_nfs_server_ip_of_given_storage() {
+    local storage="$1"
+    awk -v storage="$storage" '
+        # When we hit an nfs: line, check if its name matches
+        /^nfs:[[:space:]]+/ {
+            in_block = ($2 == storage)
+        }
+        # While in the right block, look for a “server” line
+        in_block && /^[[:space:]]*server[[:space:]]+/ {
+            print $2     # print the IP
+            exit         # and quit immediately
+        }
+    ' /etc/pve/storage.cfg
+}
+
+
+# Function: get_dataset_pool_name
+get_dataset_pool_name() {
+    local dataset_name="$1"
+
+    if [[ -z "$dataset_name" ]]; then
+        echo "Error: dataset_name is required" >&2
+        return 1
+    fi
+
+    # Check if we have NFS IP configured
+    if [[ -z "$selected_nfs_ip" ]]; then
+        echo "Error: selected_nfs_ip is not set" >&2
+        return 1
+    fi
+
+    # Get all pools
+    local pools
+    pools=$(get_pools)
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to get pools list" >&2
+        return 1
+    fi
+
+    # Loop through each pool and check if dataset exists
+    while IFS= read -r pool_name; do
+        if [[ -z "$pool_name" ]]; then
+            continue
+        fi
+
+        # Get nas-volumes for this pool
+        local response
+        response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" \
+            -H 'Content-Type: application/json' \
+            "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
+
+        local curl_exit=$?
+        if [[ $curl_exit -ne 0 ]]; then
+            continue  # Skip this pool if we can't access it
+        fi
+
+        # Check if dataset exists in this pool
+        local dataset_found
+        dataset_found=$(printf '%s' "$response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    entries = data.get('data', {}).get('entries', [])
+    for d in entries:
+        if d.get('name') == '$dataset_name':
+            print('FOUND')
+            sys.exit(0)
+    print('NOT_FOUND')
+except Exception as e:
+    print('ERROR', file=sys.stderr)
+    sys.exit(1)
+")
+
+        if [[ "$dataset_found" == "FOUND" ]]; then
+            echo "$pool_name"
+            return 0
+        fi
+    done <<< "$pools"
+
+    # Dataset not found in any pool
+    # echo "Error: Dataset '$dataset_name' not found in any pool" >&2
+    return 1
+}
+
+# Function: is_clone
+is_clone() {
+    local volume_name="$1"
+
+    if [[ -z "$volume_name" ]]; then
+        echo "Error: volume_name is required" >&2
+        return 1
+    fi
+
+    # Parse pool and dataset from volume_name
+    local pool_name="${volume_name%%/*}"
+    local dataset_name="${volume_name#*/}"
+
+    if [[ -z "$pool_name" || -z "$dataset_name" || "$pool_name" == "$dataset_name" ]]; then
+        echo "Error: Invalid volume_name format. Expected: pool_name/dataset_name" >&2
+        return 1
+    fi
+
+    # Check if we have NFS IP configured
+    if [[ -z "$selected_nfs_ip" ]]; then
+        echo "Error: selected_nfs_ip is not set" >&2
+        return 1
+    fi
+
+    # Make REST API call to get nas-volumes for the pool
+    local response
+    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" \
+        -H 'Content-Type: application/json' \
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
+
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        echo "Error: Failed to connect to server" >&2
+        return 1
+    fi
+
+    # Parse JSON response to find the dataset and check its origin
+    local origin
+    origin=$(printf '%s' "$response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    entries = data.get('data', {}).get('entries', [])
+    for d in entries:
+        if d.get('name') == '$dataset_name':
+            origin = d.get('origin')
+            if origin is None:
+                print('None')
+            else:
+                print(origin)
+            sys.exit(0)
+    print('NOT_FOUND')
+except Exception as e:
+    print('ERROR', file=sys.stderr)
+    sys.exit(1)
+")
+
+    local python_exit=$?
+    if [[ $python_exit -ne 0 ]]; then
+        echo "Error: Failed to parse JSON response" >&2
+        return 1
+    fi
+
+    if [[ "$origin" == "NOT_FOUND" ]]; then
+        echo "Error: Dataset '$dataset_name' not found in pool '$pool_name'" >&2
+        return 1
+    fi
+
+    if [[ "$origin" == "None" ]]; then
+        # origin is None, so it's a dataset (not a clone)
+        return 1
+    else
+        # origin is set, so it's a clone
+        return 0
+    fi
+}
+
+# Function: delete_cloned_dataset
+delete_cloned_dataset() {
+    local dataset_name="$1"
+
+    if [[ -z "$dataset_name" ]]; then
+        echo "Error: dataset_name is required" >&2
+        return 1
+    fi
+
+    # Check if we have NFS IP configured
+    if [[ -z "$selected_nfs_ip" ]]; then
+        echo "Error: selected_nfs_ip is not set" >&2
+        return 1
+    fi
+
+    log_info "Checking dataset: $dataset_name"
+
+    # Find which pool this dataset belongs to
+    local pool_name
+    pool_name=$(get_dataset_pool_name "$dataset_name")
+    if [[ $? -ne 0 ]]; then
+        # echo "Error: Dataset '$dataset_name' not found in any pool" >&2
+        return 1
+    fi
+
+    log_info "Dataset '$dataset_name' found in pool '$pool_name'"
+
+    # Check if this dataset is a clone
+    local volume_name="$pool_name/$dataset_name"
+    if ! is_clone "$volume_name"; then
+        log_error "Dataset '$dataset_name' is not a clone. Refusing to delete original dataset."
+        return 1
+    fi
+
+    log_info "Confirmed: Dataset '$dataset_name' is a clone. Proceeding with deletion..."
+
+    # Make REST API call to delete the dataset
+    local url="https://${selected_nfs_ip}:${rest_api_port}/api/v4/pools/${pool_name}/nas-volumes/${dataset_name}"
+
+    local response
+    response=$(curl -k -s -X DELETE \
+        -u "$rest_api_user:$rest_api_password" \
+        -H 'Content-Type: application/json' \
+        -d '{}' \
+        -w "\n%{http_code}\n%{redirect_url}" \
+        "$url" 2>/dev/null)
+
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "Failed to connect to server for deletion"
+        return 1
+    fi
+
+    # Parse curl response (body, http_code, redirect_url)
+    local response_lines
+    readarray -t response_lines <<< "$response"
+    local response_body="${response_lines[0]}"
+    local http_code="${response_lines[1]}"
+    local redirect_url="${response_lines[2]}"
+
+    if [[ "$http_code" == "204" ]]; then
+        log_info "Success: Dataset '$dataset_name' has been deleted"
+        return 0
+    else
+        log_error "Failed to delete dataset '$dataset_name'. HTTP code: $http_code"
+        if [[ -n "$response_body" ]]; then
+            log_error "Response: $response_body"
+        fi
+        return 1
+    fi
+}
+
+# Function: get_cloned_storage_list
+get_cloned_storage_list() {
+    # Check if we have NFS IP configured
+
+    # Get all NFS storages from PVE
+    local nfs_storages
+    nfs_storages=$(get_pve_NFS_storage)
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to get NFS storages from PVE"
+        return 1
+    fi
+
+    if [[ -z "$nfs_storages" ]]; then
+        # No NFS storages found, return successfully but with no output
+        return 0
+    fi
+
+    # Loop through each NFS storage and check if it's a clone
+    while IFS= read -r storage_name; do
+        if [[ -z "$storage_name" ]]; then
+            continue
+        fi
+
+        # Find which pool this storage belongs to
+        local pool_name
+        selected_nfs_ip=$(get_nfs_server_ip_of_given_storage "$storage_name") # fix for missing IP ADDR
+        pool_name=$(get_dataset_pool_name "$storage_name")
+        if [[ $? -ne 0 ]]; then
+            # Storage not found in any pool, skip it
+            continue
+        fi
+
+        # Check if this storage is a clone
+        local volume_name="$pool_name/$storage_name"
+        if is_clone "$volume_name"; then
+            echo "$storage_name"
+        fi
+
+    done <<< "$nfs_storages"
+}
+
+# Function: delete_pve_NFS_storage
+delete_pve_NFS_storage() {
+    local pve_storage_name="$1"
+
+    if [[ -z "$pve_storage_name" ]]; then
+        echo "Error: pve_storage_name is required" >&2
+        return 1
+    fi
+
+    log_info "Processing PVE NFS storage: $pve_storage_name"
+
+    # Step 1: Check if given storage is a PVE NFS storage
+    local pve_nfs_storages
+    pve_nfs_storages=$(get_pve_NFS_storage)
+    if [[ $? -ne 0 ]]; then
+        echo "Error: Failed to get PVE NFS storages" >&2
+        return 1
+    fi
+
+    local is_pve_nfs_storage=false
+    while IFS= read -r storage; do
+        if [[ "$storage" == "$pve_storage_name" ]]; then
+            is_pve_nfs_storage=true
+            break
+        fi
+    done <<< "$pve_nfs_storages"
+
+    if [[ "$is_pve_nfs_storage" == "false" ]]; then
+        log_error "'$pve_storage_name' is not a PVE NFS storage"
+        return 1
+    fi
+
+    log_info "Confirmed: '$pve_storage_name' is a PVE NFS storage"
+
+    # Step 2: Check if we have NFS IP configured
+    if [[ -z "$selected_nfs_ip" ]]; then
+        echo "Error: selected_nfs_ip is not set" >&2
+        return 1
+    fi
+
+    # Step 3: Find which pool this storage belongs to
+    local pool_name
+    pool_name=$(get_dataset_pool_name "$pve_storage_name")
+    if [[ $? -ne 0 ]]; then
+        # echo "Error: Storage '$pve_storage_name' not found in any pool" >&2
+        return 1
+    fi
+
+    log_info "Storage '$pve_storage_name' found in pool '$pool_name'"
+
+    # Step 4: Check if this storage is a clone dataset
+    local volume_name="$pool_name/$pve_storage_name"
+    if ! is_clone "$volume_name"; then
+        log_error "Storage '$pve_storage_name' is not a clone dataset. Refusing to delete original dataset."
+        return 1
+    fi
+
+    log_info "Confirmed: Storage '$pve_storage_name' is a clone dataset"
+
+    # Step 5: Delete the cloned dataset via REST API
+    log_info "Deleting cloned dataset..."
+    if ! delete_cloned_dataset "$pve_storage_name"; then
+        log_error "Failed to delete cloned dataset '$pve_storage_name'"
+        return 1
+    fi
+
+    log_info "Successfully deleted cloned dataset '$pve_storage_name'"
+
+    # Step 6: Remove PVE storage configuration
+    log_info "Removing PVE storage configuration..."
+    if ! pvesm remove "$pve_storage_name"; then
+        log_error "Failed to remove PVE storage '$pve_storage_name'"
+        return 1
+    fi
+
+    log_info "Successfully removed PVE storage configuration '$pve_storage_name'"
+
+    # Step 7: Run cleanup of inactive NFS storage
+    log_info "Running cleanup of inactive NFS storage..."
+    if ! cleanup_inactive_nfs_storage; then
+        log_error "cleanup_inactive_nfs_storage failed, but main deletion was successful"
+    else
+        log_info "NFS storage cleanup complete"
+    fi
+
+    log_info "Storage '$pve_storage_name' deleted"
+    return 0
+}
+
+# Function: get_cloned_storage_list_with_ips
+get_cloned_storage_list_with_ips() {
+    # Get all NFS storages from PVE
+    local nfs_storages
+    nfs_storages=$(get_pve_NFS_storage)
+    if [[ $? -ne 0 ]]; then
+        log_error "Failed to get NFS storages from PVE"
+        return 1
+    fi
+
+    if [[ -z "$nfs_storages" ]]; then
+        # No NFS storages found, return successfully but with no output
+        return 0
+    fi
+
+    # Check each storage and build list with IPs
+    local cloned_storages_with_ips=()
+    while IFS= read -r storage_name; do
+        if [[ -z "$storage_name" ]]; then
+            continue
+        fi
+
+        # Get NFS IP for this storage
+        local nfs_ip
+        nfs_ip=$(get_server_ip_address_of_given_nfs_storage "$storage_name")
+        if [[ -z "$nfs_ip" ]]; then
+            continue
+        fi
+
+        # Set global variable for REST API calls
+        selected_nfs_ip="$nfs_ip"
+
+        # Find which pool this storage belongs to
+        local pool_name
+        pool_name=$(get_dataset_pool_name "$storage_name")
+        if [[ $? -ne 0 ]]; then
+            # Storage not found in any pool, skip it
+            continue
+        fi
+
+        # Check if this storage is a clone
+        local volume_name="$pool_name/$storage_name"
+        if is_clone "$volume_name"; then
+            cloned_storages_with_ips+=("$storage_name:$nfs_ip")
+        fi
+
+    done <<< "$nfs_storages"
+
+    # Output results
+    for item in "${cloned_storages_with_ips[@]}"; do
+        echo "$item"
+    done
+}
+
+# Function: delete_cloned_nfs_storage_wizard
+delete_cloned_nfs_storage_wizard() {
+    # Check if REST API is configured
+    if [[ -z "$rest_api_user" || -z "$rest_api_password" || -z "$rest_api_port" ]]; then
+        dialog --msgbox "REST API configuration is not complete. Please use Setup to configure it first." 8 60
+        return 1
+    fi
+
+    # Get list of cloned storages with their IPs
+    local cloned_storages_with_ips
+    cloned_storages_with_ips=$(get_cloned_storage_list_with_ips)
+    if [[ $? -ne 0 ]]; then
+        dialog --msgbox "Failed to get cloned storage list. Please check your NFS server connection and configuration." 8 60
+        return 1
+    fi
+
+    if [[ -z "$cloned_storages_with_ips" ]]; then
+        dialog --msgbox "No cloned NFS storages found." 8 40
+        return 1
+    fi
+
+    # Build menu options
+    local menu_items=()
+    local index=1
+    while IFS= read -r storage_with_ip; do
+        if [[ -n "$storage_with_ip" ]]; then
+            local storage_name="${storage_with_ip%:*}"
+            local nfs_ip="${storage_with_ip#*:}"
+            menu_items+=("$index" "$storage_name ($nfs_ip)")
+            ((index++))
+        fi
+    done <<< "$cloned_storages_with_ips"
+
+    # Show selection dialog with warning
+    local dialog_selected=$(mktemp)
+    dialog --keep-tite \
+        --title "Delete Cloned NFS Storage" \
+        --ok-label "Continue" --cancel-label "Cancel" \
+        --msgbox "WARNING: This will delete the cloned NFS storage in Proxmox PVE and the cloned dataset in JovianDSS on which the Proxmox NFS storage is based. This operation cannot be undone!" 10 70
+
+    local exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        rm -f "$dialog_selected"
+        return 1
+    fi
+
+    # Show storage selection menu
+    dialog --keep-tite \
+        --title "Select Cloned NFS Storage to Delete" \
+        --ok-label "Select" --cancel-label "Cancel" \
+        --menu "Choose a cloned NFS storage to delete:" 15 60 8 \
+        "${menu_items[@]}" 2> "$dialog_selected"
+
+    exit_code=$?
+    local selected_index=$(cat "$dialog_selected")
+    rm -f "$dialog_selected"
+
+    if [[ $exit_code -ne 0 || -z "$selected_index" ]]; then
+        return 1
+    fi
+
+    # Get the selected storage name and its NFS IP
+    local selected_storage
+    local selected_nfs_ip_final
+    local current_index=1
+    while IFS= read -r storage_with_ip; do
+        if [[ -n "$storage_with_ip" ]]; then
+            if [[ "$current_index" == "$selected_index" ]]; then
+                selected_storage="${storage_with_ip%:*}"
+                selected_nfs_ip_final="${storage_with_ip#*:}"
+                break
+            fi
+            ((current_index++))
+        fi
+    done <<< "$cloned_storages_with_ips"
+
+    # Set the NFS IP for the selected storage
+    selected_nfs_ip="$selected_nfs_ip_final"
+
+    if [[ -z "$selected_storage" ]]; then
+        dialog --msgbox "Error: Could not determine selected storage." 8 50
+        return 1
+    fi
+
+    # Final confirmation dialog - user must type "delete"
+    local confirm_input=$(mktemp)
+    dialog --inputbox "To confirm deletion of storage '$selected_storage', type 'delete' (without quotes):" 8 70 2> "$confirm_input"
+    exit_code=$?
+    local confirmation=$(cat "$confirm_input")
+    rm -f "$confirm_input"
+
+    if [[ $exit_code -ne 0 || "$confirmation" != "delete" ]]; then
+        dialog --msgbox "Deletion cancelled." 8 40
+        return 1
+    fi
+
+    # Show progress dialog
+    dialog --infobox "Deleting cloned NFS storage '$selected_storage'...
+
+This may take a moment." 8 50
+
+    # Execute deletion
+    if delete_pve_NFS_storage "$selected_storage"; then
+        dialog --msgbox "Successfully deleted cloned NFS storage '$selected_storage'." 8 60
+    else
+        dialog --msgbox "Error: Failed to delete cloned NFS storage '$selected_storage'. Check the log file for details." 8 70
+    fi
+}
+
+# MAIN SCRIPT EXECUTION
+
+# Main script entry point
+main() {
+    # Initialize logging system first
+    if ! init_logging; then
+        echo "Error: Failed to initialize logging system" >&2
+        exit 1
+    fi
+    
+    log_info "Starting PVE Tools script"
+    
+    # Initialize configuration
+    if ! init_config; then
+        log_error "Failed to initialize configuration"
+        exit 1
+    fi
+    
+    log_info "PVE Tools initialized"
+    
+    # Main application loop
+    clear
+    while true; do
+        main_menu
+    done
+}
+
+# Only run main if this script is executed directly (not sourced)
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main "$@"
+fi

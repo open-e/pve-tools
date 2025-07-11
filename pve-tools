@@ -1,4 +1,22 @@
 #!/bin/bash
+#    Copyright (c) 2025 Open-E, Inc.
+#    All Rights Reserved.
+#
+#    This file is licensed under the GNU General Public License, Version 3.0 (the "License");
+#    you may not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         https://www.gnu.org/licenses/gpl-3.0
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#    GNU General Public License for more details.
 
 export LANG=en_US.UTF-8
 export LC_ALL=en_US.UTF-8
@@ -47,7 +65,30 @@ selected_snapshot_index=""
 nfs_current_step=1
 nfs_total_steps=5
 
+# Disk type constants
+DISK_TYPES="(scsi|ide|sata|virtio|efidisk|tpmstate|nvme)"
+DISK_PATTERN="^${DISK_TYPES}[0-9]+:[^:]+:[0-9]+/vm"
+
 # STORAGE IP MAPPING
+
+# Check if any NFS storage exists in Proxmox VE
+check_nfs_storage_exists() {
+    log_debug "check_nfs_storage_exists: Checking for NFS storage in /etc/pve/storage.cfg"
+    
+    if [[ ! -f "/etc/pve/storage.cfg" ]]; then
+        log_error "check_nfs_storage_exists: /etc/pve/storage.cfg not found"
+        return 1
+    fi
+    
+    # Check if any NFS storage entries exist
+    if grep -q "^nfs:" /etc/pve/storage.cfg; then
+        log_debug "check_nfs_storage_exists: NFS storage found"
+        return 0
+    else
+        log_debug "check_nfs_storage_exists: No NFS storage found"
+        return 1
+    fi
+}
 
 # Build storage name to IP address mapping table
 build_storage_ip_map() {
@@ -731,8 +772,6 @@ get_etc_conf_file_for_id() {
 get_storage_name_of_id() {
     local id="$1"
     local etc_conf conf_type storage_name
-    local disk_types="scsi|ide|sata|virtio|efidisk|tpmstate|nvme"
-    local pattern="^(${disk_types})[0-9]+:[^:]+:[0-9]+/vm"
 
     # 1) locate the /etc/pve config file
     etc_conf=$(get_etc_conf_file_for_id "$id") || return 1
@@ -753,7 +792,7 @@ get_storage_name_of_id() {
         vm)
             # use the more specific pattern to find the first VM disk line
             storage_name=$(
-                grep -E "$pattern" "$etc_conf" \
+                grep -E "$DISK_PATTERN" "$etc_conf" \
                 | head -n1 \
                 | awk -F: '{print $2}' \
                 | xargs
@@ -1097,12 +1136,11 @@ restore_vm() {
     fi
 
     # Update storage references in config
-    local disk_types="scsi|ide|sata|virtio|efidisk|tpmstate|nvme"
     local current_storage_name
-    current_storage_name="$(grep -E "^(${disk_types})[0-9]+:\s+[^:]+:[0-9]+/vm" "$dst_conf" | head -1 | awk -F':' '{print $2}' | awk '{$1=$1};1')"
+    current_storage_name="$(grep -E "^${DISK_TYPES}[0-9]+:\s+[^:]+:[0-9]+/vm" "$dst_conf" | head -1 | awk -F':' '{print $2}' | awk '{$1=$1};1')"
 
     if [[ -n "$current_storage_name" ]]; then
-        sed -i -E "s@^((${disk_types})[0-9]+:) *${current_storage_name}:@\1${storage_name}:@g" "$dst_conf"
+        sed -i -E "s@^(${DISK_TYPES}[0-9]+:) *${current_storage_name}:@\1${storage_name}:@g" "$dst_conf"
         log_info "Updated storage reference from $current_storage_name to $storage_name in VM $vmid config"
     else
         log_error "Could not find storage reference in VM $vmid config"
@@ -2963,6 +3001,17 @@ main() {
     if ! init_config; then
         log_error "Failed to initialize configuration"
         exit 1
+    fi
+    
+    # Check if any NFS storage exists
+    if ! check_nfs_storage_exists; then
+        dialog --title "No NFS Storage Found" \
+               --msgbox "No NFS storage found in Proxmox VE. Please connect one first." \
+               8 60 \
+               --ok-label "Exit"
+        clear
+        log_info "Script terminated: No NFS storage found"
+        exit 0
     fi
     
     # Build storage to IP mapping table

@@ -90,6 +90,46 @@ log_debug() {
     log "DEBUG" "$1"
 }
 
+# DIALOG DEPENDENCY CHECK
+
+# Check for dialog and install if missing
+check_for_dialog_and_install_if_missing() {
+    log_info "Checking for dialog dependency"
+    
+    # Check if dialog is installed
+    if command -v dialog >/dev/null 2>&1; then
+        log_info "Dialog is already installed"
+        return 0
+    fi
+    
+    log_info "Dialog not found, attempting to install"
+    echo "Installing missing dialog package. Please wait..."
+    
+    # Update package list
+    if ! apt-get update >/dev/null 2>&1; then
+        echo "Error: Failed to update package list. Please check your network connection." >&2
+        log_error "Failed to update package list"
+        exit 1
+    fi
+    
+    # Install dialog
+    if ! apt-get install -y dialog >/dev/null 2>&1; then
+        echo "Error: Failed to install dialog package. Please install it manually: apt-get install dialog" >&2
+        log_error "Failed to install dialog via apt-get"
+        exit 1
+    fi
+    
+    # Verify installation
+    if ! command -v dialog >/dev/null 2>&1; then
+        echo "Error: Dialog installation failed. Please install it manually." >&2
+        log_error "Dialog installation verification failed"
+        exit 1
+    fi
+    
+    log_info "Dialog installed successfully"
+    return 0
+}
+
 # CONFIGURATION MANAGEMENT
 
 # Initialize configuration system
@@ -736,7 +776,7 @@ is_mnt_conf_file_form_existing_vmct() {
 get_cloned_config_file_list() {
     for storage in $(get_cloned_storage_list); do
         ls -1 /mnt/pve/"$storage"/images/*/*.conf 2>/dev/null
-    done
+    done | sort | uniq
 }
 
 
@@ -769,11 +809,26 @@ step1_select_config() {
         fi
     done
 
-    local i vmid
+    local i vmid seen_vmids=()
     for ((i=0; i<${#confs[@]}; i++)); do
         # Extract VM/CT ID from path like /mnt/pve/storage/images/103/103.conf
         local dir_name="$(dirname "${confs[i]}")"
         vmid=$(basename "$dir_name")
+        
+        # Skip if we've already seen this VM ID
+        local skip=false
+        for seen_vmid in "${seen_vmids[@]}"; do
+            if [[ "$seen_vmid" == "$vmid" ]]; then
+                skip=true
+                break
+            fi
+        done
+        
+        if [[ "$skip" == true ]]; then
+            continue
+        fi
+        
+        seen_vmids+=("$vmid")
         vmids+=("$vmid")
 
         # Get VM/CT type
@@ -2585,6 +2640,9 @@ main() {
     fi
     
     log_info "Starting PVE Tools script"
+    
+    # Check for dialog dependency and install if missing
+    check_for_dialog_and_install_if_missing
     
     # Initialize configuration
     if ! init_config; then

@@ -33,6 +33,9 @@ rest_api_password=admin
 rest_api_port=82
 selected_nfs_ip=""
 
+# Storage to IP mapping table
+declare -A storage_ip_map
+
 # NFS wizard variables
 selected_pool=""
 selected_dataset=""
@@ -43,6 +46,62 @@ selected_dataset_index=""
 selected_snapshot_index=""
 nfs_current_step=1
 nfs_total_steps=5
+
+# STORAGE IP MAPPING
+
+# Build storage name to IP address mapping table
+build_storage_ip_map() {
+    log_debug "build_storage_ip_map: Building storage to IP mapping table"
+    
+    # Clear existing mapping
+    storage_ip_map=()
+    
+    # Read storage.cfg and extract NFS storage entries
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^nfs:[[:space:]]*([^[:space:]]+) ]]; then
+            local storage_name="${BASH_REMATCH[1]}"
+            local server_ip=""
+            
+            # Read the next few lines to find the server IP
+            while IFS= read -r config_line; do
+                if [[ "$config_line" =~ ^[[:space:]]*server[[:space:]]+([^[:space:]]+) ]]; then
+                    server_ip="${BASH_REMATCH[1]}"
+                    break
+                elif [[ "$config_line" =~ ^[[:space:]]*$ ]] || [[ "$config_line" =~ ^[a-zA-Z]+: ]]; then
+                    # Empty line or start of new section, stop looking
+                    break
+                fi
+            done
+            
+            if [[ -n "$server_ip" ]]; then
+                storage_ip_map["$storage_name"]="$server_ip"
+                log_debug "build_storage_ip_map: Mapped storage '$storage_name' to IP '$server_ip'"
+            fi
+        fi
+    done < /etc/pve/storage.cfg
+    
+    log_info "build_storage_ip_map: Built mapping for ${#storage_ip_map[@]} storage entries"
+}
+
+# Get IP address for a specific storage name
+get_storage_ip() {
+    local storage_name="$1"
+    
+    if [[ -z "$storage_name" ]]; then
+        log_error "get_storage_ip: storage_name is required"
+        return 1
+    fi
+    
+    if [[ -n "${storage_ip_map[$storage_name]}" ]]; then
+        local ip="${storage_ip_map[$storage_name]}"
+        log_debug "get_storage_ip: Found IP '$ip' for storage '$storage_name'"
+        echo "$ip"
+        return 0
+    else
+        log_error "get_storage_ip: No IP mapping found for storage '$storage_name'"
+        return 1
+    fi
+}
 
 # LOGGING FUNCTIONS
 
@@ -77,17 +136,23 @@ log() {
 
 # Log info message
 log_info() {
-    log "INFO" "$1"
+    if [[ -f "$LOG_FILE" ]]; then
+        log "INFO" "$1"
+    fi
 }
 
 # Log error message
 log_error() {
-    log "ERROR" "$1"
+    if [[ -f "$LOG_FILE" ]]; then
+        log "ERROR" "$1"
+    fi
 }
 
 # Log debug message
 log_debug() {
-    log "DEBUG" "$1"
+    if [[ -f "$LOG_FILE" ]]; then
+        log "DEBUG" "$1"
+    fi
 }
 
 # DIALOG DEPENDENCY CHECK
@@ -199,13 +264,9 @@ log_info "Running cleanup on remote node"
 
 # Get all mounted NFS directories
 all_nfs_mounts=$(mount | grep -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:/\S+\s.+\snfs\s' | awk '{print $3}' | sort)
-echo "$all_nfs_mounts" | while read -r mount; do
-done
 
 # Get active PVE storage mounts
 active_pve_mounts=$(pvesm status | awk '$2 == "nfs" && $3 == "active" {print "/mnt/pve/" $1}' | sort)
-echo "$active_pve_mounts" | while read -r mount; do
-done
 
 # Calculate inactive mounts
 inactive_mounts=$(comm -23 <(echo "$all_nfs_mounts") <(echo "$active_pve_mounts"))
@@ -213,9 +274,6 @@ log_info "Inactive mounts to process: $(echo $inactive_mounts | wc -w) mounts"
 
 if [ -z "$inactive_mounts" ]; then
   log_info "No inactive mounts found to clean up"
-else
-  echo "$inactive_mounts" | while read -r mount; do
-  done
 fi
 
 for mount_point in $inactive_mounts; do
@@ -225,13 +283,14 @@ for mount_point in $inactive_mounts; do
   # Check if mount point is actually mounted
   if mount | grep -q "$mount_point"; then
     log_info "Unmounting $mount_point"
-    if umount "$mount_point"; then
+    if umount -l "$mount_point"; then
       log_info "Unmounted: $mount_point"
     else
       log_error "Failed to unmount: $mount_point"
       continue
     fi
   else
+    log_info "Mount point already unmounted: $mount_point"
   fi
   
   # Check if directory exists
@@ -239,26 +298,12 @@ for mount_point in $inactive_mounts; do
     continue
   fi
   
-  # List directory contents for debugging
-  ls_output=$(ls -la "$mount_point" 2>&1)
-  if [ $? -eq 0 ]; then
-    echo "$ls_output" | while read -r line; do
-    done
-  else
-    log_error "Cannot list directory contents: $mount_point - $ls_output"
-  fi
-  
   # Attempt to remove directory
   log_info "Attempting to remove directory: $mount_point"
-  rmdir_output=$(rmdir "$mount_point" 2>&1)
-  rmdir_exit=$?
-  
-  if [ $rmdir_exit -eq 0 ]; then
+  if rmdir "$mount_point" 2>/dev/null; then
     log_info "Removed: $mount_point"
   else
-    log_error "Failed to remove directory: $mount_point - $rmdir_output"
-    if [ -d "$mount_point" ]; then
-    fi
+    log_error "Failed to remove directory: $mount_point"
   fi
 done
 
@@ -286,35 +331,22 @@ echo "$pve_directories" | while read -r dir; do
   # Check if directory is currently mounted
   if mount | grep -q "$dir"; then
     log_info "Directory is mounted but not active, unmounting: $dir"
-    if umount "$dir"; then
+    if umount -l "$dir"; then
       log_info "Unmounted orphaned directory: $dir"
     else
       log_error "Failed to unmount orphaned directory: $dir"
       continue
     fi
   else
-  fi
-  
-  # List directory contents for debugging
-  ls_output=$(ls -la "$dir" 2>&1)
-  if [ $? -eq 0 ]; then
-    echo "$ls_output" | while read -r line; do
-    done
-  else
-    log_error "Cannot list orphaned directory contents: $dir - $ls_output"
+    log_info "Directory not mounted: $dir"
   fi
   
   # Attempt to remove orphaned directory
   log_info "Attempting to remove orphaned directory: $dir"
-  rmdir_output=$(rmdir "$dir" 2>&1)
-  rmdir_exit=$?
-  
-  if [ $rmdir_exit -eq 0 ]; then
+  if rmdir "$dir" 2>/dev/null; then
     log_info "Removed orphaned: $dir"
   else
-    log_error "Failed to remove orphaned directory: $dir - $rmdir_output"
-    if [ -d "$dir" ]; then
-    fi
+    log_error "Failed to remove orphaned directory: $dir"
   fi
 done
 ENDSCRIPT
@@ -1066,12 +1098,11 @@ restore_vm() {
 
     # Update storage references in config
     local disk_types="scsi|ide|sata|virtio|efidisk|tpmstate|nvme"
-    local pattern="^("${disk_types}")[0-9]+:[^:]+:[0-9]+/vm"
     local current_storage_name
-    current_storage_name="$(grep -E "$pattern" "$dst_conf" | awk -F':' '{print $2}' | xargs)"
+    current_storage_name="$(grep -E "^(${disk_types})[0-9]+:\s+[^:]+:[0-9]+/vm" "$dst_conf" | head -1 | awk -F':' '{print $2}' | awk '{$1=$1};1')"
 
     if [[ -n "$current_storage_name" ]]; then
-        sed -i -E "s@^((${disk_types})[0-9]+:[[:space:]]+)${current_storage_name}:@\1${storage_name}:@g" "$dst_conf"
+        sed -i -E "s@^((${disk_types})[0-9]+:) *${current_storage_name}:@\1${storage_name}:@g" "$dst_conf"
         log_info "Updated storage reference from $current_storage_name to $storage_name in VM $vmid config"
     else
         log_error "Could not find storage reference in VM $vmid config"
@@ -1203,6 +1234,11 @@ restore_from_clone_wizard() {
     # Reset conflict resolution variables
     new_vmct_id=""
     conflict_selected_host=""
+    
+    # Ensure storage configuration is synchronized
+    dialog --title "Initializing..." --infobox "Synchronizing storage discovery..." 5 50
+    sync_storage_discovery
+    clear
 
     while true; do
         case $current_step in
@@ -1348,7 +1384,7 @@ get_datasets_in_pool() {
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
-        echo "Error: Failed to connect to server for datasets." >&2
+        echo "get_datasets_in_pool: Error: Failed to connect to server for datasets." >&2
         return 1
     fi
 
@@ -1384,7 +1420,7 @@ get_snapshots_in_dataset() {
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
-        echo "Error: Failed to connect to server for snapshots." >&2
+        echo "get_snapshots_in_dataset: Error: Failed to connect to server for snapshots." >&2
         return 1
     fi
 
@@ -1430,7 +1466,7 @@ get_snapshots_with_times() {
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
-        echo "Error: Failed to connect to server for snapshots." >&2
+        echo "get_snapshots_with_times: Error: Failed to connect to server for snapshots." >&2
         return 1
     fi
 
@@ -1766,7 +1802,7 @@ extract_timestamp_from_snapname() {
             "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
         local curl_exit=$?
         if [[ $curl_exit -ne 0 ]]; then
-            echo "Error: Failed to connect to server for snapshot creation time." >&2
+            echo "extract_timestamp_from_snapname: Error: Failed to connect to server for snapshot creation time." >&2
             return 1
         fi
 
@@ -1896,6 +1932,90 @@ add_nfs_storage_to_proxmox() {
         --nodes "$nodes_csv" > /dev/null 2>&1
 }
 
+wait_for_storage_mount() {
+    local storage_name="$1"
+    local max_wait=30
+    local wait_time=0
+    
+    log_info "Waiting for storage '$storage_name' to become available..."
+    
+    while [[ $wait_time -lt $max_wait ]]; do
+        if [[ -d "/mnt/pve/$storage_name" ]]; then
+            log_info "Storage '$storage_name' is now available"
+            return 0
+        fi
+        
+        sleep 2
+        wait_time=$((wait_time + 2))
+        log_debug "Waiting for storage mount... ${wait_time}s/${max_wait}s"
+    done
+    
+    log_error "Storage '$storage_name' failed to mount within ${max_wait}s"
+    return 1
+}
+
+refresh_storage_cache() {
+    local storage_name="$1"
+    
+    log_info "Refreshing storage cache for '$storage_name'..."
+    
+    # Force Proxmox to refresh storage information
+    pvesh set /nodes/$(hostname)/storage/"$storage_name" --enabled 1 2>/dev/null || true
+    
+    # Wait a moment for the refresh to take effect
+    sleep 2
+    
+    # Clear any cached storage information
+    rm -f /tmp/pve-storage-* 2>/dev/null || true
+}
+
+sync_storage_discovery() {
+    log_info "Synchronizing storage discovery for restore wizard..."
+    
+    # Rebuild storage IP mapping to ensure all storage is discovered
+    build_storage_ip_map
+    
+    # Clear any cached storage information
+    rm -f /tmp/pve-storage-* 2>/dev/null || true
+    
+    # Force refresh of all NFS storages
+    local nfs_storages
+    nfs_storages=$(get_pve_NFS_storage)
+    if [[ -n "$nfs_storages" ]]; then
+        while IFS= read -r storage_name; do
+            [[ -n "$storage_name" ]] && pvesh set /nodes/$(hostname)/storage/"$storage_name" --enabled 1 2>/dev/null || true
+        done <<< "$nfs_storages"
+    fi
+    
+    # Wait for storage system to stabilize
+    sleep 3
+    
+    log_info "Storage discovery synchronization complete"
+}
+
+wait_for_config_files() {
+    local storage_name="$1"
+    local max_wait=60
+    local wait_time=0
+    
+    log_info "Waiting for VM/CT config files to be discoverable in storage '$storage_name'..."
+    
+    while [[ $wait_time -lt $max_wait ]]; do
+        local config_count=$(ls -1 /mnt/pve/"$storage_name"/images/*/*.conf 2>/dev/null | wc -l)
+        if [[ $config_count -gt 0 ]]; then
+            log_info "Found $config_count config files in storage '$storage_name'"
+            return 0
+        fi
+        
+        sleep 3
+        wait_time=$((wait_time + 3))
+        log_debug "Waiting for config files... ${wait_time}s/${max_wait}s"
+    done
+    
+    log_info "No config files found in storage '$storage_name' within ${max_wait}s (this is normal for new storage)"
+    return 0
+}
+
 perform_clone_and_setup() {
     local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot")
 
@@ -1924,6 +2044,24 @@ perform_clone_and_setup() {
         dialog --msgbox "Failed to add storage to Proxmox!" 8 40
         return 1
     fi
+
+    dialog --title "Processing..." --infobox "Waiting for storage to become available..." 6 50
+
+    if ! wait_for_storage_mount "$clone_name"; then
+        dialog --msgbox "Storage was added but failed to mount properly.\nIt may take a few minutes to become available." 8 60
+        return 1
+    fi
+
+    dialog --title "Processing..." --infobox "Refreshing storage information..." 6 50
+
+    refresh_storage_cache "$clone_name"
+    
+    # Rebuild storage IP mapping to include the new storage
+    build_storage_ip_map
+
+    dialog --title "Processing..." --infobox "Scanning for VM/CT configurations..." 6 50
+
+    wait_for_config_files "$clone_name"
 
     dialog --msgbox "Clone and NFS setup completed successfully!\n\nClone: $clone_name\nNFS Share: $clone_name\nProxmox Storage: $clone_name" 10 60
 }
@@ -2061,23 +2199,187 @@ get_pve_NFS_storage() {
     ' "$storage_cfg"
 }
 
+# Function: auto_select_nfs_ip
+auto_select_nfs_ip() {
+    local storage_name="$1"  # Optional: specific storage name to match
+    local available_ips=()
+    
+    log_debug "auto_select_nfs_ip: Called with storage_name='$storage_name'"
+    log_debug "auto_select_nfs_ip: Current selected_nfs_ip='$selected_nfs_ip'"
+    
+    # Get all unique NFS server IPs from storage config
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] && available_ips+=("$ip")
+    done < <(grep "server" /etc/pve/storage.cfg | awk '{print $2}' | sort -u)
+    
+    log_debug "auto_select_nfs_ip: Found ${#available_ips[@]} IP(s): ${available_ips[*]}"
+    
+    if [[ ${#available_ips[@]} -eq 0 ]]; then
+        log_error "auto_select_nfs_ip: No NFS server IPs found in storage config"
+        return 1
+    fi
+    
+    # If only one IP, use it
+    if [[ ${#available_ips[@]} -eq 1 ]]; then
+        selected_nfs_ip="${available_ips[0]}"
+        log_info "auto_select_nfs_ip: Using single NFS IP: $selected_nfs_ip"
+        return 0
+    fi
+    
+    # If specific storage name provided, try to match it first
+    if [[ -n "$storage_name" ]]; then
+        local storage_ip
+        storage_ip=$(get_server_ip_address_of_given_nfs_storage "$storage_name")
+        if [[ -n "$storage_ip" ]]; then
+            # Test if this IP works
+            local temp_selected_nfs_ip="$selected_nfs_ip"
+            selected_nfs_ip="$storage_ip"
+            if rest_api_connection_test >/dev/null 2>&1; then
+                log_info "auto_select_nfs_ip: Using storage-specific IP: $selected_nfs_ip"
+                return 0
+            else
+                selected_nfs_ip="$temp_selected_nfs_ip"
+                log_debug "auto_select_nfs_ip: Storage-specific IP $storage_ip failed connection test"
+            fi
+        fi
+    fi
+    
+    # Try each IP sequentially
+    for ip in "${available_ips[@]}"; do
+        log_debug "auto_select_nfs_ip: Testing IP: $ip"
+        local temp_selected_nfs_ip="$selected_nfs_ip"
+        selected_nfs_ip="$ip"
+        if rest_api_connection_test >/dev/null 2>&1; then
+            log_info "auto_select_nfs_ip: Successfully connected to IP: $selected_nfs_ip"
+            return 0
+        else
+            selected_nfs_ip="$temp_selected_nfs_ip"
+            log_debug "auto_select_nfs_ip: IP $ip failed connection test"
+        fi
+    done
+    
+    # All IPs failed, ask user to select
+    log_info "auto_select_nfs_ip: All IPs failed, prompting user for selection"
+    
+    # Reuse existing IP selection logic
+    local line ips=() menu_items=()
+    for ip in "${available_ips[@]}"; do
+        ips+=("$ip")
+    done
+    ips+=("Enter new IP")
+    
+    local i
+    for ((i=0; i<${#ips[@]}; i++)); do
+        menu_items+=("$i" "${ips[i]}")
+    done
+    
+    local dialog_selected=$(mktemp)
+    local cmd=(dialog --keep-tite --title "NFS Server Selection"
+         --ok-label "Select" --cancel-label "Cancel"
+         --menu "Multiple NFS servers found. Choose one:" 15 60 8)
+    local options=("${menu_items[@]}")
+    
+    local selected_option dialog_exit_code
+    exec 3>&1
+    selected_option=$(dialog "${cmd[@]}" "${options[@]}" 2>&1 1>&3)
+    dialog_exit_code=$?
+    exec 3>&-
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # User selected an option
+            if [[ "${ips[selected_option]}" == "Enter new IP" ]]; then
+                # Get custom IP input
+                local input_ip
+                input_ip=$(dialog --keep-tite --title "Enter New IP" --inputbox "Enter the NFS Storage IP address:" 8 40 3>&1 1>&2 2>&3)
+                if [[ $? -eq 0 && -n "$input_ip" ]]; then
+                    if [[ "$input_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                        selected_nfs_ip="$input_ip"
+                        log_info "auto_select_nfs_ip: User provided IP: $selected_nfs_ip"
+                        return 0
+                    else
+                        log_error "auto_select_nfs_ip: Invalid IP address format: $input_ip"
+                        return 1
+                    fi
+                else
+                    log_error "auto_select_nfs_ip: User cancelled IP input"
+                    return 1
+                fi
+            else
+                selected_nfs_ip="${ips[selected_option]}"
+                log_info "auto_select_nfs_ip: User selected IP: $selected_nfs_ip"
+                return 0
+            fi
+            ;;
+        1)  # User cancelled
+            log_error "auto_select_nfs_ip: User cancelled IP selection"
+            return 1
+            ;;
+    esac
+    
+    return 1
+}
+
+# Function: ensure_nfs_ip_selected
+ensure_nfs_ip_selected() {
+    local storage_name="$1"  # Optional: specific storage name
+    
+    log_debug "ensure_nfs_ip_selected: Called with storage_name='$storage_name'"
+    log_debug "ensure_nfs_ip_selected: Current selected_nfs_ip='$selected_nfs_ip'"
+    
+    # If IP is already selected, just return success
+    if [[ -n "$selected_nfs_ip" ]]; then
+        log_debug "ensure_nfs_ip_selected: IP already selected, returning success"
+        return 0
+    fi
+    
+    log_debug "ensure_nfs_ip_selected: No IP selected, trying auto-select"
+    
+    # Try to auto-select IP
+    if auto_select_nfs_ip "$storage_name"; then
+        log_debug "ensure_nfs_ip_selected: auto_select_nfs_ip succeeded, selected_nfs_ip='$selected_nfs_ip'"
+        return 0
+    else
+        log_error "ensure_nfs_ip_selected: Failed to select NFS IP"
+        return 1
+    fi
+}
+
 # Function: get_pools
 get_pools() {
-    # Check if we have NFS IP configured
-    if [[ -z "$selected_nfs_ip" ]]; then
-        echo "Error: selected_nfs_ip is not set" >&2
-        return 1
+    local nfs_ip="$1"
+    
+    log_debug "get_pools: Starting function"
+    log_debug "get_pools: nfs_ip='$nfs_ip'"
+    log_debug "get_pools: rest_api_user='$rest_api_user'"
+    log_debug "get_pools: rest_api_port='$rest_api_port'"
+    
+    # If no IP provided, try to use global selected_nfs_ip
+    if [[ -z "$nfs_ip" ]]; then
+        if ! ensure_nfs_ip_selected; then
+            log_error "get_pools: ensure_nfs_ip_selected failed"
+            echo "get_pools: Error: Failed to select NFS IP" >&2
+            return 1
+        fi
+        nfs_ip="$selected_nfs_ip"
+        log_debug "get_pools: Using global selected_nfs_ip='$nfs_ip'"
     fi
 
     # Make REST API call to get all pools
     local response
+    local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
+    log_debug "get_pools: Making request to: $url"
+    
     response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" \
         -H 'Content-Type: application/json' \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools" 2>/dev/null)
+        "$url" 2>/dev/null)
 
     local curl_exit=$?
+    log_debug "get_pools: curl exit code: $curl_exit"
+    
     if [[ $curl_exit -ne 0 ]]; then
-        echo "Error: Failed to connect to server" >&2
+        log_error "get_pools: curl failed with exit code $curl_exit"
+        echo "get_pools: Error: Failed to connect to server" >&2
         return 1
     fi
 
@@ -2092,13 +2394,13 @@ try:
         if name:
             print(name)
 except Exception as e:
-    print('Error: Failed to parse JSON response', file=sys.stderr)
+    print('get_pools: Error: Failed to parse JSON response', file=sys.stderr)
     sys.exit(1)
 "
 
     local python_exit=$?
     if [[ $python_exit -ne 0 ]]; then
-        echo "Error: Failed to parse JSON response" >&2
+        echo "get_pools: Error: Failed to parse JSON response" >&2
         return 1
     fi
 }
@@ -2122,23 +2424,25 @@ get_nfs_server_ip_of_given_storage() {
 # Function: get_dataset_pool_name
 get_dataset_pool_name() {
     local dataset_name="$1"
+    local nfs_ip="$2"
 
     if [[ -z "$dataset_name" ]]; then
         echo "Error: dataset_name is required" >&2
         return 1
     fi
 
-    # Check if we have NFS IP configured
-    if [[ -z "$selected_nfs_ip" ]]; then
-        echo "Error: selected_nfs_ip is not set" >&2
+    if [[ -z "$nfs_ip" ]]; then
+        echo "Error: nfs_ip is required" >&2
         return 1
     fi
 
+    log_debug "get_dataset_pool_name: Looking for dataset '$dataset_name' on IP '$nfs_ip'"
+
     # Get all pools
     local pools
-    pools=$(get_pools)
+    pools=$(get_pools "$nfs_ip")
     if [[ $? -ne 0 ]]; then
-        echo "Error: Failed to get pools list" >&2
+        echo "get_dataset_pool_name: Error: Failed to get pools list" >&2
         return 1
     fi
 
@@ -2152,7 +2456,7 @@ get_dataset_pool_name() {
         local response
         response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" \
             -H 'Content-Type: application/json' \
-            "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
+            "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
 
         local curl_exit=$?
         if [[ $curl_exit -ne 0 ]]; then
@@ -2190,9 +2494,15 @@ except Exception as e:
 # Function: is_clone
 is_clone() {
     local volume_name="$1"
+    local nfs_ip="$2"
 
     if [[ -z "$volume_name" ]]; then
         echo "Error: volume_name is required" >&2
+        return 1
+    fi
+
+    if [[ -z "$nfs_ip" ]]; then
+        echo "Error: nfs_ip is required" >&2
         return 1
     fi
 
@@ -2205,21 +2515,17 @@ is_clone() {
         return 1
     fi
 
-    # Check if we have NFS IP configured
-    if [[ -z "$selected_nfs_ip" ]]; then
-        echo "Error: selected_nfs_ip is not set" >&2
-        return 1
-    fi
+    log_debug "is_clone: Checking if '$volume_name' is a clone on IP '$nfs_ip'"
 
     # Make REST API call to get nas-volumes for the pool
     local response
     response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" \
         -H 'Content-Type: application/json' \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
+        "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
-        echo "Error: Failed to connect to server" >&2
+        echo "is_clone: Error: Failed to connect to server" >&2
         return 1
     fi
 
@@ -2246,7 +2552,7 @@ except Exception as e:
 
     local python_exit=$?
     if [[ $python_exit -ne 0 ]]; then
-        echo "Error: Failed to parse JSON response" >&2
+        echo "is_clone: Error: Failed to parse JSON response" >&2
         return 1
     fi
 
@@ -2267,23 +2573,23 @@ except Exception as e:
 # Function: delete_cloned_dataset
 delete_cloned_dataset() {
     local dataset_name="$1"
+    local nfs_ip="$2"
 
     if [[ -z "$dataset_name" ]]; then
         echo "Error: dataset_name is required" >&2
         return 1
     fi
 
-    # Check if we have NFS IP configured
-    if [[ -z "$selected_nfs_ip" ]]; then
-        echo "Error: selected_nfs_ip is not set" >&2
+    if [[ -z "$nfs_ip" ]]; then
+        echo "Error: nfs_ip is required" >&2
         return 1
     fi
 
-    log_info "Checking dataset: $dataset_name"
+    log_info "Checking dataset: $dataset_name on IP: $nfs_ip"
 
     # Find which pool this dataset belongs to
     local pool_name
-    pool_name=$(get_dataset_pool_name "$dataset_name")
+    pool_name=$(get_dataset_pool_name "$dataset_name" "$nfs_ip")
     if [[ $? -ne 0 ]]; then
         # echo "Error: Dataset '$dataset_name' not found in any pool" >&2
         return 1
@@ -2293,7 +2599,7 @@ delete_cloned_dataset() {
 
     # Check if this dataset is a clone
     local volume_name="$pool_name/$dataset_name"
-    if ! is_clone "$volume_name"; then
+    if ! is_clone "$volume_name" "$nfs_ip"; then
         log_error "Dataset '$dataset_name' is not a clone. Refusing to delete original dataset."
         return 1
     fi
@@ -2301,7 +2607,7 @@ delete_cloned_dataset() {
     log_info "Confirmed: Dataset '$dataset_name' is a clone. Proceeding with deletion..."
 
     # Make REST API call to delete the dataset
-    local url="https://${selected_nfs_ip}:${rest_api_port}/api/v4/pools/${pool_name}/nas-volumes/${dataset_name}"
+    local url="https://${nfs_ip}:${rest_api_port}/api/v4/pools/${pool_name}/nas-volumes/${dataset_name}"
 
     local response
     response=$(curl -k -s -X DELETE \
@@ -2359,10 +2665,17 @@ get_cloned_storage_list() {
             continue
         fi
 
+        # Get the IP address for this storage
+        local storage_ip
+        storage_ip=$(get_storage_ip "$storage_name")
+        if [[ $? -ne 0 ]]; then
+            log_error "get_cloned_storage_list: No IP mapping found for storage '$storage_name'"
+            continue
+        fi
+
         # Find which pool this storage belongs to
         local pool_name
-        selected_nfs_ip=$(get_nfs_server_ip_of_given_storage "$storage_name") # fix for missing IP ADDR
-        pool_name=$(get_dataset_pool_name "$storage_name")
+        pool_name=$(get_dataset_pool_name "$storage_name" "$storage_ip")
         if [[ $? -ne 0 ]]; then
             # Storage not found in any pool, skip it
             continue
@@ -2370,7 +2683,7 @@ get_cloned_storage_list() {
 
         # Check if this storage is a clone
         local volume_name="$pool_name/$storage_name"
-        if is_clone "$volume_name"; then
+        if is_clone "$volume_name" "$storage_ip"; then
             echo "$storage_name"
         fi
 
@@ -2411,15 +2724,19 @@ delete_pve_NFS_storage() {
 
     log_info "Confirmed: '$pve_storage_name' is a PVE NFS storage"
 
-    # Step 2: Check if we have NFS IP configured
-    if [[ -z "$selected_nfs_ip" ]]; then
-        echo "Error: selected_nfs_ip is not set" >&2
+    # Step 2: Get the IP address for this storage
+    local storage_ip
+    storage_ip=$(get_storage_ip "$pve_storage_name")
+    if [[ $? -ne 0 ]]; then
+        echo "delete_pve_NFS_storage: Error: No IP mapping found for storage '$pve_storage_name'" >&2
         return 1
     fi
 
+    log_info "Storage '$pve_storage_name' mapped to IP '$storage_ip'"
+
     # Step 3: Find which pool this storage belongs to
     local pool_name
-    pool_name=$(get_dataset_pool_name "$pve_storage_name")
+    pool_name=$(get_dataset_pool_name "$pve_storage_name" "$storage_ip")
     if [[ $? -ne 0 ]]; then
         # echo "Error: Storage '$pve_storage_name' not found in any pool" >&2
         return 1
@@ -2429,7 +2746,7 @@ delete_pve_NFS_storage() {
 
     # Step 4: Check if this storage is a clone dataset
     local volume_name="$pool_name/$pve_storage_name"
-    if ! is_clone "$volume_name"; then
+    if ! is_clone "$volume_name" "$storage_ip"; then
         log_error "Storage '$pve_storage_name' is not a clone dataset. Refusing to delete original dataset."
         return 1
     fi
@@ -2438,7 +2755,7 @@ delete_pve_NFS_storage() {
 
     # Step 5: Delete the cloned dataset via REST API
     log_info "Deleting cloned dataset..."
-    if ! delete_cloned_dataset "$pve_storage_name"; then
+    if ! delete_cloned_dataset "$pve_storage_name" "$storage_ip"; then
         log_error "Failed to delete cloned dataset '$pve_storage_name'"
         return 1
     fi
@@ -2490,17 +2807,15 @@ get_cloned_storage_list_with_ips() {
 
         # Get NFS IP for this storage
         local nfs_ip
-        nfs_ip=$(get_server_ip_address_of_given_nfs_storage "$storage_name")
-        if [[ -z "$nfs_ip" ]]; then
+        nfs_ip=$(get_storage_ip "$storage_name")
+        if [[ $? -ne 0 ]]; then
+            log_error "get_cloned_storage_list_with_ips: No IP mapping found for storage '$storage_name'"
             continue
         fi
 
-        # Set global variable for REST API calls
-        selected_nfs_ip="$nfs_ip"
-
         # Find which pool this storage belongs to
         local pool_name
-        pool_name=$(get_dataset_pool_name "$storage_name")
+        pool_name=$(get_dataset_pool_name "$storage_name" "$nfs_ip")
         if [[ $? -ne 0 ]]; then
             # Storage not found in any pool, skip it
             continue
@@ -2508,7 +2823,7 @@ get_cloned_storage_list_with_ips() {
 
         # Check if this storage is a clone
         local volume_name="$pool_name/$storage_name"
-        if is_clone "$volume_name"; then
+        if is_clone "$volume_name" "$nfs_ip"; then
             cloned_storages_with_ips+=("$storage_name:$nfs_ip")
         fi
 
@@ -2649,6 +2964,9 @@ main() {
         log_error "Failed to initialize configuration"
         exit 1
     fi
+    
+    # Build storage to IP mapping table
+    build_storage_ip_map
     
     log_info "PVE Tools initialized"
     

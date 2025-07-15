@@ -24,6 +24,9 @@ export NCURSES_NO_UTF8_ACS=1
 
 # GLOBAL VARIABLES
 
+# Version information
+VERSION="0.10"
+
 # Product information
 VENDOR="Open-E"
 PRODUCT="JovianDSS"
@@ -40,6 +43,8 @@ selected_host_index=""
 current_step=1
 total_steps=3
 select_all_mode=false
+storage_discovery_done=false
+cached_config_list=()  # Cache config list to avoid repeated discovery
 
 # Conflict resolution variables
 new_vmct_id=""
@@ -298,9 +303,9 @@ cleanup_inactive_nfs_storage() {
         log_info "Processing cleanup for node: $node ($ip)"
         (
         ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
-log_info() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: $1"; }
-log_debug() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] DEBUG: $1"; }
-log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: $1"; }
+log_info() { true; }
+log_debug() { true; }
+log_error() { true; }
 log_info "Running cleanup on remote node"
 
 # Get all mounted NFS directories
@@ -661,7 +666,6 @@ config_file_type() {
     
     if [ ! -f "$config_file" ]; then
         log_error "config_file_type: File not found: $config_file"
-        echo "Error: file not found: $config_file" >&2
         return 1
     fi
     
@@ -765,7 +769,7 @@ get_etc_conf_file_for_id() {
     done
 
     # If we get here, no file was found
-    echo "Error: no config file found for VMID ${vmid}" >&2
+    log_error "get_etc_conf_file_for_id: no config file found for VMID ${vmid}"
     return 1
 }
 
@@ -800,7 +804,7 @@ get_storage_name_of_id() {
             echo "$storage_name"
             ;;
         *)
-            echo "Error: unknown config type '$conf_type' in $etc_conf" >&2
+            log_error "get_storage_name_of_id: unknown config type '$conf_type' in $etc_conf"
             return 1
             ;;
     esac
@@ -814,11 +818,11 @@ is_mnt_conf_file_form_existing_vmct() {
 
     # 1) sanity check
     if [[ -z "$mnt_conf_file" ]]; then
-        echo "Usage: $FUNCNAME /mnt/pve/.../<vmid>.conf" >&2
+        log_error "get_storage_name_from_mnt_conf_file: Usage: $FUNCNAME /mnt/pve/.../<vmid>.conf"
         return 2
     fi
     if [[ ! -f "$mnt_conf_file" ]]; then
-        echo "Error: file not found: $mnt_conf_file" >&2
+        log_error "get_storage_name_from_mnt_conf_file: File not found: $mnt_conf_file"
         return 1
     fi
 
@@ -855,13 +859,19 @@ get_cloned_config_file_list() {
 step1_select_config() {
     local line confs=() menu_items=() vmids=()
 
-    while IFS= read -r line; do
-        confs+=("$line")
-        log_debug "Added config file: $line"
-    done < <(get_cloned_config_file_list)
+    # Use cached config list if available, otherwise get fresh list
+    if [ "${#cached_config_list[@]}" -eq 0 ]; then
+        while IFS= read -r line; do
+            cached_config_list+=("$line")
+            log_debug "Added config file to cache: $line"
+        done < <(get_cloned_config_file_list)
+    fi
+    
+    # Copy cached list to working array
+    confs=("${cached_config_list[@]}")
 
     if [ "${#confs[@]}" -eq 0 ]; then
-        dialog --msgbox "No configs found to restore." 8 40
+        dialog --msgbox "No VMs/CTs found to restore." 8 40
         return 1
     fi
 
@@ -1268,15 +1278,19 @@ restore_from_clone_wizard() {
     selected_host_index=""
     current_step=1
     select_all_mode=false
+    storage_discovery_done=false
+    cached_config_list=()  # Clear cached config list
     
     # Reset conflict resolution variables
     new_vmct_id=""
     conflict_selected_host=""
     
-    # Ensure storage configuration is synchronized
-    dialog --title "Initializing..." --infobox "Synchronizing storage discovery..." 5 50
-    sync_storage_discovery
-    clear
+    # Ensure storage configuration is synchronized (only once)
+    if [[ "$storage_discovery_done" == false ]]; then
+        dialog --title "Please wait..." --infobox "Synchronizing storage discovery..." 5 50
+        sync_storage_discovery
+        storage_discovery_done=true
+    fi
 
     while true; do
         case $current_step in
@@ -1284,15 +1298,12 @@ restore_from_clone_wizard() {
                 step1_select_config
                 case $? in
                     0)  # Next
-                        clear
                         current_step=2
                         ;;
                     1)  # Back to Main
-                        clear
                         return
                         ;;
                     2)  # Stay on same step (retry)
-                        clear
                         ;;
                 esac
                 ;;
@@ -1300,15 +1311,12 @@ restore_from_clone_wizard() {
                 step2_select_host
                 case $? in
                     0)  # Next
-                        clear
                         current_step=3
                         ;;
                     1)  # Back to Main
-                        clear
                         return
                         ;;
                     2)  # Back
-                        clear
                         current_step=1
                         ;;
                 esac
@@ -1317,16 +1325,13 @@ restore_from_clone_wizard() {
                 step3_summary
                 case $? in
                     0)  # Apply
-                        clear
                         perform_restore
                         return
                         ;;
                     1)  # Back to Main
-                        clear
                         return
                         ;;
                     2)  # Back
-                        clear
                         current_step=2
                         ;;
                 esac
@@ -1359,8 +1364,144 @@ rest_api_connection_test() {
     if [[ "$status" == "200" ]]; then
         return 0
     else
-        echo "REST API connection test failed (HTTP $status)" >&2
+        log_error "REST API connection test failed (HTTP $status)"
         return 1
+    fi
+}
+
+get_custom_ips() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        grep "^custom_ips=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr ',' '\n' | grep -v '^$'
+    fi
+}
+
+validate_ip() {
+    local ip="$1"
+    
+    # Check basic format
+    if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        return 1
+    fi
+    
+    # Check each octet is in valid range (0-255)
+    IFS='.' read -ra octets <<< "$ip"
+    for octet in "${octets[@]}"; do
+        # Remove leading zeros and check range
+        octet=$((10#$octet))
+        if [[ $octet -lt 0 || $octet -gt 255 ]]; then
+            return 1
+        fi
+    done
+    
+    return 0
+}
+
+ip_already_exists() {
+    local check_ip="$1"
+    local existing_ips
+    
+    # Check custom IPs from config
+    existing_ips=$(get_custom_ips)
+    if [[ -n "$existing_ips" ]]; then
+        while IFS= read -r ip; do
+            if [[ "$ip" == "$check_ip" ]]; then
+                return 0
+            fi
+        done <<< "$existing_ips"
+    fi
+    
+    # Check IPs from storage.cfg
+    local storage_cfg="/etc/pve/storage.cfg"
+    if [[ -f "$storage_cfg" ]]; then
+        while IFS= read -r ip; do
+            if [[ "$ip" == "$check_ip" ]]; then
+                return 0
+            fi
+        done < <(grep server "$storage_cfg" | awk '{print $2}')
+    fi
+    
+    return 1
+}
+
+add_custom_ip() {
+    local new_ip="$1"
+    local current_ips
+    current_ips=$(get_custom_ips | tr '\n' ',' | sed 's/,$//')
+    
+    # Check if IP already exists
+    if [[ -n "$current_ips" && "$current_ips" == *"$new_ip"* ]]; then
+        return 0
+    fi
+    
+    # Add new IP
+    if [[ -n "$current_ips" ]]; then
+        current_ips="$current_ips,$new_ip"
+    else
+        current_ips="$new_ip"
+    fi
+    
+    # Update config file
+    if grep -q "^custom_ips=" "$CONFIG_FILE" 2>/dev/null; then
+        sed -i "s/^custom_ips=.*/custom_ips=$current_ips/" "$CONFIG_FILE"
+    else
+        echo "custom_ips=$current_ips" >> "$CONFIG_FILE"
+    fi
+    
+    log_info "Added custom IP: $new_ip"
+}
+
+remove_custom_ip() {
+    local ip_to_remove="$1"
+    local current_ips
+    current_ips=$(get_custom_ips | tr '\n' ',' | sed 's/,$//')
+    
+    # Remove the IP
+    current_ips=$(echo "$current_ips" | sed "s/$ip_to_remove,//g" | sed "s/,$ip_to_remove//g" | sed "s/^$ip_to_remove$//g")
+    
+    # Update config file
+    if [[ -n "$current_ips" ]]; then
+        sed -i "s/^custom_ips=.*/custom_ips=$current_ips/" "$CONFIG_FILE"
+    else
+        sed -i "/^custom_ips=/d" "$CONFIG_FILE"
+    fi
+    
+    log_info "Removed custom IP: $ip_to_remove"
+}
+
+manage_custom_ips() {
+    local custom_ips_array=()
+    local menu_items=()
+    
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && custom_ips_array+=("$line")
+    done <<< "$(get_custom_ips)"
+    
+    if [[ ${#custom_ips_array[@]} -eq 0 ]]; then
+        dialog --msgbox "No custom IPs found." 8 40
+        return
+    fi
+    
+    for ((i=0; i<${#custom_ips_array[@]}; i++)); do
+        menu_items+=("$i" "${custom_ips_array[i]}")
+    done
+    
+    local selected_ip
+    selected_ip=$(dialog --keep-tite --title "Manage Custom IPs" \
+        --ok-label "Delete" --cancel-label "Back" \
+        --menu "Select IP to delete:" 15 50 8 \
+        "${menu_items[@]}" 3>&1 1>&2 2>&3)
+    
+    local dialog_result=$?
+    
+    # Only proceed if user selected an IP (not cancelled)
+    if [[ $dialog_result -eq 0 && -n "$selected_ip" ]]; then
+        local ip_to_delete="${custom_ips_array[selected_ip]}"
+        # Ask for confirmation before deletion
+        if dialog --yesno "Delete IP: $ip_to_delete?" 8 40; then
+            remove_custom_ip "$ip_to_delete"
+            # Only show success message after actual deletion
+            dialog --msgbox "IP $ip_to_delete deleted." 8 40
+        fi
     fi
 }
 
@@ -1371,9 +1512,19 @@ get_current_storage_servers_ip() {
         [[ -n "$line" ]] && ips+=("$line")
     done < <(grep server "$storage_cfg" | awk '{print $2}')
 
+    # Add custom IPs from config file
+    local custom_ips
+    custom_ips=$(get_custom_ips)
+    if [[ -n "$custom_ips" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] && ips+=("$line")
+        done <<< "$custom_ips"
+    fi
+
     # Remove duplicates
     readarray -t uniq_ips < <(printf "%s\n" "${ips[@]}" | sort -u)
     uniq_ips+=("Enter new IP")
+    uniq_ips+=("Manage custom IPs")
 
     printf '%s\n' "${uniq_ips[@]}"
 }
@@ -1388,12 +1539,12 @@ get_pool_names() {
     local curl_exit=$?
 
     if [[ $curl_exit -ne 0 ]]; then
-        echo "Error: Failed to connect to NFS server at $addr:$rest_api_port" >&2
+        log_error "test_nfs_connection: Failed to connect to NFS server at $addr:$rest_api_port"
         return 1
     fi
 
     if [[ -z "$response" ]]; then
-        echo "Error: Empty response from server" >&2
+        log_error "test_nfs_connection: Empty response from server"
         return 1
     fi
 
@@ -1422,12 +1573,12 @@ get_datasets_in_pool() {
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
-        echo "get_datasets_in_pool: Error: Failed to connect to server for datasets." >&2
+        log_error "get_datasets_in_pool: Failed to connect to server for datasets"
         return 1
     fi
 
     if [[ -z "$response" ]]; then
-        echo "Error: Empty response from server (datasets)." >&2
+        log_error "get_datasets_in_pool: Empty response from server (datasets)"
         return 1
     fi
 
@@ -1458,12 +1609,12 @@ get_snapshots_in_dataset() {
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
-        echo "get_snapshots_in_dataset: Error: Failed to connect to server for snapshots." >&2
+        log_error "get_snapshots_in_dataset: Failed to connect to server for snapshots"
         return 1
     fi
 
     if [[ -z "$response" ]]; then
-        echo "Error: Empty response from server (snapshots)." >&2
+        log_error "get_snapshots_in_dataset: Empty response from server (snapshots)"
         return 1
     fi
 
@@ -1504,12 +1655,12 @@ get_snapshots_with_times() {
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
-        echo "get_snapshots_with_times: Error: Failed to connect to server for snapshots." >&2
+        log_error "get_snapshots_with_times: Failed to connect to server for snapshots"
         return 1
     fi
 
     if [[ -z "$response" ]]; then
-        echo "Error: Empty response from server (snapshots)." >&2
+        log_error "get_snapshots_with_times: Empty response from server (snapshots)"
         return 1
     fi
 
@@ -1617,20 +1768,42 @@ nfs_step1_select_ip() {
         0)  # Next
             selected_nfs_ip_index="$selected_option"
             if [[ "${ips[selected_option]}" == "Enter new IP" ]]; then
-                # Get custom IP input
+                # Get custom IP input with validation loop
                 local input_ip
-                input_ip=$(dialog --keep-tite --title "Enter New IP" --inputbox "Enter the NFS Storage IP address:" 8 40 3>&1 1>&2 2>&3)
-                if [[ $? -eq 0 && -n "$input_ip" ]]; then
-                    if [[ "$input_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
-                        selected_nfs_ip="$input_ip"
-                        return 0
-                    else
-                        dialog --msgbox "Invalid IP address format." 8 40
-                        return 2  # Retry same step
+                while true; do
+                    input_ip=$(dialog --keep-tite --title "Enter New IP" --inputbox "Enter the NFS Storage IP address:" 8 40 3>&1 1>&2 2>&3)
+                    if [[ $? -ne 0 ]]; then
+                        return 2  # User cancelled
                     fi
-                else
-                    return 2  # Retry same step
+                    
+                    if [[ -z "$input_ip" ]]; then
+                        dialog --msgbox "IP address cannot be empty. Please try again." 8 50
+                        continue
+                    fi
+                    
+                    if ! validate_ip "$input_ip"; then
+                        dialog --msgbox "Invalid IP address format or range. Please enter a valid IP address (e.g., 192.168.1.100)." 10 60
+                        continue
+                    fi
+                    
+                    if ip_already_exists "$input_ip"; then
+                        dialog --msgbox "IP address $input_ip already exists in configuration. Please enter a different IP." 10 60
+                        continue
+                    fi
+                    
+                    # IP is valid and new, break the loop
+                    break
+                done
+                
+                selected_nfs_ip="$input_ip"
+                # Ask if user wants to save this IP (only for manually entered IPs)
+                if dialog --yesno "Save this IP ($input_ip) for future use?" 8 50; then
+                    add_custom_ip "$input_ip"
                 fi
+                return 0
+            elif [[ "${ips[selected_option]}" == "Manage custom IPs" ]]; then
+                manage_custom_ips
+                return 2  # Retry same step
             else
                 selected_nfs_ip="${ips[selected_option]}"
                 return 0
@@ -1840,7 +2013,7 @@ extract_timestamp_from_snapname() {
             "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
         local curl_exit=$?
         if [[ $curl_exit -ne 0 ]]; then
-            echo "extract_timestamp_from_snapname: Error: Failed to connect to server for snapshot creation time." >&2
+            log_error "extract_timestamp_from_snapname: Failed to connect to server for snapshot creation time"
             return 1
         fi
 
@@ -1866,7 +2039,7 @@ except Exception:
 " "$snapname")
 
         if [[ -z "$creation" ]]; then
-            echo "Error: Failed to extract creation time from snapshot data." >&2
+            log_error "extract_timestamp_from_snapname: Failed to extract creation time from snapshot data"
             return 1
         fi
         echo "$creation"
@@ -2016,17 +2189,7 @@ sync_storage_discovery() {
     # Clear any cached storage information
     rm -f /tmp/pve-storage-* 2>/dev/null || true
     
-    # Force refresh of all NFS storages
-    local nfs_storages
-    nfs_storages=$(get_pve_NFS_storage)
-    if [[ -n "$nfs_storages" ]]; then
-        while IFS= read -r storage_name; do
-            [[ -n "$storage_name" ]] && pvesh set /nodes/$(hostname)/storage/"$storage_name" --enabled 1 2>/dev/null || true
-        done <<< "$nfs_storages"
-    fi
-    
-    # Wait for storage system to stabilize
-    sleep 3
+    pvesm status >/dev/null 2>&1
     
     log_info "Storage discovery synchronization complete"
 }
@@ -2122,15 +2285,12 @@ add_nfs_storage_wizard() {
                 nfs_step1_select_ip
                 case $? in
                     0)  # Next
-                        clear
                         nfs_current_step=2
                         ;;
                     1)  # Back to Main
-                        clear
                         return
                         ;;
                     2)  # Retry same step
-                        clear
                         ;;
                 esac
                 ;;
@@ -2138,15 +2298,12 @@ add_nfs_storage_wizard() {
                 nfs_step2_select_pool
                 case $? in
                     0)  # Next
-                        clear
                         nfs_current_step=3
                         ;;
                     1)  # Back to Main
-                        clear
                         return
                         ;;
                     2)  # Back
-                        clear
                         nfs_current_step=1
                         ;;
                 esac
@@ -2155,15 +2312,12 @@ add_nfs_storage_wizard() {
                 nfs_step3_select_dataset
                 case $? in
                     0)  # Next
-                        clear
                         nfs_current_step=4
                         ;;
                     1)  # Back to Main
-                        clear
                         return
                         ;;
                     2)  # Back
-                        clear
                         nfs_current_step=2
                         ;;
                 esac
@@ -2172,15 +2326,12 @@ add_nfs_storage_wizard() {
                 nfs_step4_select_snapshot
                 case $? in
                     0)  # Next
-                        clear
                         nfs_current_step=5
                         ;;
                     1)  # Back to Main
-                        clear
                         return
                         ;;
                     2)  # Back
-                        clear
                         nfs_current_step=3
                         ;;
                 esac
@@ -2189,16 +2340,13 @@ add_nfs_storage_wizard() {
                 nfs_step5_summary
                 case $? in
                     0)  # Apply
-                        clear
                         perform_clone_and_setup
                         return
                         ;;
                     1)  # Back to Main
-                        clear
                         return
                         ;;
                     2)  # Back
-                        clear
                         nfs_current_step=4
                         ;;
                 esac
@@ -2223,7 +2371,7 @@ get_pve_NFS_storage() {
     local storage_cfg="/etc/pve/storage.cfg"
 
     if [[ ! -f "$storage_cfg" ]]; then
-        echo "Error: $storage_cfg not found" >&2
+        log_error "get_nfs_server_ip_of_given_storage: $storage_cfg not found"
         return 1
     fi
 
@@ -2396,7 +2544,7 @@ get_pools() {
     if [[ -z "$nfs_ip" ]]; then
         if ! ensure_nfs_ip_selected; then
             log_error "get_pools: ensure_nfs_ip_selected failed"
-            echo "get_pools: Error: Failed to select NFS IP" >&2
+            log_error "get_pools: Failed to select NFS IP"
             return 1
         fi
         nfs_ip="$selected_nfs_ip"
@@ -2417,7 +2565,7 @@ get_pools() {
     
     if [[ $curl_exit -ne 0 ]]; then
         log_error "get_pools: curl failed with exit code $curl_exit"
-        echo "get_pools: Error: Failed to connect to server" >&2
+        log_error "get_pools: Failed to connect to server"
         return 1
     fi
 
@@ -2438,7 +2586,7 @@ except Exception as e:
 
     local python_exit=$?
     if [[ $python_exit -ne 0 ]]; then
-        echo "get_pools: Error: Failed to parse JSON response" >&2
+        log_error "get_pools: Failed to parse JSON response"
         return 1
     fi
 }
@@ -2464,13 +2612,13 @@ get_dataset_pool_name() {
     local dataset_name="$1"
     local nfs_ip="$2"
 
-    if [[ -z "$dataset_name" ]]; then
-        echo "Error: dataset_name is required" >&2
+    if [[ -z "$dataset_name" ]]en
+        log_error "get_dataset_pool_name: dataset_name is required"
         return 1
     fi
 
     if [[ -z "$nfs_ip" ]]; then
-        echo "Error: nfs_ip is required" >&2
+        log_error "get_dataset_pool_name: nfs_ip is required"
         return 1
     fi
 
@@ -2480,7 +2628,7 @@ get_dataset_pool_name() {
     local pools
     pools=$(get_pools "$nfs_ip")
     if [[ $? -ne 0 ]]; then
-        echo "get_dataset_pool_name: Error: Failed to get pools list" >&2
+        log_error "get_dataset_pool_name: Failed to get pools list"
         return 1
     fi
 
@@ -2540,7 +2688,7 @@ is_clone() {
     fi
 
     if [[ -z "$nfs_ip" ]]; then
-        echo "Error: nfs_ip is required" >&2
+        log_error "get_dataset_pool_name: nfs_ip is required"
         return 1
     fi
 
@@ -2614,12 +2762,12 @@ delete_cloned_dataset() {
     local nfs_ip="$2"
 
     if [[ -z "$dataset_name" ]]; then
-        echo "Error: dataset_name is required" >&2
+        log_error "get_dataset_pool_name: dataset_name is required"
         return 1
     fi
 
     if [[ -z "$nfs_ip" ]]; then
-        echo "Error: nfs_ip is required" >&2
+        log_error "get_dataset_pool_name: nfs_ip is required"
         return 1
     fi
 
@@ -2873,6 +3021,147 @@ get_cloned_storage_list_with_ips() {
     done
 }
 
+# Function: check_vmct_using_storage
+check_vmct_using_storage() {
+    local storage_name="$1"
+    local temp_file=$(mktemp)
+    
+    log_debug "check_vmct_using_storage: Checking if VMs/CTs are using storage '$storage_name'"
+    
+    # Check all VM and CT configuration files
+    for conf_file in /etc/pve/nodes/*/qemu-server/*.conf /etc/pve/nodes/*/lxc/*.conf; do
+        if [[ -f "$conf_file" ]]; then
+            # Get VM/CT ID from filename
+            local vmct_id=$(basename "$conf_file" .conf)
+            
+            # Check if this VM/CT uses the specified storage
+            local storage_match=false
+            if grep -q "^rootfs:.*${storage_name}:" "$conf_file" 2>/dev/null; then
+                storage_match=true
+                log_debug "check_vmct_using_storage: Found rootfs match in $conf_file"
+            elif grep -E -q "^${DISK_TYPES}[0-9]+:.*${storage_name}:" "$conf_file" 2>/dev/null; then
+                storage_match=true
+                log_debug "check_vmct_using_storage: Found disk match in $conf_file"
+            fi
+            
+            if [[ "$storage_match" == "true" ]]; then
+                
+                # Determine type (VM or CT)
+                local vmct_type="VM"
+                if [[ "$conf_file" == */lxc/* ]]; then
+                    vmct_type="CT"
+                fi
+                
+                # Get VM/CT name from config (handle both formats: "name: value" and "name=value")
+                local vmct_name=$(grep -E "^name[[:space:]]*[:=]" "$conf_file" 2>/dev/null | sed -E 's/^name[[:space:]]*[:=][[:space:]]*//' | head -1)
+                if [[ -z "$vmct_name" ]]; then
+                    vmct_name="(no name)"
+                fi
+                
+                # Get tags from config (handle both formats: "tags: value" and "tags=value")
+                local tags=$(grep -E "^tags[[:space:]]*[:=]" "$conf_file" 2>/dev/null | sed -E 's/^tags[[:space:]]*[:=][[:space:]]*//' | head -1)
+                if [[ -z "$tags" ]]; then
+                    tags="(no tags)"
+                fi
+                
+                # Write to temp file in format: ID|TYPE|NAME|TAGS (using pipe delimiter to avoid space issues)
+                echo "$vmct_id|$vmct_type|$vmct_name|$tags" >> "$temp_file"
+                
+                log_debug "check_vmct_using_storage: Found $vmct_type $vmct_id ($vmct_name) using storage '$storage_name'"
+            fi
+        fi
+    done
+    
+    # Log temp file contents for debugging
+    if [[ -s "$temp_file" ]]; then
+        log_debug "check_vmct_using_storage: Found usage data in temp file:"
+        while IFS= read -r line; do
+            log_debug "check_vmct_using_storage: $line"
+        done < "$temp_file"
+        log_debug "check_vmct_using_storage: Returning temp file path: $temp_file"
+        printf '%s\n' "$temp_file"
+        return 0
+    else
+        log_debug "check_vmct_using_storage: No VMs/CTs found using storage '$storage_name'"
+        rm -f "$temp_file"
+        return 1
+    fi
+}
+
+# Function: show_vmct_usage_warning
+show_vmct_usage_warning() {
+    local storage_name="$1"
+    local usage_file="$2"
+    
+    log_debug "show_vmct_usage_warning: Showing warning for storage '$storage_name'"
+    log_debug "show_vmct_usage_warning: Usage file path: $usage_file"
+    
+    # Check if usage file exists and has content
+    if [[ ! -f "$usage_file" ]]; then
+        log_error "show_vmct_usage_warning: Usage file '$usage_file' does not exist"
+        return 1
+    fi
+    
+    if [[ ! -s "$usage_file" ]]; then
+        log_error "show_vmct_usage_warning: Usage file '$usage_file' is empty"
+        return 1
+    fi
+    
+    log_debug "show_vmct_usage_warning: Usage file contents:"
+    while IFS= read -r line; do
+        log_debug "show_vmct_usage_warning: File line: '$line'"
+    done < "$usage_file"
+    
+    # Build warning message
+    local warning_msg="WARNING: The following VMs/CTs are using storage '$storage_name':\n\n"
+    local vm_count=0
+    
+    while IFS='|' read -r vmct_id vmct_type vmct_name tags; do
+        log_debug "show_vmct_usage_warning: Read line: ID='$vmct_id', Type='$vmct_type', Name='$vmct_name', Tags='$tags'"
+        
+        # Skip empty lines
+        if [[ -z "$vmct_id" ]]; then
+            log_debug "show_vmct_usage_warning: Skipping empty line"
+            continue
+        fi
+        
+        warning_msg="${warning_msg}ID: $vmct_id | Type: $vmct_type | Name: $vmct_name | Tags: $tags\n"
+        ((vm_count++))
+        
+        log_debug "show_vmct_usage_warning: Added VM/CT to warning: ID=$vmct_id, Type=$vmct_type, Name=$vmct_name, Tags=$tags"
+    done < "$usage_file"
+    
+    log_debug "show_vmct_usage_warning: Total VMs/CTs processed: $vm_count"
+    
+    warning_msg="${warning_msg}\nDeleting this storage will make these VMs/CTs unusable!\n\nDo you want to continue with deletion?"
+    
+    log_debug "show_vmct_usage_warning: Final warning message:"
+    log_debug "show_vmct_usage_warning: $warning_msg"
+    
+    # Show warning dialog with Yes/No/Back options
+    local dialog_result=$(mktemp)
+    dialog --keep-tite \
+        --title "Storage In Use Warning" \
+        --yes-label "Continue Delete" \
+        --no-label "Cancel" \
+        --extra-button --extra-label "Back" \
+        --defaultno \
+        --yesno "$warning_msg" 20 80
+    
+    local exit_code=$?
+    rm -f "$dialog_result"
+    
+    # Return appropriate exit code
+    # 0 = Yes (Continue Delete), 1 = No (Cancel), 3 = Extra (Back)
+    # With --defaultno, Cancel is highlighted but Continue Delete is still "Yes"
+    case $exit_code in
+        0) return 0 ;;  # Continue Delete
+        1) return 1 ;;  # Cancel
+        3) return 3 ;;  # Back
+        *) return 1 ;;  # Default to cancel
+    esac
+}
+
 # Function: delete_cloned_nfs_storage_wizard
 delete_cloned_nfs_storage_wizard() {
     # Check if REST API is configured
@@ -2880,6 +3169,9 @@ delete_cloned_nfs_storage_wizard() {
         dialog --msgbox "REST API configuration is not complete. Please use Setup to configure it first." 8 60
         return 1
     fi
+
+    # Show progress message while fetching data
+    dialog --infobox "Fetching Cloned Volumes ..." 5 35
 
     # Get list of cloned storages with their IPs
     local cloned_storages_with_ips
@@ -2919,43 +3211,78 @@ delete_cloned_nfs_storage_wizard() {
         return 1
     fi
 
-    # Show storage selection menu
-    dialog --keep-tite \
-        --title "Select Cloned NFS Storage to Delete" \
-        --ok-label "Select" --cancel-label "Cancel" \
-        --menu "Choose a cloned NFS storage to delete:" 15 60 8 \
-        "${menu_items[@]}" 2> "$dialog_selected"
+    # Storage selection loop to handle back button
+    while true; do
+        # Show storage selection menu
+        dialog --keep-tite \
+            --title "Select Cloned NFS Storage to Delete" \
+            --ok-label "Select" --cancel-label "Cancel" \
+            --menu "Choose a cloned NFS storage to delete:" 15 60 8 \
+            "${menu_items[@]}" 2> "$dialog_selected"
 
-    exit_code=$?
-    local selected_index=$(cat "$dialog_selected")
-    rm -f "$dialog_selected"
+        exit_code=$?
+        local selected_index=$(cat "$dialog_selected")
+        rm -f "$dialog_selected"
 
-    if [[ $exit_code -ne 0 || -z "$selected_index" ]]; then
-        return 1
-    fi
-
-    # Get the selected storage name and its NFS IP
-    local selected_storage
-    local selected_nfs_ip_final
-    local current_index=1
-    while IFS= read -r storage_with_ip; do
-        if [[ -n "$storage_with_ip" ]]; then
-            if [[ "$current_index" == "$selected_index" ]]; then
-                selected_storage="${storage_with_ip%:*}"
-                selected_nfs_ip_final="${storage_with_ip#*:}"
-                break
-            fi
-            ((current_index++))
+        if [[ $exit_code -ne 0 || -z "$selected_index" ]]; then
+            return 1
         fi
-    done <<< "$cloned_storages_with_ips"
 
-    # Set the NFS IP for the selected storage
-    selected_nfs_ip="$selected_nfs_ip_final"
+        # Get the selected storage name and its NFS IP
+        local selected_storage
+        local selected_nfs_ip_final
+        local current_index=1
+        while IFS= read -r storage_with_ip; do
+            if [[ -n "$storage_with_ip" ]]; then
+                if [[ "$current_index" == "$selected_index" ]]; then
+                    selected_storage="${storage_with_ip%:*}"
+                    selected_nfs_ip_final="${storage_with_ip#*:}"
+                    break
+                fi
+                ((current_index++))
+            fi
+        done <<< "$cloned_storages_with_ips"
 
-    if [[ -z "$selected_storage" ]]; then
-        dialog --msgbox "Error: Could not determine selected storage." 8 50
-        return 1
-    fi
+        # Set the NFS IP for the selected storage
+        selected_nfs_ip="$selected_nfs_ip_final"
+
+        if [[ -z "$selected_storage" ]]; then
+            dialog --msgbox "Error: Could not determine selected storage." 8 50
+            return 1
+        fi
+
+        # Check if VMs/CTs are using this storage
+        local usage_file
+        if usage_file=$(check_vmct_using_storage "$selected_storage"); then
+            # Storage is in use, show warning
+            log_info "Storage '$selected_storage' is in use by VMs/CTs"
+            
+            show_vmct_usage_warning "$selected_storage" "$usage_file"
+            local warning_result=$?
+            
+            # Clean up temp file
+            rm -f "$usage_file"
+            
+            case $warning_result in
+                0)  # Continue Delete
+                    log_info "User chose to continue deletion despite VM/CT usage"
+                    break
+                    ;;
+                1)  # Cancel
+                    log_info "User cancelled deletion due to VM/CT usage"
+                    return 1
+                    ;;
+                3)  # Back
+                    log_info "User chose to go back to storage selection"
+                    continue
+                    ;;
+            esac
+        else
+            # No VMs/CTs using this storage, proceed
+            log_info "No VMs/CTs are using storage '$selected_storage'"
+            break
+        fi
+    done
 
     # Final confirmation dialog - user must type "delete"
     local confirm_input=$(mktemp)
@@ -3009,7 +3336,6 @@ main() {
                --msgbox "No NFS storage found in Proxmox VE. Please connect one first." \
                8 60 \
                --ok-label "Exit"
-        clear
         log_info "Script terminated: No NFS storage found"
         exit 0
     fi
@@ -3028,5 +3354,10 @@ main() {
 
 # Only run main if this script is executed directly (not sourced)
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    # Handle version argument
+    if [ "$1" = "version" ]; then
+        echo "$VERSION"
+        exit 0
+    fi
     main "$@"
 fi

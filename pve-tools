@@ -556,7 +556,8 @@ main_menu() {
     options=("0" "Add Cloned NFS Storage from JovianDSS Snapshot"
              "1" "Restore VM/CT from Cloned NFS Storage"
              "2" "Delete Cloned NFS Storage and cloned dataset in JovianDSS     "
-             "3" "Cleanup inactive NFS storage")
+             "3" "Cleanup inactive NFS storage"
+             "4" "VM/CT Manager - Bulk Actions")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -575,6 +576,9 @@ main_menu() {
                     ;;
                 3)  # Cleanup inactive NFS storage
                     cleanup_inactive_nfs_storage
+                    ;;
+                4)  # VM/CT Manager - Bulk Actions
+                    vm_ct_manager_bulk_actions
                     ;;
             esac
             ;;
@@ -2612,7 +2616,7 @@ get_dataset_pool_name() {
     local dataset_name="$1"
     local nfs_ip="$2"
 
-    if [[ -z "$dataset_name" ]]en
+    if [[ -z "$dataset_name" ]]; then
         log_error "get_dataset_pool_name: dataset_name is required"
         return 1
     fi
@@ -3307,6 +3311,562 @@ This may take a moment." 8 50
     else
         dialog --msgbox "Error: Failed to delete cloned NFS storage '$selected_storage'. Check the log file for details." 8 70
     fi
+}
+
+# VM/CT MANAGER - BULK ACTIONS
+
+# VM/CT Manager variables
+vm_manager_selected_vms=()
+vm_manager_action_counts=()
+
+# Get VMs with hostpci (passthrough) for VM/CT Manager
+vm_manager_get_vms_with_hostpci() {
+    grep -Rl hostpci /etc/pve/nodes/*/qemu-server/*.conf 2>/dev/null | \
+        sed -nE 's#.*/([0-9]+)\.conf#\1#p' | sort -u
+}
+
+# Get all VMs and CTs from entire Proxmox cluster for VM/CT Manager
+vm_manager_get_vm_ct_list() {
+    local vm_list=()
+    local hostpci_vms
+    
+    # Get VMs with hostpci for skipping
+    readarray -t hostpci_vms < <(vm_manager_get_vms_with_hostpci)
+    
+    # Get cluster-wide resources using pvesh
+    while IFS='|' read -r vmid name type status node tags; do
+        if [[ -n "$vmid" && "$vmid" != "VMID" ]]; then
+            # Skip VMs with hostpci (passthrough)
+            if [[ "$type" == "vm" ]] && [[ " ${hostpci_vms[*]} " == *" $vmid "* ]]; then
+                log_debug "Skipping vm:$vmid (hostpci present)"
+                continue
+            fi
+            
+            # Skip VMs/CTs with joviandss in name
+            if [[ "$name" == *"joviandss"* ]]; then
+                log_debug "Skipping $type:$vmid (joviandss in name: $name)"
+                continue
+            fi
+            
+            vm_list+=("$vmid|$name|$type|$status|$tags")
+        fi
+    done < <(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
+        python3 -c "
+import sys, json
+try:
+    resources = json.load(sys.stdin)
+    for resource in resources:
+        vmid = resource.get('vmid', '')
+        name = resource.get('name', 'unnamed')
+        res_type = resource.get('type', '')
+        status = resource.get('status', 'unknown')
+        node = resource.get('node', '')
+        tags = resource.get('tags', '')
+        lock = resource.get('lock', '')
+        
+        # Map resource type to our format
+        if res_type == 'qemu':
+            vm_type = 'vm'
+        elif res_type == 'lxc':
+            vm_type = 'ct'
+        else:
+            continue
+            
+        # Clean up tags (empty if None)
+        if not tags:
+            tags = ''
+            
+        # Check if VM/CT is suspended (has suspended lock or paused status)
+        if lock == 'suspended' or status == 'paused':
+            status = 'suspended'
+            
+        print(f'{vmid}|{name}|{vm_type}|{status}|{node}|{tags}')
+except Exception as e:
+    print(f'Error: {e}', file=sys.stderr)
+")
+    
+    printf '%s\n' "${vm_list[@]}"
+}
+
+# Find longest name and tag for formatting in VM/CT Manager
+vm_manager_get_max_lengths() {
+    local max_name_length=0
+    local max_tag_length=0
+    local vm_data
+    
+    while IFS='|' read -r vmid name type status tags; do
+        local name_length=${#name}
+        local tag_length=${#tags}
+        
+        if [[ $name_length -gt $max_name_length ]]; then
+            max_name_length=$name_length
+        fi
+        
+        if [[ $tag_length -gt $max_tag_length ]]; then
+            max_tag_length=$tag_length
+        fi
+    done <<< "$1"
+    
+    # Minimum lengths
+    if [[ $max_name_length -lt 10 ]]; then
+        max_name_length=10
+    fi
+    
+    if [[ $max_tag_length -lt 4 ]]; then
+        max_tag_length=4
+    fi
+    
+    echo "$max_name_length|$max_tag_length"
+}
+
+# VM/CT selection dialog for VM/CT Manager
+vm_manager_select_vm_ct() {
+    local vm_ct_data
+    local select_all_mode=false
+    local max_name_length
+    local max_tag_length
+    local menu_items=()
+    
+    # Get VM/CT data
+    vm_ct_data=$(vm_manager_get_vm_ct_list)
+    if [[ -z "$vm_ct_data" ]]; then
+        dialog --title "Error" --msgbox "No VMs or CTs found in the cluster." 8 50
+        return 1
+    fi
+    
+    # Calculate max name and tag lengths for formatting
+    local max_lengths=$(vm_manager_get_max_lengths "$vm_ct_data")
+    IFS='|' read -r max_name_length max_tag_length <<< "$max_lengths"
+    
+    while true; do
+        menu_items=()
+        local select_label
+        
+        if $select_all_mode; then
+            select_label="Deselect All"
+        else
+            select_label="Select All"
+        fi
+        
+        # Build menu items
+        while IFS='|' read -r vmid name type status tags; do
+            if [[ -n "$vmid" ]]; then
+                # Format display string with proper spacing
+                local formatted_name=$(printf "%-${max_name_length}s" "$name")
+                local formatted_tags=$(printf "%-${max_tag_length}s" "$tags")
+                local display_string=$(printf "(%s) [%s] %-2s %s" "$formatted_name" "$formatted_tags" "$type" "$status")
+                
+                # Check if this VM/CT was previously selected
+                local selection_status="off"
+                for selected_vm in "${vm_manager_selected_vms[@]}"; do
+                    if [[ "$selected_vm" == "$vmid" ]]; then
+                        selection_status="on"
+                        break
+                    fi
+                done
+                
+                menu_items+=("$vmid" "$display_string" "$selection_status")
+            fi
+        done <<< "$vm_ct_data"
+        
+        # Create dialog
+        cmd=(dialog --keep-tite --title "VM/CT Manager - Select VM/CT"
+             --ok-label "Next" --cancel-label "Back" --extra-button --extra-label "$select_label"
+             --checklist "Choose VM/CT to manage (use SPACE to select/deselect):" 20 120 12)
+        options=("${menu_items[@]}")
+        
+        dialog_menu
+        
+        case $dialog_exit_code in
+            0)  # Next
+                if [[ -n "$selected_option" ]]; then
+                    # Parse selected VMs/CTs
+                    vm_manager_selected_vms=()
+                    IFS=' ' read -ra ADDR <<< "$selected_option"
+                    for vmid in "${ADDR[@]}"; do
+                        vm_manager_selected_vms+=("$vmid")
+                    done
+                    log_info "Selected VMs/CTs: ${vm_manager_selected_vms[*]}"
+                    return 0
+                else
+                    dialog --title "Warning" --msgbox "Please select at least one VM or CT." 8 50
+                fi
+                ;;
+            1)  # Back
+                return 1
+                ;;
+            3)  # Select All/Deselect All
+                if $select_all_mode; then
+                    # Deselect all
+                    vm_manager_selected_vms=()
+                    select_all_mode=false
+                    log_debug "Deselected all VMs/CTs"
+                else
+                    # Select all
+                    vm_manager_selected_vms=()
+                    while IFS='|' read -r vmid name type status tags; do
+                        if [[ -n "$vmid" ]]; then
+                            vm_manager_selected_vms+=("$vmid")
+                        fi
+                    done <<< "$vm_ct_data"
+                    select_all_mode=true
+                    log_debug "Selected all VMs/CTs: ${vm_manager_selected_vms[*]}"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Confirm critical action with detailed explanation for VM/CT Manager
+vm_manager_confirm_critical_action() {
+    local action="$1"
+    local vm_count="${#vm_manager_selected_vms[@]}"
+    local description=""
+    local warning=""
+    
+    case "$action" in
+        "shutdown")
+            description="GRACEFUL SHUTDOWN - Sends shutdown signal to guest OS"
+            warning="- Safe: Saves all data and applications\\n- Speed: Slower (waits for guest OS)\\n- Recommended for normal operations"
+            ;;
+        "stop")
+            description="FORCE STOP - Immediately stops VM/CT without graceful shutdown"
+            warning="- UNSAFE: May cause data loss or corruption\\n- Speed: Fast (immediate)\\n- Use only when shutdown fails"
+            ;;
+        "reboot")
+            description="GRACEFUL REBOOT - Restarts VM/CT with proper shutdown first"
+            warning="- Safe: Saves all data before restart\\n- Speed: Medium (graceful shutdown + restart)\\n- Recommended for normal restarts"
+            ;;
+        "reset")
+            description="HARD RESET - Force restart like pressing physical reset button"
+            warning="- VERY UNSAFE: High risk of data corruption\\n- Speed: Fastest (immediate reset)\\n- Use ONLY when system is completely frozen"
+            ;;
+        "suspend")
+            description="SUSPEND - Pause VM/CT to memory, preserving current state"
+            warning="- Safe: Preserves all running applications\\n- Speed: Fast pause/resume\\n- Use: Temporary resource management"
+            ;;
+        *)
+            return 0  # No confirmation needed for non-critical actions
+            ;;
+    esac
+    
+    local prompt_text="CRITICAL ACTION: $description\\n\\nEffects on $vm_count VM/CT(s):\\n$warning\\n\\nTo confirm this action, type '$action' (without quotes):"
+    
+    while true; do
+        # Confirmation input with description
+        local confirm_input=$(mktemp)
+        dialog --title "CONFIRM CRITICAL ACTION" --inputbox "$prompt_text" 18 80 2> "$confirm_input"
+        local exit_code=$?
+        local confirmation=$(cat "$confirm_input")
+        rm -f "$confirm_input"
+        
+        # User cancelled
+        if [[ $exit_code -ne 0 ]]; then
+            return 1
+        fi
+        
+        # Correct input
+        if [[ "$confirmation" == "$action" ]]; then
+            return 0
+        fi
+        
+        # Wrong input - show error and retry
+        dialog --title "INPUT ERROR" --msgbox "You typed: '$confirmation'\\n\\nExpected: '$action'\\n\\nPlease try again or use Cancel to abort." 10 60
+    done
+}
+
+# Action selection dialog for VM/CT Manager
+vm_manager_select_action() {
+    local actions=(
+        "start" "Start selected VM/CT"
+        "shutdown" "Graceful shutdown of selected VM/CT"
+        "stop" "Force stop selected VM/CT"
+        "reboot" "Reboot selected VM/CT"
+        "reset" "Reset selected VM/CT"
+        "suspend" "Suspend selected VM/CT to memory"
+        "resume" "Resume suspended VM/CT"
+    )
+    
+    cmd=(dialog --keep-tite --title "VM/CT Manager - Select Action"
+         --ok-label "Execute" --cancel-label "Back"
+         --menu "Choose action to perform on selected VM/CT:" 15 60 8)
+    options=("${actions[@]}")
+    
+    dialog_menu
+    
+    case $dialog_exit_code in
+        0)  # Execute
+            if [[ -n "$selected_option" ]]; then
+                log_info "Selected action: $selected_option"
+                return 0
+            fi
+            ;;
+        1)  # Back
+            return 1
+            ;;
+    esac
+}
+
+# Get VM/CT type, current status and node from cluster for VM/CT Manager
+vm_manager_get_vm_type_status_node() {
+    local vmid="$1"
+    
+    # Get VM/CT info from cluster resources
+    local vm_info=$(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
+        python3 -c "
+import sys, json
+try:
+    resources = json.load(sys.stdin)
+    for resource in resources:
+        if str(resource.get('vmid', '')) == '$vmid':
+            res_type = resource.get('type', '')
+            status = resource.get('status', 'unknown')
+            node = resource.get('node', '')
+            lock = resource.get('lock', '')
+            
+            # Map resource type to our format
+            if res_type == 'qemu':
+                vm_type = 'vm'
+            elif res_type == 'lxc':
+                vm_type = 'ct'
+            else:
+                vm_type = 'unknown'
+                
+            # Check if VM/CT is suspended (has suspended lock or paused status)
+            if lock == 'suspended' or status == 'paused':
+                status = 'suspended'
+                
+            print(f'{vm_type}|{status}|{node}')
+            sys.exit(0)
+    print('unknown|unknown|unknown')
+except Exception as e:
+    print('unknown|unknown|unknown')
+    print(f'Error: {e}', file=sys.stderr)
+")
+    
+    if [[ -n "$vm_info" && "$vm_info" != "unknown|unknown|unknown" ]]; then
+        echo "$vm_info"
+        return 0
+    fi
+    
+    echo "unknown|unknown|unknown"
+    return 1
+}
+
+# Execute action on VM/CT for VM/CT Manager
+vm_manager_execute_action() {
+    local vmid="$1"
+    local action="$2"
+    local vm_type_status_node
+    local vm_type
+    local current_status
+    local vm_node
+    local current_node
+    local cmd_to_run
+    local result
+    
+    # Get VM type, current status and node
+    vm_type_status_node=$(vm_manager_get_vm_type_status_node "$vmid")
+    IFS='|' read -r vm_type current_status vm_node <<< "$vm_type_status_node"
+    
+    # Get current node name
+    current_node=$(hostname)
+    
+    log_debug "VM/CT $vmid: type=$vm_type, status=$current_status, node=$vm_node, action=$action"
+    
+    # Check if action is needed
+    case "$action" in
+        "start")
+            if [[ "$current_status" == "running" ]]; then
+                log_info "VM/CT $vmid already running, skipping start"
+                return 2  # Skip
+            elif [[ "$current_status" == "suspended" ]]; then
+                log_info "VM/CT $vmid is suspended, skipping start (use resume instead)"
+                return 2  # Skip
+            fi
+            ;;
+        "stop"|"shutdown")
+            if [[ "$current_status" == "stopped" ]]; then
+                log_info "VM/CT $vmid already stopped, skipping $action"
+                return 2  # Skip
+            fi
+            ;;
+        "reboot"|"reset")
+            if [[ "$current_status" == "stopped" ]]; then
+                log_info "VM/CT $vmid is stopped, skipping $action (requires running VM/CT)"
+                return 2  # Skip
+            fi
+            ;;
+        "suspend")
+            if [[ "$current_status" == "stopped" ]]; then
+                log_info "VM/CT $vmid is stopped, skipping suspend (requires running VM/CT)"
+                return 2  # Skip
+            elif [[ "$current_status" == "suspended" ]]; then
+                log_info "VM/CT $vmid already suspended, skipping suspend"
+                return 2  # Skip
+            fi
+            ;;
+        "resume")
+            if [[ "$current_status" != "suspended" ]]; then
+                log_info "VM/CT $vmid is not suspended, skipping resume (status: $current_status)"
+                return 2  # Skip
+            fi
+            ;;
+    esac
+    
+    # Build command
+    if [[ "$vm_type" == "vm" ]]; then
+        local base_cmd="qm $action $vmid"
+    elif [[ "$vm_type" == "ct" ]]; then
+        local base_cmd="pct $action $vmid"
+    else
+        log_error "Unknown VM/CT type for $vmid"
+        return 1
+    fi
+    
+    # Execute command on correct node
+    if [[ "$vm_node" == "$current_node" ]]; then
+        # Execute locally
+        cmd_to_run="$base_cmd"
+        log_info "Executing locally: $cmd_to_run"
+        
+        result=$(bash -c "$cmd_to_run" 2>&1)
+        local exit_code=$?
+        
+        if [[ $exit_code -eq 0 ]]; then
+            log_info "Action $action completed successfully for VM/CT $vmid"
+            return 0
+        else
+            log_error "Action $action failed for VM/CT $vmid: $result"
+            return 1
+        fi
+    else
+        # Execute on remote node using pvesh
+        if [[ "$vm_type" == "vm" ]]; then
+            cmd_to_run="pvesh create /nodes/$vm_node/qemu/$vmid/status/$action"
+        elif [[ "$vm_type" == "ct" ]]; then
+            cmd_to_run="pvesh create /nodes/$vm_node/lxc/$vmid/status/$action"
+        fi
+        
+        log_info "Executing on node $vm_node: $cmd_to_run"
+        
+        result=$(bash -c "$cmd_to_run" 2>&1)
+        local exit_code=$?
+        
+        if [[ $exit_code -eq 0 ]]; then
+            log_info "Action $action completed successfully for VM/CT $vmid on node $vm_node"
+            return 0
+        else
+            log_error "Action $action failed for VM/CT $vmid on node $vm_node: $result"
+            return 1
+        fi
+    fi
+}
+
+# Execute actions with progress for VM/CT Manager
+vm_manager_execute_actions() {
+    local action="$1"
+    local total_count=${#vm_manager_selected_vms[@]}
+    local success_count=0
+    local skip_count=0
+    local error_count=0
+    local current=0
+    
+    # Initialize action counts
+    vm_manager_action_counts=("$success_count" "$skip_count" "$error_count")
+    
+    for vmid in "${vm_manager_selected_vms[@]}"; do
+        current=$((current + 1))
+        local progress=$((current * 100 / total_count))
+        
+        # Show progress
+        echo "$progress" | dialog --title "Processing VM/CT" --gauge "Executing $action on VM/CT $vmid ($current/$total_count)" 8 60
+        
+        # Execute action
+        vm_manager_execute_action "$vmid" "$action"
+        local exit_code=$?
+        
+        case $exit_code in
+            0)  # Success
+                success_count=$((success_count + 1))
+                ;;
+            1)  # Error
+                error_count=$((error_count + 1))
+                ;;
+            2)  # Skip
+                skip_count=$((skip_count + 1))
+                ;;
+        esac
+        
+        # Small delay for user feedback
+        sleep 0.5
+    done
+    
+    # Update action counts
+    vm_manager_action_counts=("$success_count" "$skip_count" "$error_count")
+}
+
+# Show final summary for VM/CT Manager
+vm_manager_show_summary() {
+    local action="$1"
+    local success_count="${vm_manager_action_counts[0]}"
+    local skip_count="${vm_manager_action_counts[1]}"
+    local error_count="${vm_manager_action_counts[2]}"
+    local total_count=${#vm_manager_selected_vms[@]}
+    
+    local summary_text="Action: $action\n\n"
+    summary_text+="Total VMs/CTs processed: $total_count\n"
+    summary_text+="Successful: $success_count\n"
+    summary_text+="Skipped: $skip_count\n"
+    summary_text+="Errors: $error_count\n\n"
+    
+    if [[ $error_count -gt 0 ]]; then
+        summary_text+="Check log file for error details: $LOG_FILE"
+    fi
+    
+    dialog --title "Action Summary" --msgbox "$summary_text" 15 60
+    log_info "Action summary - Success: $success_count, Skipped: $skip_count, Errors: $error_count"
+}
+
+# VM/CT Manager - Bulk Actions main function
+vm_ct_manager_bulk_actions() {
+    # Check if running as root (required for Proxmox commands)
+    if [[ $EUID -ne 0 ]]; then
+        dialog --title "Error" --msgbox "VM/CT Manager must be run as root to access Proxmox VE commands." 8 60
+        return 1
+    fi
+    
+    # Check if Proxmox commands are available
+    if ! command -v qm >/dev/null 2>&1 || ! command -v pct >/dev/null 2>&1; then
+        dialog --title "Error" --msgbox "Proxmox VE commands (qm/pct) not found. Please run on a Proxmox VE node." 10 60
+        return 1
+    fi
+    
+    while true; do
+        # Step 1: Select VMs/CTs
+        if ! vm_manager_select_vm_ct; then
+            return 0  # Back to main menu
+        fi
+        
+        # Step 2: Select action
+        if ! vm_manager_select_action; then
+            continue  # Go back to VM selection
+        fi
+        
+        # Step 3: Confirm critical actions and execute
+        if ! vm_manager_confirm_critical_action "$selected_option"; then
+            continue  # Go back to action selection if cancelled
+        fi
+        vm_manager_execute_actions "$selected_option"
+        
+        # Step 4: Show summary
+        vm_manager_show_summary "$selected_option"
+        
+        # Ask if user wants to continue
+        if ! dialog --title "Continue?" --yesno "Do you want to perform another action?" 8 50; then
+            return 0  # Back to main menu
+        fi
+    done
 }
 
 # MAIN SCRIPT EXECUTION

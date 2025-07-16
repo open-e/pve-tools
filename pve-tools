@@ -27,6 +27,9 @@ export NCURSES_NO_UTF8_ACS=1
 # Version information
 VERSION="0.10"
 
+# Script mode flag
+VERSION_MODE=false
+
 # Product information
 VENDOR="Open-E"
 PRODUCT="JovianDSS"
@@ -70,9 +73,48 @@ selected_snapshot_index=""
 nfs_current_step=1
 nfs_total_steps=5
 
+# NFS tuning variables
+selected_nfs_storages=""
+selected_nfs_nconnect=""
+
 # Disk type constants
 DISK_TYPES="(scsi|ide|sata|virtio|efidisk|tpmstate|nvme)"
 DISK_PATTERN="^${DISK_TYPES}[0-9]+:[^:]+:[0-9]+/vm"
+
+# CLEANUP FUNCTIONS
+
+# Cleanup function to restore terminal settings and clear screen
+cleanup_and_exit() {
+    # Skip cleanup if we're just showing version
+    if [ "$VERSION_MODE" = true ]; then
+        exit 0
+    fi
+    
+    # Kill any background dialog processes
+    pkill -f "dialog.*Please wait" 2>/dev/null || true
+    
+    # Clear the screen
+    clear
+    
+    # Reset terminal settings
+    reset
+    
+    # Show cursor (in case it was hidden)
+    tput cnorm 2>/dev/null || true
+    
+    # Restore terminal to normal mode
+    stty sane 2>/dev/null || true
+    
+    log_info "Script cleanup completed - terminal restored"
+    
+    exit 0
+}
+
+# Setup trap handlers for cleanup
+trap cleanup_and_exit EXIT
+trap cleanup_and_exit SIGINT
+trap cleanup_and_exit SIGTERM
+trap cleanup_and_exit SIGTSTP
 
 # STORAGE IP MAPPING
 
@@ -276,6 +318,11 @@ EOF
 
 # UTILITY FUNCTIONS
 
+# Trim leading and trailing quotes and spaces from user input
+trimq() {
+    echo "${1}" | tr -d " \"'"
+}
+
 # Cleanup inactive NFS storage on all cluster nodes
 cleanup_inactive_nfs_storage() {
     log_info "Starting NFS cleanup on all cluster nodes"
@@ -411,6 +458,9 @@ dialog_menu() {
     "${cmd[@]}" "${options[@]}" 2> "$dialog_selected"
     dialog_exit_code=$?
     selected_option=$(< "$dialog_selected")
+    dialog --infobox "Please wait..." 5 20 &
+    # Give up to 0.1 second to suck out up to 10 000 bytes from keyboard buffer:
+    read -t 0.2 -n 10000 discard
 }
 
 # Show VM/CT conflict dialog and get user decision
@@ -543,6 +593,364 @@ select_host_for_conflict() {
     fi
 }
 
+# NFS TUNING FUNCTIONS
+
+get_nfs_storages() {
+    grep -Po '^nfs:\s*\K\S+' /etc/pve/storage.cfg 2>/dev/null || true
+}
+
+get_current_nconnect() {
+    local storage="$1"
+    local nconnect_val
+    nconnect_val=$(awk -v storage="$storage" '
+        /^nfs:/ && $2 == storage {
+            found = 1
+            next
+        }
+        found && /^[a-z]+:/ {
+            found = 0
+            next
+        }
+        found && /options/ {
+            for(i=2; i<=NF; i++) {
+                if($i ~ /nconnect=[0-9]+/) {
+                    gsub(/.*nconnect=/, "", $i)
+                    gsub(/,.*/, "", $i)
+                    print $i
+                    exit
+                }
+            }
+        }
+    ' /etc/pve/storage.cfg)
+    echo "${nconnect_val:-1}"
+}
+
+get_mounted_nconnect() {
+    local storage="$1"
+    local current_nconnect
+    local mount_output
+    
+    log_debug "Getting mounted nconnect for storage: $storage"
+    mount_output=$(mount | grep nfs | grep "$storage")
+    log_debug "Mount output for $storage: $mount_output"
+    
+    current_nconnect=$(echo "$mount_output" | grep -Eo "nconnect=[0-9]+" | cut -d= -f2)
+    log_debug "Extracted nconnect value for $storage: ${current_nconnect:-1}"
+    
+    echo "${current_nconnect:-1}"
+}
+
+nfs_tuning_step1_storage_selection() {
+    local dialog_selected=$(mktemp)
+    
+    local nfs_storages
+    nfs_storages=$(get_nfs_storages)
+    
+    if [[ -z "$nfs_storages" ]]; then
+        dialog --title "Error" --msgbox "No NFS storage found in configuration" 8 50
+        rm -f "$dialog_selected"
+        return 1
+    fi
+    
+    local dialog_args=()
+    
+    while IFS= read -r storage; do
+        if [[ -n "$storage" ]]; then
+            local config_nconnect
+            local mounted_nconnect
+            config_nconnect=$(get_current_nconnect "$storage")
+            mounted_nconnect=$(get_mounted_nconnect "$storage")
+            dialog_args+=("$storage" "nconnect: config = $(printf '%2s' "$config_nconnect")   mounted = $(printf '%2s' "$mounted_nconnect")" "off")
+        fi
+    done <<< "$nfs_storages"
+    
+    if [[ ${#dialog_args[@]} -eq 0 ]]; then
+        dialog --title "Error" --msgbox "No valid NFS storage found" 8 40
+        rm -f "$dialog_selected"
+        return 1
+    fi
+    
+    cmd=(dialog --keep-tite --title "Step 1/2: Storage Selection"
+         --ok-label "Next" --cancel-label "Back"
+         --checklist "Select storage to update (use SPACE to select):" 20 70 10)
+    options=("${dialog_args[@]}")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # OK/Next button
+            if [[ -z "$selected_option" ]]; then
+                dialog --title "Error" --msgbox "Please select at least one storage." 8 50
+                return 2  # Stay on same step
+            fi
+            selected_nfs_storages=$(echo "$selected_option" | tr -d '"' | tr ' ' '\n')
+            log_info "Selected storages: $(echo "$selected_nfs_storages" | tr '\n' ' ')"
+            return 0  # Proceed to next step
+            ;;
+        1)  # Cancel button (Back)
+            return 1
+            ;;
+    esac
+}
+
+nfs_tuning_step2_nconnect_selection() {
+    local dialog_selected=$(mktemp)
+    
+    local dialog_args=()
+    
+    for i in {1..16}; do
+        if [[ $i -eq 4 ]]; then
+            dialog_args+=("$i" "nconnect = $i (default)" "on")
+        else
+            dialog_args+=("$i" "nconnect = $i" "off")
+        fi
+    done
+    
+    cmd=(dialog --keep-tite --title "Step 2/2: nconnect Value"
+         --ok-label "Next" --cancel-label "Back"
+         --radiolist "Choose new nconnect value:" 23 50 16)
+    options=("${dialog_args[@]}")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # OK/Next button
+            if [[ -z "$selected_option" ]]; then
+                dialog --title "Error" --msgbox "Please select an nconnect value." 8 50
+                return 2  # Stay on same step
+            fi
+            selected_nfs_nconnect="$selected_option"
+            log_info "Selected nconnect value: $selected_nfs_nconnect"
+            return 0  # Proceed to next step
+            ;;
+        1)  # Cancel button (Back)
+            return 2  # Go back to previous step
+            ;;
+    esac
+}
+
+execute_nfs_nconnect_update() {
+    local temp_dir="/tmp/nfs-tuning-$$"
+    local results_file="$temp_dir/results.txt"
+    
+    mkdir -p "$temp_dir"
+    
+    log_info "Starting nconnect update process"
+    echo "Starting nconnect update process" > "$results_file"
+    echo "Selected storages: $(echo "$selected_nfs_storages" | tr '\n' ' ')" >> "$results_file"
+    echo "Selected nconnect value: $selected_nfs_nconnect" >> "$results_file"
+    echo "" >> "$results_file"
+    
+    # Count total storages for progress calculation
+    local storage_count=0
+    while IFS= read -r storage; do
+        if [[ -n "$storage" ]]; then
+            storage_count=$((storage_count + 1))
+        fi
+    done <<< "$selected_nfs_storages"
+    
+    # Progress tracking
+    local current_step=0
+    local total_steps=$((storage_count * 2 + storage_count + 1))  # config+umount, mount, verify, +1 for stabilize
+    
+    # Create progress pipe
+    local progress_pipe
+    progress_pipe=$(mktemp -u)
+    mkfifo "$progress_pipe"
+    
+    # Start progress dialog in background
+    dialog --title "Updating nconnect Settings" \
+           --gauge "Initializing..." 8 60 0 < "$progress_pipe" &
+    local dialog_pid=$!
+    
+    # Function to update progress
+    update_progress() {
+        local message="$1"
+        local percentage=$((current_step * 100 / total_steps))
+        echo "$percentage"
+        echo "XXX"
+        echo "$message"
+        echo "XXX"
+    }
+    
+    # Redirect to progress pipe
+    exec 3>"$progress_pipe"
+    
+    # Step 1: Update storage config and umount for each storage
+    log_info "Step 1: Updating storage configurations and unmounting"
+    echo "Step 1: Updating storage configurations and unmounting" >> "$results_file"
+    
+    while IFS= read -r storage; do
+        if [[ -n "$storage" ]]; then
+            # Update storage configuration
+            current_step=$((current_step + 1))
+            update_progress "Updating $storage configuration..." >&3
+            
+            log_info "Updating $storage configuration with nconnect=$selected_nfs_nconnect"
+            log_debug "Executing: pvesm set $storage --options nconnect=$selected_nfs_nconnect"
+            pvesm set "$storage" --options "nconnect=$selected_nfs_nconnect" 2>/dev/null || true
+            
+            # Attempt to unmount
+            current_step=$((current_step + 1))
+            update_progress "Unmounting $storage..." >&3
+            
+            log_info "Attempting to unmount $storage"
+            local mount_path="/mnt/pve/$storage"
+            log_debug "Executing: umount $mount_path"
+            umount "$mount_path" 2>/dev/null || true
+        fi
+    done <<< "$selected_nfs_storages"
+    
+    # Step 2: Mount all storages
+    log_info "Step 2: Mounting all storages"
+    echo "Step 2: Mounting all storages" >> "$results_file"
+    
+    while IFS= read -r storage; do
+        if [[ -n "$storage" ]]; then
+            current_step=$((current_step + 1))
+            update_progress "Mounting $storage..." >&3
+            
+            log_info "Mounting $storage"
+            local escaped
+            escaped=$(systemd-escape "$storage")
+            local unit="mnt-pve-${escaped}.mount"
+            log_debug "Executing: systemctl start $unit"
+            systemctl start "$unit" 2>/dev/null || true
+        fi
+    done <<< "$selected_nfs_storages"
+    
+    # Step 3: Wait for mounts to stabilize
+    current_step=$((current_step + 1))
+    update_progress "Waiting for mounts to stabilize..." >&3
+    
+    log_info "Step 3: Waiting for mounts to stabilize"
+    log_debug "Starting 5-second wait for mounts to stabilize"
+    echo "Step 3: Waiting for mounts to stabilize, then verifying results" >> "$results_file"
+    sleep 5
+    log_debug "Mount stabilization wait completed"
+    
+    # Step 4: Verify results
+    log_info "Step 4: Verifying results"
+    echo "============================" >> "$results_file"
+    
+    local has_failures=false
+    while IFS= read -r storage; do
+        if [[ -n "$storage" ]]; then
+            update_progress "Verifying $storage..." >&3
+            
+            local mounted_nconnect
+            local attempts=0
+            local max_attempts=10
+            
+            log_debug "Starting verification for $storage (expected: $selected_nfs_nconnect)"
+            
+            # Try multiple times to get the mount info, as it may take time to update
+            while [[ $attempts -lt $max_attempts ]]; do
+                attempts=$((attempts + 1))
+                log_debug "Verification attempt $attempts/$max_attempts for $storage"
+                
+                mounted_nconnect=$(get_mounted_nconnect "$storage")
+                log_debug "Got nconnect value: $mounted_nconnect for $storage"
+                
+                # Check if we got the expected value
+                if [[ "$mounted_nconnect" == "$selected_nfs_nconnect" ]]; then
+                    log_debug "Expected nconnect value found for $storage, stopping retries"
+                    break
+                fi
+                
+                if [[ $attempts -lt $max_attempts ]]; then
+                    log_debug "Sleeping 2 seconds before next attempt for $storage"
+                    sleep 2
+                fi
+            done
+            
+            log_debug "Final verification for $storage: expected=$selected_nfs_nconnect, actual=$mounted_nconnect"
+            
+            if [[ "$mounted_nconnect" == "$selected_nfs_nconnect" ]]; then
+                log_info "$storage: SUCCESS - nconnect=$mounted_nconnect"
+                log_debug "RESULT: $storage SUCCESS"
+                echo "$storage: SUCCESS - nconnect=$mounted_nconnect" >> "$results_file"
+            else
+                log_info "$storage: FAILED - expected=$selected_nfs_nconnect, actual=$mounted_nconnect"
+                log_debug "RESULT: $storage FAILED - expected=$selected_nfs_nconnect, actual=$mounted_nconnect"
+                echo "$storage: FAILED - expected=$selected_nfs_nconnect, actual=$mounted_nconnect" >> "$results_file"
+                has_failures=true
+            fi
+        fi
+    done <<< "$selected_nfs_storages"
+    
+    # Complete progress
+    echo "100" >&3
+    echo "XXX" >&3
+    echo "Update completed!" >&3
+    echo "XXX" >&3
+    
+    # Close progress pipe and wait for dialog to finish
+    exec 3>&-
+    sleep 1
+    kill "$dialog_pid" 2>/dev/null || true
+    wait "$dialog_pid" 2>/dev/null || true
+    
+    # Clean up
+    rm -f "$progress_pipe"
+    
+    # Add failure note if needed
+    if [[ "$has_failures" == "true" ]]; then
+        echo "" >> "$results_file"
+        echo "NOTE: To apply and mount NFS with a new nconnect option value," >> "$results_file"
+        echo " all VMs must be stopped or their disks migrated to other storage." >> "$results_file"
+    fi
+    
+    dialog --exit-label "Continue" --title "Operation Summary" --textbox "$results_file" 20 80
+
+    # Clean up temp directory
+    rm -rf "$temp_dir"
+}
+
+nfs_tuning_wizard() {
+    local nfs_current_step=1
+    local nfs_total_steps=2
+    
+    # Clear previous selections
+    selected_nfs_storages=""
+    selected_nfs_nconnect=""
+    
+    while true; do
+        case $nfs_current_step in
+            1)
+                nfs_tuning_step1_storage_selection
+                case $? in
+                    0)  # Next - advance to step 2
+                        nfs_current_step=2
+                        ;;
+                    1)  # Back to main menu
+                        return 0
+                        ;;
+                    2)  # Stay on same step
+                        ;;
+                esac
+                ;;
+            2)
+                nfs_tuning_step2_nconnect_selection
+                case $? in
+                    0)  # Next - execute and return to main menu
+                        execute_nfs_nconnect_update
+                        return 0
+                        ;;
+                    1)  # Back to main menu
+                        return 0
+                        ;;
+                    2)  # Back - return to step 1
+                        nfs_current_step=1
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
 # MAIN MENU SYSTEM
 
 # Display main menu and handle user selections
@@ -557,7 +965,8 @@ main_menu() {
              "1" "Restore VM/CT from Cloned NFS Storage"
              "2" "Delete Cloned NFS Storage and cloned dataset in JovianDSS     "
              "3" "Cleanup inactive NFS storage"
-             "4" "VM/CT Manager - Bulk Actions")
+             "4" "VM/CT Manager - Bulk Actions"
+             "5" "NFS tuning - set nconnect option")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -579,6 +988,9 @@ main_menu() {
                     ;;
                 4)  # VM/CT Manager - Bulk Actions
                     vm_ct_manager_bulk_actions
+                    ;;
+                5)  # NFS tuning - set nconnect option
+                    nfs_tuning_wizard
                     ;;
             esac
             ;;
@@ -603,10 +1015,10 @@ setup_dialog() {
     # Create form with current values
     dialog --keep-tite --title "Setup Configuration" \
            --ok-label "Save" --cancel-label "Back" \
-           --form "Configure REST API settings:" 12 60 3 \
-           "REST API User:" 1 1 "$rest_api_user" 1 20 20 0 \
-           "REST API Password:" 2 1 "$rest_api_password" 2 20 20 0 \
-           "REST API Port:" 3 1 "$rest_api_port" 3 20 10 0 \
+           --form "Configure JovianDSS REST API settings:" 12 60 3 \
+           "User:" 1 1 "$rest_api_user" 1 20 20 0 \
+           "Password:" 2 1 "$rest_api_password" 2 20 20 0 \
+           "Port:" 3 1 "$rest_api_port" 3 20 10 0 \
            2> "$form_data"
 
     local exit_code=$?
@@ -1982,7 +2394,7 @@ nfs_step5_summary() {
     summary_text+="Dataset: $selected_dataset\n"
     summary_text+="Snapshot: $selected_snapshot\n"
     summary_text+="Clone name: $clone_name\n\n"
-    summary_text+="Click 'Apply' to create clone and NFS share or 'Back' to modify selections."
+    summary_text+="Click 'Apply' to create the cloned NFS storage,\nor click 'Back' to modify your selections."
 
     dialog --keep-tite --title "Step 5/$nfs_total_steps: Confirmation" \
            --ok-label "Apply" --cancel-label "Back to Main" --extra-button --extra-label "Back" \
@@ -3207,7 +3619,7 @@ delete_cloned_nfs_storage_wizard() {
     dialog --keep-tite \
         --title "Delete Cloned NFS Storage" \
         --ok-label "Continue" --cancel-label "Cancel" \
-        --msgbox "WARNING: This will delete the cloned NFS storage in Proxmox PVE and the cloned dataset in JovianDSS on which the Proxmox NFS storage is based. This operation cannot be undone!" 10 70
+        --msgbox "WARNING: This action will delete the cloned NFS storage in Proxmox PVE, as well as the corresponding cloned dataset in JovianDSS on which it is based. This operation is irreversible!" 10 70
 
     local exit_code=$?
     if [[ $exit_code -ne 0 ]]; then
@@ -3290,9 +3702,9 @@ delete_cloned_nfs_storage_wizard() {
 
     # Final confirmation dialog - user must type "delete"
     local confirm_input=$(mktemp)
-    dialog --inputbox "To confirm deletion of storage '$selected_storage', type 'delete' (without quotes):" 8 70 2> "$confirm_input"
+    dialog --inputbox "To confirm deletion of storage '$selected_storage'\ntype 'delete':" 8 70 2> "$confirm_input"
     exit_code=$?
-    local confirmation=$(cat "$confirm_input")
+    local confirmation=$(trimq "$(cat "$confirm_input")")
     rm -f "$confirm_input"
 
     if [[ $exit_code -ne 0 || "$confirmation" != "delete" ]]; then
@@ -3550,14 +3962,14 @@ vm_manager_confirm_critical_action() {
             ;;
     esac
     
-    local prompt_text="CRITICAL ACTION: $description\\n\\nEffects on $vm_count VM/CT(s):\\n$warning\\n\\nTo confirm this action, type '$action' (without quotes):"
+    local prompt_text="CRITICAL ACTION: $description\\n\\nEffects on $vm_count VM/CT(s):\\n$warning\\n\\nTo confirm this action, type '$action':"
     
     while true; do
         # Confirmation input with description
         local confirm_input=$(mktemp)
         dialog --title "CONFIRM CRITICAL ACTION" --inputbox "$prompt_text" 18 80 2> "$confirm_input"
         local exit_code=$?
-        local confirmation=$(cat "$confirm_input")
+        local confirmation=$(trimq "$(cat "$confirm_input")")
         rm -f "$confirm_input"
         
         # User cancelled
@@ -3824,7 +4236,7 @@ vm_manager_show_summary() {
         summary_text+="Check log file for error details: $LOG_FILE"
     fi
     
-    dialog --title "Action Summary" --msgbox "$summary_text" 15 60
+    dialog --ok-label "Continue" --title "Action Summary" --msgbox "$summary_text" 15 60
     log_info "Action summary - Success: $success_count, Skipped: $skip_count, Errors: $error_count"
 }
 
@@ -3862,10 +4274,7 @@ vm_ct_manager_bulk_actions() {
         # Step 4: Show summary
         vm_manager_show_summary "$selected_option"
         
-        # Ask if user wants to continue
-        if ! dialog --title "Continue?" --yesno "Do you want to perform another action?" 8 50; then
-            return 0  # Back to main menu
-        fi
+        return 0  # Back to main menu
     done
 }
 
@@ -3914,8 +4323,9 @@ main() {
 
 # Only run main if this script is executed directly (not sourced)
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-    # Handle version argument
+    # Handle version argument before any terminal operations
     if [ "$1" = "version" ]; then
+        VERSION_MODE=true
         echo "$VERSION"
         exit 0
     fi

@@ -25,7 +25,7 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.10"
+VERSION="0.11"
 
 # Script mode flag
 VERSION_MODE=false
@@ -450,6 +450,210 @@ ENDSCRIPT
     
     log_info "NFS cleanup complete"
     dialog --msgbox "Cleanup finished.\nReview $LOGS_DIR/pve-nfs-cleanup-*.log for details." 8 70
+}
+
+# Cleanup unused disks in VM/CT configs
+cleanup_unused_disks_wizard() {
+    log_info "Starting cleanup unused disks wizard"
+    
+    # Arrays to store found unused disks
+    local unused_disks=()
+    local unused_display=()
+    
+    # Scan all VM configs
+    for config_file in /etc/pve/nodes/*/qemu-server/*.conf; do
+        [ -f "$config_file" ] || continue
+        
+        local vmid=$(basename "$config_file" .conf)
+        local node=$(basename "$(dirname "$(dirname "$config_file")")")
+        
+        # Search for unused disk lines
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^unused[0-9]+: ]]; then
+                unused_disks+=("vm:$vmid:$node:$line")
+                unused_display+=("$vmid" "VM - $line")
+            fi
+        done < "$config_file"
+    done
+    
+    # Scan all CT configs
+    for config_file in /etc/pve/nodes/*/lxc/*.conf; do
+        [ -f "$config_file" ] || continue
+        
+        local ctid=$(basename "$config_file" .conf)
+        local node=$(basename "$(dirname "$(dirname "$config_file")")")
+        
+        # Search for unused disk lines
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^unused[0-9]+: ]]; then
+                unused_disks+=("ct:$ctid:$node:$line")
+                unused_display+=("$ctid" "CT - $line")
+            fi
+        done < "$config_file"
+    done
+    
+    # Check if any unused disks found
+    if [ ${#unused_disks[@]} -eq 0 ]; then
+        dialog --msgbox "No unused disks found in VM/CT configurations." 8 50
+        return 0
+    fi
+    
+    log_info "Found ${#unused_disks[@]} unused disk entries"
+    
+    # Create checklist dialog
+    local dialog_selected=$(mktemp)
+    local checklist_items=()
+    local all_selected=false
+    
+    # Build initial checklist items
+    for ((i=0; i<${#unused_display[@]}; i+=2)); do
+        local vmid="${unused_display[i]}"
+        local desc="${unused_display[i+1]}"
+        checklist_items+=("$((i/2))" "$vmid: $desc" "off")
+        log_debug "Added checklist item: index=$((i/2)), desc='$vmid: $desc', status=off"
+    done
+    
+    log_debug "Total checklist_items array length: ${#checklist_items[@]}"
+    
+    while true; do
+        local middle_button_label="Select All"
+        if [ "$all_selected" = true ]; then
+            middle_button_label="Deselect All"
+        fi
+        
+        log_debug "About to show dialog with button: $middle_button_label"
+        log_debug "Current all_selected state: $all_selected"
+        
+        dialog --keep-tite --title "Cleanup Unused Disks" \
+               --ok-label "Remove Selected" --cancel-label "Back" \
+               --extra-button --extra-label "$middle_button_label" \
+               --checklist "Select unused disks to remove (use SPACE to select):" \
+               20 90 10 "${checklist_items[@]}" 2> "$dialog_selected"
+        
+        local exit_code=$?
+        log_debug "Dialog exit code: $exit_code"
+        
+        case $exit_code in
+            0)  # Remove Selected
+                log_debug "User pressed Remove Selected"
+                local selected_indices=$(cat "$dialog_selected")
+                log_debug "Selected indices: $selected_indices"
+                if [ -z "$selected_indices" ]; then
+                    dialog --msgbox "No items selected." 6 30
+                    continue
+                fi
+                
+                # Confirm removal
+                dialog --keep-tite --title "Confirm Removal" \
+                       --yes-label "Yes, Remove" --no-label "Cancel" \
+                       --yesno "Are you sure you want to remove the selected unused disk entries?" 8 70
+                
+                if [ $? -eq 0 ]; then
+                    cleanup_selected_unused_disks "$selected_indices" unused_disks
+                fi
+                break
+                ;;
+            1)  # Back
+                log_debug "User pressed Back"
+                rm -f "$dialog_selected"
+                return 0
+                ;;
+            2)  # Toggle Select All / Deselect All (extra button)
+                log_debug "User pressed toggle button (exit code 2)"
+                if [ "$all_selected" = false ]; then
+                    # Select all
+                    log_info "Selecting all items"
+                    for ((i=2; i<${#checklist_items[@]}; i+=3)); do
+                        checklist_items[i]="on"
+                        log_debug "Set checklist_items[$i]=on"
+                    done
+                    all_selected=true
+                else
+                    # Deselect all
+                    log_info "Deselecting all items"
+                    for ((i=2; i<${#checklist_items[@]}; i+=3)); do
+                        checklist_items[i]="off"
+                        log_debug "Set checklist_items[$i]=off"
+                    done
+                    all_selected=false
+                fi
+                continue
+                ;;
+            3)  # Toggle Select All / Deselect All (help button alternative)
+                log_debug "User pressed toggle button (exit code 3)"
+                if [ "$all_selected" = false ]; then
+                    # Select all
+                    log_info "Selecting all items"
+                    for ((i=2; i<${#checklist_items[@]}; i+=3)); do
+                        checklist_items[i]="on"
+                        log_debug "Set checklist_items[$i]=on"
+                    done
+                    all_selected=true
+                else
+                    # Deselect all
+                    log_info "Deselecting all items"
+                    for ((i=2; i<${#checklist_items[@]}; i+=3)); do
+                        checklist_items[i]="off"
+                        log_debug "Set checklist_items[$i]=off"
+                    done
+                    all_selected=false
+                fi
+                continue
+                ;;
+            *)  # Any other exit code
+                log_debug "Unexpected dialog exit code: $exit_code"
+                rm -f "$dialog_selected"
+                return 1
+                ;;
+        esac
+    done
+    
+    rm -f "$dialog_selected"
+    return 0
+}
+
+# Remove selected unused disk entries
+cleanup_selected_unused_disks() {
+    local selected_indices="$1"
+    local -n disk_array=$2
+    local removed_count=0
+    
+    log_info "Starting removal of selected unused disk entries"
+    
+    # Process each selected index
+    for index in $selected_indices; do
+        local disk_info="${disk_array[index]}"
+        IFS=':' read -ra parts <<< "$disk_info"
+        local type="${parts[0]}"
+        local vmid="${parts[1]}"
+        local node="${parts[2]}"
+        local unused_line="${parts[3]}"
+        
+        # Determine config file path
+        local config_file
+        if [ "$type" = "vm" ]; then
+            config_file="/etc/pve/nodes/$node/qemu-server/$vmid.conf"
+        else
+            config_file="/etc/pve/nodes/$node/lxc/$vmid.conf"
+        fi
+        
+        # Extract unused disk identifier (e.g., "unused0")
+        local unused_key
+        unused_key=$(echo "$unused_line" | cut -d':' -f1)
+        
+        log_info "Removing $unused_key from $type $vmid config"
+        
+        # Remove the unused line using sed
+        if sed -i "/^$unused_key:/d" "$config_file"; then
+            log_info "Successfully removed $unused_key from $config_file"
+            ((removed_count++))
+        else
+            log_error "Failed to remove $unused_key from $config_file"
+        fi
+    done
+    
+    log_info "Cleanup complete. Removed $removed_count unused disk entries"
+    dialog --msgbox "Cleanup complete!\nRemoved $removed_count unused disk entries." 8 50
 }
 
 
@@ -1236,16 +1440,17 @@ main_menu() {
 
     cmd=(dialog --keep-tite --title "$VENDOR $PRODUCT Proxmox VE (PVE) Tools - Main Menu"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
-         --menu "Choose an option:" 16 80 9)
+         --menu "Choose an option:" 16 80 10)
     options=("0" "Add Cloned NFS Storage from $PRODUCT Snapshot"
              "1" "Restore VM/CT from Cloned NFS Storage"
              "2" "Delete Cloned NFS Storage and cloned dataset in $PRODUCT     "
              "3" "Cleanup inactive NFS storage"
-             "4" "VM/CT Manager - Bulk Actions"
-             "5" "NFS tuning - set nconnect option"
-             "6" "Add VM/CT to Proxmox VE HA Resources"
-             "7" "Post known issues fixes and tuning"
-             "8" "Help & About pve-tools")
+             "4" "Cleanup unused disks in VM/CT config"
+             "5" "VM/CT Manager - Bulk Actions"
+             "6" "NFS tuning - set nconnect option"
+             "7" "Add VM/CT to Proxmox VE HA Resources"
+             "8" "Post known issues fixes and tuning"
+             "9" "Help & About pve-tools")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -1265,19 +1470,22 @@ main_menu() {
                 3)  # Cleanup inactive NFS storage
                     cleanup_inactive_nfs_storage
                     ;;
-                4)  # VM/CT Manager - Bulk Actions
+                4)  # Cleanup unused disks in VM/CT config
+                    cleanup_unused_disks_wizard
+                    ;;
+                5)  # VM/CT Manager - Bulk Actions
                     vm_ct_manager_bulk_actions
                     ;;
-                5)  # NFS tuning - set nconnect option
+                6)  # NFS tuning - set nconnect option
                     nfs_tuning_wizard
                     ;;
-                6)  # Add VM/CT to Proxmox VE HA Resources
+                7)  # Add VM/CT to Proxmox VE HA Resources
                     add_vmct_to_ha_resources
                     ;;
-                7)  # Post known issues fixes and tuning
+                8)  # Post known issues fixes and tuning
                     post_known_issues_fixes
                     ;;
-                8)  # Help & About pve-tools
+                9)  # Help & About pve-tools
                     help_about_dialog
                     ;;
             esac

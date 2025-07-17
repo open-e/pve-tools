@@ -449,7 +449,7 @@ ENDSCRIPT
     wait
     
     log_info "NFS cleanup complete"
-    dialog --msgbox "Cleanup finished. Review $LOGS_DIR/pve-nfs-cleanup-*.log for details." 8 70
+    dialog --msgbox "Cleanup finished.\nReview $LOGS_DIR/pve-nfs-cleanup-*.log for details." 8 70
 }
 
 
@@ -951,6 +951,282 @@ nfs_tuning_wizard() {
     done
 }
 
+# POST KNOWN ISSUES FIXES AND TUNING
+
+# Check ZFS import scan service status
+check_zfs_import_scan_service() {
+    local service_status
+    service_status=$(systemctl is-enabled zfs-import-scan.service 2>/dev/null)
+    
+    if [ "$service_status" = "disabled" ]; then
+        return 1  # Already disabled
+    else
+        return 0  # Enabled or other status
+    fi
+}
+
+# Fix ZFS import scan service
+fix_zfs_import_scan_service() {
+    log_info "Disabling zfs-import-scan.service"
+    
+    if systemctl disable zfs-import-scan.service >> "$LOG_FILE" 2>&1; then
+        log_info "Successfully disabled zfs-import-scan.service"
+        return 0
+    else
+        log_error "Failed to disable zfs-import-scan.service"
+        return 1
+    fi
+}
+
+# Check HA policy shutdown setting
+check_ha_policy_shutdown() {
+    local ha_policy
+    
+    # Check only /etc/pve/datacenter.cfg for HA configuration
+    if [ -f "/etc/pve/datacenter.cfg" ]; then
+        ha_policy=$(grep -E "^ha:" /etc/pve/datacenter.cfg 2>/dev/null | grep -oE "shutdown_policy=[^, ]*" | cut -d= -f2)
+    fi
+    
+    # If no explicit setting in datacenter.cfg, default to conditional
+    if [ -z "$ha_policy" ]; then
+        ha_policy="conditional"
+    fi
+    
+    log_info "Current HA shutdown policy: $ha_policy"
+    
+    if [ "$ha_policy" = "migrate" ]; then
+        return 1  # Already set to migrate
+    else
+        return 0  # Not set to migrate (includes missing line = default conditional)
+    fi
+}
+
+# Fix HA policy shutdown setting
+fix_ha_policy_shutdown() {
+    log_info "Setting HA shutdown policy to migrate"
+    
+    local datacenter_cfg="/etc/pve/datacenter.cfg"
+    
+    if [ -f "$datacenter_cfg" ]; then
+        # Check if ha section exists
+        if grep -q "^ha:" "$datacenter_cfg"; then
+            # Update existing ha section
+            sed -i 's/^ha:.*$/ha: shutdown_policy=migrate/' "$datacenter_cfg" >> "$LOG_FILE" 2>&1
+        else
+            # Add ha section
+            echo "ha: shutdown_policy=migrate" >> "$datacenter_cfg" 2>> "$LOG_FILE"
+        fi
+        
+        if [ $? -eq 0 ]; then
+            log_info "Successfully set HA shutdown policy to migrate in datacenter.cfg"
+            return 0
+        else
+            log_error "Failed to set HA shutdown policy to migrate"
+            return 1
+        fi
+    else
+        log_error "datacenter.cfg not found"
+        return 1
+    fi
+}
+
+# Restore HA policy shutdown setting to conditional (default)
+restore_ha_policy_shutdown() {
+    log_info "Restoring HA shutdown policy to conditional (default)"
+    
+    local datacenter_cfg="/etc/pve/datacenter.cfg"
+    
+    if [ -f "$datacenter_cfg" ]; then
+        # Check if ha section exists
+        if grep -q "^ha:" "$datacenter_cfg"; then
+            # Check if it only contains shutdown_policy
+            local ha_line=$(grep "^ha:" "$datacenter_cfg")
+            if [[ "$ha_line" =~ ^ha:[[:space:]]*shutdown_policy=[^,]*$ ]]; then
+                # Only shutdown_policy is set, remove the entire line
+                sed -i '/^ha:[[:space:]]*shutdown_policy=/d' "$datacenter_cfg" >> "$LOG_FILE" 2>&1
+                log_info "Removed ha: shutdown_policy line from datacenter.cfg (restored to default)"
+            else
+                # Other HA settings exist, just remove shutdown_policy
+                sed -i 's/,\?[[:space:]]*shutdown_policy=[^,]*//g; s/shutdown_policy=[^,]*,\?[[:space:]]*//g' "$datacenter_cfg" >> "$LOG_FILE" 2>&1
+                log_info "Removed shutdown_policy from ha line in datacenter.cfg (restored to default)"
+            fi
+            
+            if [ $? -eq 0 ]; then
+                log_info "Successfully restored HA shutdown policy to conditional (default) in datacenter.cfg"
+                return 0
+            else
+                log_error "Failed to restore HA shutdown policy to conditional (default)"
+                return 1
+            fi
+        else
+            # No ha section exists, already at default
+            log_info "No ha section found in datacenter.cfg, already at default (conditional)"
+            return 0
+        fi
+    else
+        log_error "datacenter.cfg not found"
+        return 1
+    fi
+}
+
+# Main function for post known issues fixes and tuning
+post_known_issues_fixes() {
+    local dialog_selected=$(mktemp)
+    local fixes_applied=0
+    
+    # ZFS Import Scan Service Fix
+    if check_zfs_import_scan_service; then
+        # Service is enabled, offer to disable it
+        dialog --title "ZFS Import Scan Service Fix" \
+               --yes-label "Confirm" \
+               --no-label "Skip" \
+               --yesno "Proxmox Host Attempts to Import Open-E JovianDSS ZFS Pool After Reboot\n\nDescription:\nWhen running Open-E JovianDSS as a virtual machine on a Proxmox host, the host system may attempt to import a ZFS pool that belongs to the Open-E JovianDSS VM. This typically occurs if the Open-E JovianDSS VM accesses its data disks via PCI passthrough.\n\nObserved Behavior:\nAfter rebooting the Proxmox host, the system tries to auto-import the ZFS pool from the passthrough disks, which may lead to errors.\n\nWorkaround:\nDisable the zfs-import-scan.service on the Proxmox host to prevent automatic import of ZFS pools that belong to the Open-E JovianDSS VM.\n\nDo you want to apply this fix?" 22 80
+        
+        if [ $? -eq 0 ]; then
+            if fix_zfs_import_scan_service; then
+                dialog --msgbox "ZFS Import Scan Service Fix Applied Successfully!\n\nThe zfs-import-scan.service has been disabled." 10 60
+                fixes_applied=$((fixes_applied + 1))
+            else
+                dialog --msgbox "Error: Failed to apply ZFS Import Scan Service fix.\nCheck the log file for details." 10 60
+            fi
+        fi
+    else
+        dialog --msgbox "ZFS Import Scan Service Fix Already Applied\n\nThe zfs-import-scan.service is already disabled." 10 60
+    fi
+    
+    # HA Policy Shutdown Fix
+    if check_ha_policy_shutdown; then
+        # Policy is not set to migrate, offer to fix it
+        dialog --title "HA Policy Shutdown Fix" \
+               --yes-label "Confirm" \
+               --no-label "Skip" \
+               --yesno "How is the HA policy for a node shutdown configured?\n\nDescription:\nThe shutdown policy can be configured in the Web UI (Datacenter → Options → HA Settings). By default, the setting is 'Conditional' for backward compatibility.\n\nTo achieve the expected behavior—starting VMs/CTs on another cluster host—you must change the setting to 'Migrate'.\n\nThis fix will set the HA shutdown policy to 'Migrate' to ensure VMs/CTs are properly migrated to other nodes during shutdown.\n\nDo you want to apply this fix?" 18 80
+        
+        if [ $? -eq 0 ]; then
+            if fix_ha_policy_shutdown; then
+                dialog --msgbox "HA Policy Shutdown Fix Applied Successfully!\n\nThe HA shutdown policy has been set to 'Migrate'." 10 60
+                fixes_applied=$((fixes_applied + 1))
+            else
+                dialog --msgbox "Error: Failed to apply HA Policy Shutdown fix.\nCheck the log file for details." 10 60
+            fi
+        fi
+    else
+        dialog --msgbox "HA Policy Shutdown Fix Already Applied\n\nThe HA shutdown policy is already set to 'Migrate'." 10 60
+    fi
+    
+    # Summary
+    if [ $fixes_applied -gt 0 ]; then
+        dialog --msgbox "Post Known Issues Fixes Complete!\n\nApplied $fixes_applied fix(es) successfully." 10 50
+    else
+        dialog --msgbox "Post Known Issues Fixes Complete!\n\nNo fixes were needed or applied." 10 50
+    fi
+    
+    rm -f "$dialog_selected"
+    log_info "Post known issues fixes completed - $fixes_applied fixes applied"
+}
+
+# AUTO-UPDATE FUNCTIONS
+
+# Check for script updates from GitHub
+check_for_updates() {
+    local current_version="$VERSION"
+    local remote_version
+    
+    log_info "Checking for updates - current version: $current_version"
+    
+    # Get remote version from GitHub
+    remote_version=$(wget -qO- https://raw.githubusercontent.com/open-e/pve-tools/main/pve-tools | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+    
+    if [ -z "$remote_version" ]; then
+        log_error "Failed to retrieve remote version"
+        return 1
+    fi
+    
+    log_info "Remote version: $remote_version"
+    
+    # Compare versions (simple string comparison)
+    if [ "$remote_version" != "$current_version" ]; then
+        # Version is different, check if it's newer
+        if [ "$remote_version" \> "$current_version" ]; then
+            log_info "New version available: $remote_version"
+            return 0  # Update available
+        else
+            log_info "Current version is newer or equal"
+            return 1  # No update needed
+        fi
+    else
+        log_info "Already running latest version"
+        return 1  # No update needed
+    fi
+}
+
+# Update the script from GitHub
+update_script() {
+    local current_version="$VERSION"
+    local script_path
+    
+    # Get the path of the currently running script
+    script_path=$(readlink -f "$0")
+    
+    log_info "Starting script update from $script_path"
+    
+    # Create backup of current script
+    if ! cp "$script_path" "${script_path}.ver.${current_version}" >> "$LOG_FILE" 2>&1; then
+        log_error "Failed to create backup of current script"
+        dialog --msgbox "Error: Failed to create backup of current script" 8 50
+        return 1
+    fi
+    
+    log_info "Created backup: ${script_path}.ver.${current_version}"
+    
+    # Download new version
+    if ! wget https://raw.githubusercontent.com/open-e/pve-tools/main/pve-tools -O "$script_path" >> "$LOG_FILE" 2>&1; then
+        log_error "Failed to download new version"
+        dialog --msgbox "Error: Failed to download new version\nRestoring backup..." 8 50
+        
+        # Restore backup on failure
+        cp "${script_path}.ver.${current_version}" "$script_path" >> "$LOG_FILE" 2>&1
+        return 1
+    fi
+    
+    # Make executable
+    chmod +x "$script_path" >> "$LOG_FILE" 2>&1
+    
+    log_info "Script updated successfully"
+    
+    # Show success message and exit
+    dialog --msgbox "Update completed successfully!\n\nPlease run pve-tools again to use the new version." 10 60
+    
+    exit 0
+}
+
+# Prompt user for update
+prompt_for_update() {
+    local remote_version
+    
+    # Get remote version for display
+    remote_version=$(wget -qO- https://raw.githubusercontent.com/open-e/pve-tools/main/pve-tools | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+    
+    dialog --title "Update Available" \
+           --yes-label "Update" \
+           --no-label "Continue" \
+           --yesno "A new version of pve-tools is available!\n\nCurrent version: $VERSION\nNew version: $remote_version\n\nWould you like to update now?" 12 60
+    
+    case $? in
+        0)  # Yes - update
+            update_script
+            ;;
+        1)  # No - continue
+            log_info "User declined update"
+            return 1
+            ;;
+        *)  # Error or ESC
+            log_info "Update dialog cancelled"
+            return 1
+            ;;
+    esac
+}
+
 # MAIN MENU SYSTEM
 
 # Display main menu and handle user selections
@@ -960,13 +1236,16 @@ main_menu() {
 
     cmd=(dialog --keep-tite --title "$VENDOR $PRODUCT Proxmox VE (PVE) Tools - Main Menu"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
-         --menu "Choose an option:" 15 80 8)
-    options=("0" "Add Cloned NFS Storage from JovianDSS Snapshot"
+         --menu "Choose an option:" 16 80 9)
+    options=("0" "Add Cloned NFS Storage from $PRODUCT Snapshot"
              "1" "Restore VM/CT from Cloned NFS Storage"
-             "2" "Delete Cloned NFS Storage and cloned dataset in JovianDSS     "
+             "2" "Delete Cloned NFS Storage and cloned dataset in $PRODUCT     "
              "3" "Cleanup inactive NFS storage"
              "4" "VM/CT Manager - Bulk Actions"
-             "5" "NFS tuning - set nconnect option")
+             "5" "NFS tuning - set nconnect option"
+             "6" "Add VM/CT to Proxmox VE HA Resources"
+             "7" "Post known issues fixes and tuning"
+             "8" "Help & About pve-tools")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -992,6 +1271,15 @@ main_menu() {
                 5)  # NFS tuning - set nconnect option
                     nfs_tuning_wizard
                     ;;
+                6)  # Add VM/CT to Proxmox VE HA Resources
+                    add_vmct_to_ha_resources
+                    ;;
+                7)  # Post known issues fixes and tuning
+                    post_known_issues_fixes
+                    ;;
+                8)  # Help & About pve-tools
+                    help_about_dialog
+                    ;;
             esac
             ;;
         1)  # Cancel
@@ -1006,6 +1294,78 @@ main_menu() {
     return 0
 }
 
+# Display Help & About dialog
+help_about_dialog() {
+    local help_text=""
+    
+    # Version and release info
+    help_text+="pve-tools: version $VERSION\n"
+    help_text+="Release Date: 2024-07-17\n"
+    help_text+="\n"
+    
+    # Log paths information
+    help_text+="LOG PATHS:\n"
+    help_text+="----------\n"
+    help_text+="Main log file: $LOG_FILE\n"
+    help_text+="Log directory: $LOGS_DIR\n"
+    help_text+="Config file: $CONFIG_FILE\n"
+    help_text+="\n"
+    
+    # Information from CLAUDE.md
+    help_text+="PROJECT OVERVIEW:\n"
+    help_text+="-----------------\n"
+    help_text+="PVE Tools is a bash script that provides Proxmox VE (PVE) integration\n"
+    help_text+="with $VENDOR $PRODUCT storage. The tool enables managing NFS storage\n"
+    help_text+="clones from $PRODUCT snapshots for VM/CT backup and restore operations.\n"
+    help_text+="\n"
+    help_text+="CORE FUNCTIONALITY:\n"
+    help_text+="-------------------\n"
+    help_text+="1. Add Cloned NFS Storage from $PRODUCT Snapshot\n"
+    help_text+="   - Creates clones from snapshots and sets up NFS storage in Proxmox\n"
+    help_text+="\n"
+    help_text+="2. Restore VM/CT from Cloned NFS Storage\n"
+    help_text+="   - Restores VMs/CTs from previously created cloned storage\n"
+    help_text+="\n"
+    help_text+="3. Delete Cloned NFS Storage\n"
+    help_text+="   - Removes cloned storage from both Proxmox and $PRODUCT\n"
+    help_text+="\n"
+    help_text+="4. Cleanup inactive NFS storage\n"
+    help_text+="   - Removes unused NFS storage entries\n"
+    help_text+="\n"
+    help_text+="5. VM/CT Manager - Bulk Actions\n"
+    help_text+="   - Perform bulk operations on VMs/CTs\n"
+    help_text+="\n"
+    help_text+="6. NFS tuning - set nconnect option\n"
+    help_text+="   - Optimize NFS performance with connection tuning\n"
+    help_text+="\n"
+    help_text+="7. Add VM/CT to Proxmox VE HA Resources\n"
+    help_text+="   - Configure high availability for VMs/CTs\n"
+    help_text+="\n"
+    help_text+="REQUIREMENTS:\n"
+    help_text+="-------------\n"
+    help_text+="- Proxmox VE cluster environment\n"
+    help_text+="- $VENDOR $PRODUCT storage system\n"
+    help_text+="- Dialog package for TUI interface\n"
+    help_text+="- REST API access to $PRODUCT (default port 82)\n"
+    help_text+="\n"
+    help_text+="ARCHITECTURE:\n"
+    help_text+="-------------\n"
+    help_text+="- Single bash file application\n"
+    help_text+="- Dialog-based interactive TUI menus\n"
+    help_text+="- REST API communication with $PRODUCT\n"
+    help_text+="- Centralized logging system\n"
+    help_text+="- Wizard-based workflows with step tracking\n"
+    help_text+="- Built-in conflict resolution for VM/CT ID conflicts\n"
+    help_text+="\n"
+    help_text+="For more information, see the project documentation."
+    
+    dialog --keep-tite --title "Help & About pve-tools" \
+           --ok-label "Close" \
+           --msgbox "$help_text" 30 80
+    
+    return 0
+}
+
 # Display setup dialog for REST API configuration
 setup_dialog() {
     local dialog_selected=$(mktemp)
@@ -1015,7 +1375,7 @@ setup_dialog() {
     # Create form with current values
     dialog --keep-tite --title "Setup Configuration" \
            --ok-label "Save" --cancel-label "Back" \
-           --form "Configure JovianDSS REST API settings:" 12 60 3 \
+           --form "Configure $PRODUCT REST API settings:" 12 60 3 \
            "User:" 1 1 "$rest_api_user" 1 20 20 0 \
            "Password:" 2 1 "$rest_api_password" 2 20 20 0 \
            "Port:" 3 1 "$rest_api_port" 3 20 10 0 \
@@ -2173,9 +2533,9 @@ nfs_step1_select_ip() {
         extra_button="--default-item $selected_nfs_ip_index"
     fi
 
-    cmd=(dialog --keep-tite --title "Step 1/$nfs_total_steps: Select JovianDSS NFS Storage IP (VIP)"
+    cmd=(dialog --keep-tite --title "Step 1/$nfs_total_steps: Select $PRODUCT NFS Storage IP (VIP)"
          --ok-label "Next" --cancel-label "Back to Main" $extra_button
-         --menu "Choose JovianDSS NFS Storage IP (VIP):" 15 60 8)
+         --menu "Choose $PRODUCT NFS Storage IP (VIP):" 15 60 8)
     options=("${menu_items[@]}")
     dialog_menu
     rm -f "$dialog_selected"
@@ -2261,7 +2621,7 @@ nfs_step2_select_pool() {
 
     cmd=(dialog --keep-tite --title "Step 2/$nfs_total_steps: Select Pool"
          --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back" $extra_button
-         --menu "Choose JovianDSS Pool from $selected_nfs_ip:" 15 60 8)
+         --menu "Choose $PRODUCT Pool from $selected_nfs_ip:" 15 60 8)
     options=("${menu_items[@]}")
     dialog_menu
     rm -f "$dialog_selected"
@@ -2305,7 +2665,7 @@ nfs_step3_select_dataset() {
 
     cmd=(dialog --keep-tite --title "Step 3/$nfs_total_steps: Select Dataset"
          --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back" $extra_button
-         --menu "Choose JovianDSS Dataset from Pool $selected_pool:" 15 60 8)
+         --menu "Choose $PRODUCT Dataset from Pool $selected_pool:" 15 60 8)
     options=("${menu_items[@]}")
     dialog_menu
     rm -f "$dialog_selected"
@@ -2366,7 +2726,7 @@ nfs_step4_select_snapshot() {
 
     cmd=(dialog --keep-tite --title "Step 4/$nfs_total_steps: Select Snapshot"
          --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back" $extra_button
-         --menu "Choose JovianDSS Snapshot from Dataset $selected_dataset:" 18 80 10)
+         --menu "Choose $PRODUCT Snapshot from Dataset $selected_dataset:" 18 80 10)
     options=("${menu_items[@]}")
     dialog_menu
     rm -f "$dialog_selected"
@@ -2633,6 +2993,56 @@ wait_for_config_files() {
     return 0
 }
 
+set_readonly_conf_files() {
+    local storage_name="$1"
+    local conf_path="/mnt/pve/$storage_name/images"
+    
+    log_info "Setting read-only permissions on conf files in storage '$storage_name'..."
+    
+    # Check if the images directory exists
+    if [[ ! -d "$conf_path" ]]; then
+        log_info "Images directory '$conf_path' not found - no conf files to process"
+        return 0
+    fi
+    
+    # Find all .conf files and set read-only attribute
+    local conf_files=()
+    local conf_count=0
+    
+    while IFS= read -r -d '' conf_file; do
+        conf_files+=("$conf_file")
+        ((conf_count++))
+    done < <(find "$conf_path" -name "*.conf" -type f -print0 2>/dev/null)
+    
+    if [[ $conf_count -eq 0 ]]; then
+        log_info "No conf files found in '$conf_path' - nothing to set read-only"
+        return 0
+    fi
+    
+    log_info "Found $conf_count conf files, setting read-only permissions..."
+    
+    local success_count=0
+    local error_count=0
+    
+    for conf_file in "${conf_files[@]}"; do
+        if chmod 444 "$conf_file" 2>/dev/null; then
+            log_debug "Set read-only permissions on: $conf_file"
+            ((success_count++))
+        else
+            log_error "Failed to set read-only permissions on: $conf_file"
+            ((error_count++))
+        fi
+    done
+    
+    if [[ $error_count -eq 0 ]]; then
+        log_info "Successfully set read-only permissions on $success_count conf files"
+    else
+        log_error "Set read-only permissions on $success_count files, $error_count failed"
+    fi
+    
+    return 0
+}
+
 perform_clone_and_setup() {
     local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot")
 
@@ -2679,6 +3089,10 @@ perform_clone_and_setup() {
     dialog --title "Processing..." --infobox "Scanning for VM/CT configurations..." 6 50
 
     wait_for_config_files "$clone_name"
+
+    dialog --title "Processing..." --infobox "Setting read-only permissions on conf files..." 6 50
+
+    set_readonly_conf_files "$clone_name"
 
     dialog --msgbox "Clone and NFS setup completed successfully!\n\nClone: $clone_name\nNFS Share: $clone_name\nProxmox Storage: $clone_name" 10 60
 }
@@ -3619,7 +4033,7 @@ delete_cloned_nfs_storage_wizard() {
     dialog --keep-tite \
         --title "Delete Cloned NFS Storage" \
         --ok-label "Continue" --cancel-label "Cancel" \
-        --msgbox "WARNING: This action will delete the cloned NFS storage in Proxmox PVE, as well as the corresponding cloned dataset in JovianDSS on which it is based. This operation is irreversible!" 10 70
+        --msgbox "WARNING: This action will delete the cloned NFS storage in Proxmox VE, as well as the corresponding cloned dataset in $VENDOR $PRODUCT on which it is based.\n\nThis operation is irreversible!" 10 60
 
     local exit_code=$?
     if [[ $exit_code -ne 0 ]]; then
@@ -3702,7 +4116,7 @@ delete_cloned_nfs_storage_wizard() {
 
     # Final confirmation dialog - user must type "delete"
     local confirm_input=$(mktemp)
-    dialog --inputbox "To confirm deletion of storage '$selected_storage'\ntype 'delete':" 8 70 2> "$confirm_input"
+    dialog --inputbox "To confirm deletion of storage\n'$selected_storage'\ntype 'delete':" 8 70 2> "$confirm_input"
     exit_code=$?
     local confirmation=$(trimq "$(cat "$confirm_input")")
     rm -f "$confirm_input"
@@ -4278,6 +4692,571 @@ vm_ct_manager_bulk_actions() {
     done
 }
 
+# PVE HA RESOURCES FUNCTIONS
+
+# Configuration
+GROUP="ha-nodes"
+
+# Function: get_groups
+get_groups() {
+  ha-manager groupconfig 2>/dev/null | grep -E '^group:' | awk '{print $2}'
+}
+
+# Function: get_vms_with_hostpci
+get_vms_with_hostpci() {
+  grep -Rl hostpci /etc/pve/nodes/*/qemu-server/*.conf 2>/dev/null | \
+    sed -nE 's#.*/([0-9]+)\.conf#\1#p' | sort -u
+}
+
+# Get all PVE nodes
+get_all_nodes() {
+    local nodes_result
+    nodes_result=$(timeout 30 pvesh get /nodes --output-format=json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    nodes = json.load(sys.stdin)
+    # extract and sort the "node" values, then join with spaces
+    print(" ".join(sorted(n["node"] for n in nodes)))
+except:
+    sys.exit(1)
+' 2>/dev/null)
+    
+    if [ $? -eq 0 ] && [ -n "$nodes_result" ]; then
+        echo "$nodes_result"
+        return 0
+    else
+        log_error "Failed to get PVE nodes"
+        return 1
+    fi
+}
+
+# Select first HA node
+select_first_ha_node() {
+    local nodes=() menu_items=()
+    local line
+    
+    # Get available nodes
+    local all_nodes
+    all_nodes=$(get_all_nodes)
+    if [ -z "$all_nodes" ]; then
+        dialog --msgbox "No PVE nodes found." 8 40
+        return 1
+    fi
+    
+    # Split nodes into array
+    readarray -t nodes <<< "$(echo "$all_nodes" | tr ' ' '\n')"
+    
+    if [ "${#nodes[@]}" -eq 0 ]; then
+        dialog --msgbox "No PVE nodes found." 8 40
+        return 1
+    fi
+    
+    # Build menu items
+    local i
+    for ((i=0; i<${#nodes[@]}; i++)); do
+        menu_items+=("$i" "${nodes[i]}")
+    done
+    
+    local dialog_selected=$(mktemp)
+    local cmd=(dialog --keep-tite --title "Step $current_step/$total_steps: Select First HA Node"
+           --ok-label "Next" --cancel-label "Back to Main"
+           --menu "Choose first PVE node for HA group \"$GROUP\":" 15 60 8)
+    local options=("${menu_items[@]}")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    if [ $dialog_exit_code -eq 0 ] && [ -n "$selected_option" ]; then
+        FIRST_NODE="${nodes[selected_option]}"
+        log_info "User selected first HA node: $FIRST_NODE"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Select second HA node
+select_second_ha_node() {
+    local nodes=() menu_items=()
+    local line
+    
+    # Get available nodes
+    local all_nodes
+    all_nodes=$(get_all_nodes)
+    if [ -z "$all_nodes" ]; then
+        dialog --msgbox "No PVE nodes found." 8 40
+        return 1
+    fi
+    
+    # Split nodes into array
+    readarray -t nodes <<< "$(echo "$all_nodes" | tr ' ' '\n')"
+    
+    if [ "${#nodes[@]}" -eq 0 ]; then
+        dialog --msgbox "No PVE nodes found." 8 40
+        return 1
+    fi
+    
+    # Build menu items excluding first node
+    local i
+    for ((i=0; i<${#nodes[@]}; i++)); do
+        if [ "${nodes[i]}" != "$FIRST_NODE" ]; then
+            menu_items+=("$i" "${nodes[i]}")
+        fi
+    done
+    
+    if [ "${#menu_items[@]}" -eq 0 ]; then
+        dialog --msgbox "No additional nodes available for HA group." 8 50
+        return 1
+    fi
+    
+    local dialog_selected=$(mktemp)
+    local cmd=(dialog --keep-tite --title "Step $current_step/$total_steps: Select Second HA Node"
+           --ok-label "Next" --cancel-label "Back"
+           --menu "Choose second PVE node for HA group \"$GROUP\":" 15 60 8)
+    local options=("${menu_items[@]}")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Next
+            if [ -n "$selected_option" ]; then
+                SECOND_NODE="${nodes[selected_option]}"
+                log_info "User selected second HA node: $SECOND_NODE"
+                return 0
+            else
+                return 1
+            fi
+            ;;
+        1)  # Back
+            return 1
+            ;;
+    esac
+}
+
+# Confirm HA node selection
+confirm_ha_nodes() {
+    local nodes_text="First node:  $FIRST_NODE\nSecond node: $SECOND_NODE"
+    
+    local dialog_selected=$(mktemp)
+    local cmd=(dialog --keep-tite --title "Step $current_step/$total_steps: Confirm HA Node Selection"
+           --yes-label "Next" --no-label "Back"
+           --yesno "Selected nodes for HA group \"$GROUP\":\n\n$nodes_text\n\nProceed with these nodes?" 12 60)
+    local options=()
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Next
+            GROUP_NODES=("$FIRST_NODE" "$SECOND_NODE")
+            NODES_CSV=$(IFS=, ; echo "${GROUP_NODES[*]}")
+            log_info "Confirmed HA nodes: $NODES_CSV"
+            return 0
+            ;;
+        1)  # Back
+            return 1
+            ;;
+    esac
+}
+
+# Get all VM/CT resources from cluster
+get_all_vm_ct_resources() {
+    pvesh get /cluster/resources --type vm --output-format=json | \
+    python3 -c "
+import sys, json
+resources = json.load(sys.stdin)
+for resource in resources:
+    if resource['type'] in ['qemu', 'lxc']:
+        vmid = resource['vmid']
+        name = resource.get('name', 'N/A')
+        vm_type = 'vm' if resource['type'] == 'qemu' else 'ct'
+        status = resource.get('status', 'unknown')
+        node = resource.get('node', 'unknown')
+        
+        # Get maximum field lengths for alignment
+        print(f\"{vmid}|{name}|{vm_type}|{status}|{node}\")
+"
+}
+
+# Calculate maximum field lengths for formatting
+get_max_field_lengths() {
+    local resources="$1"  # Accept resources as parameter to avoid duplicate calls
+    
+    local max_name_length=4  # minimum for "Name"
+    local max_node_length=4  # minimum for "Node"
+    
+    while IFS='|' read -r vmid name vm_type status node; do
+        if [ ${#name} -gt $max_name_length ]; then
+            max_name_length=${#name}
+        fi
+        if [ ${#node} -gt $max_node_length ]; then
+            max_node_length=${#node}
+        fi
+    done <<< "$resources"
+    
+    echo "$max_name_length|$max_node_length"
+}
+
+# Select VM/CT for HA Resources
+select_vm_ct_for_ha() {
+    local resources=() menu_items=() vmids=()
+    
+    # Get all VM/CT resources once
+    local all_resources_data
+    all_resources_data=$(get_all_vm_ct_resources)
+    
+    # Get HA manager status once to avoid multiple calls
+    local ha_manager_status=$(ha-manager status)
+    
+    if [ -z "$all_resources_data" ]; then
+        dialog --msgbox "No VMs/CTs found in the cluster." 8 40
+        return 1
+    fi
+    
+    # Parse resources data
+    while IFS='|' read -r vmid name vm_type status node; do
+        if [ -n "$vmid" ]; then
+            resources+=("$vmid|$name|$vm_type|$status|$node")
+            vmids+=("$vmid")
+        fi
+    done <<< "$all_resources_data"
+    
+    if [ "${#resources[@]}" -eq 0 ]; then
+        dialog --msgbox "No VMs/CTs found in the cluster." 8 40
+        return 1
+    fi
+    
+    # Get max field lengths for formatting using cached data
+    local max_lengths
+    max_lengths=$(get_max_field_lengths "$all_resources_data")
+    local max_name_length=$(echo "$max_lengths" | cut -d'|' -f1)
+    local max_node_length=$(echo "$max_lengths" | cut -d'|' -f2)
+    
+    # Process each resource entry
+    for resource in "${resources[@]}"; do
+        IFS='|' read -r vmid name vm_type status node <<< "$resource"
+        
+        # Skip hostpci VMs
+        local skip_hostpci=false
+        if [[ "$vm_type" == "vm" ]] && [[ " ${HOSTPCI_VMS[*]} " == *" $vmid "* ]]; then
+            skip_hostpci=true
+        fi
+        
+        # Skip if already in HA
+        local skip_ha=false
+        if echo "$ha_manager_status" | awk '{print $1}' | grep -qx "${vm_type}:${vmid}"; then
+            skip_ha=true
+        fi
+        
+        # Format display string
+        local formatted_name=$(printf "%-${max_name_length}s" "$name")
+        local formatted_node=$(printf "%-${max_node_length}s" "$node")
+        
+        local display_string=$(printf "%s  %s  %s  %s" "$formatted_name" "$vm_type" "$status" "$formatted_node")
+        
+        # Add suffix if skipped
+        if [ "$skip_hostpci" = true ]; then
+            display_string+="  (hostpci - will be skipped)"
+        elif [ "$skip_ha" = true ]; then
+            display_string+="  (already in HA - will be skipped)"
+        fi
+        
+        # Check if this VM/CT was previously selected
+        local item_status="off"
+        for selected_vmid in "${SELECTED_VMIDS[@]}"; do
+            if [[ "$selected_vmid" == "$vmid" ]]; then
+                item_status="on"
+                break
+            fi
+        done
+        
+        menu_items+=("$vmid" "$display_string" "$item_status")
+    done
+    
+    local dialog_selected=$(mktemp)
+    local select_label="Select All"
+    if [[ "$select_all_mode" == true ]]; then
+        select_label="Deselect All"
+    fi
+    
+    local cmd=(dialog --keep-tite --title "Step $current_step/$total_steps: Select VM/CT for HA Resources"
+         --ok-label "Next" --cancel-label "Back" --extra-button --extra-label "$select_label"
+         --checklist "Choose VM/CT to add to HA resources (use SPACE to select/deselect):" 20 120 10)
+    local options=("${menu_items[@]}")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Next
+            if [[ -z "$selected_option" ]]; then
+                dialog --msgbox "Please select at least one VM/CT to add to HA resources." 8 50
+                return 2  # Stay on same step
+            fi
+            
+            # Parse selected VM IDs
+            SELECTED_VMIDS=()
+            IFS=' ' read -ra temp_vmids <<< "$selected_option"
+            for vmid in "${temp_vmids[@]}"; do
+                # Remove quotes if present
+                vmid=$(echo "$vmid" | tr -d '"')
+                SELECTED_VMIDS+=("$vmid")
+            done
+            return 0
+            ;;
+        1)  # Back
+            return 1
+            ;;
+        3)  # Select All / Deselect All
+            if [[ "$select_all_mode" == false ]]; then
+                # Select all
+                SELECTED_VMIDS=()
+                for vmid in "${vmids[@]}"; do
+                    SELECTED_VMIDS+=("$vmid")
+                done
+                select_all_mode=true
+            else
+                # Deselect all
+                SELECTED_VMIDS=()
+                select_all_mode=false
+            fi
+            return 2  # Stay on same step
+            ;;
+    esac
+}
+
+# Show confirmation dialog
+show_confirmation_dialog() {
+    local selected_count="${#SELECTED_VMIDS[@]}"
+    local hostpci_count="${#HOSTPCI_VMS[@]}"
+    
+    # Get HA manager status once to avoid multiple calls
+    local ha_manager_status=$(ha-manager status)
+    
+    # Count VMs/CTs that will be skipped
+    local skip_count=0
+    local skip_details=""
+    
+    for vmid in "${SELECTED_VMIDS[@]}"; do
+        # Check if VM has hostpci
+        if [[ " ${HOSTPCI_VMS[*]} " == *" $vmid "* ]]; then
+            skip_details+="- VM $vmid (hostpci present)\n"
+            ((skip_count++))
+        fi
+        
+        # Check if already in HA
+        if echo "$ha_manager_status" | awk '{print $1}' | grep -qx "vm:$vmid" || echo "$ha_manager_status" | awk '{print $1}' | grep -qx "ct:$vmid"; then
+            skip_details+="- VM/CT $vmid (already in HA)\n"
+            ((skip_count++))
+        fi
+    done
+    
+    local info_text="Summary of VM/CT selection for HA resources:\n\n"
+    info_text+="Selected VM/CT count: $selected_count\n"
+    info_text+="Target HA group: $GROUP\n"
+    info_text+="Target HA nodes: $NODES_CSV\n\n"
+    
+    if [ $skip_count -gt 0 ]; then
+        info_text+="Items that will be skipped ($skip_count):\n$skip_details\n"
+    fi
+    
+    local process_count=$((selected_count - skip_count))
+    info_text+="Items to be processed: $process_count\n\n"
+    info_text+="Do you want to continue?"
+    
+    local dialog_selected=$(mktemp)
+    local cmd=(dialog --keep-tite --title "Step $current_step/$total_steps: HA Resources Summary"
+           --yes-label "Execute" --no-label "Back"
+           --yesno "$info_text" 20 80)
+    local options=()
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Execute
+            log_info "User confirmed HA resources addition operation"
+            return 0
+            ;;
+        1)  # Back
+            log_info "User went back from HA resources addition confirmation"
+            return 1
+            ;;
+    esac
+}
+
+# Process and add resources
+process_ha_resources() {
+    local total_processed=0
+    local total_added=0
+    local total_skipped=0
+    local results_text=""
+    
+    # Get HA manager status once to avoid multiple calls
+    local ha_manager_status=$(ha-manager status)
+    
+    # Get type information for selected VMs/CTs
+    local vm_type_map
+    vm_type_map=$(pvesh get /cluster/resources --type vm --output-format=json | \
+    python3 -c "
+import sys, json
+resources = json.load(sys.stdin)
+mapping = {'qemu': 'vm', 'lxc': 'ct'}
+for resource in resources:
+    if resource['type'] in mapping:
+        print(f\"{resource['vmid']}:{mapping[resource['type']]}\")
+")
+    
+    # Count total selected resources for progress
+    local total_resources=${#SELECTED_VMIDS[@]}
+    
+    # Process each selected VM/CT
+    for vmid in "${SELECTED_VMIDS[@]}"; do
+        ((total_processed++))
+        
+        # Get VM/CT type
+        local vm_type
+        vm_type=$(echo "$vm_type_map" | grep "^$vmid:" | cut -d':' -f2)
+        if [ -z "$vm_type" ]; then
+            log_error "Cannot determine type for VM/CT $vmid"
+            results_text+="Failed to determine type for $vmid\n"
+            continue
+        fi
+        
+        local sid="${vm_type}:${vmid}"
+        
+        # Update progress
+        local progress=$((total_processed * 100 / total_resources))
+        echo "$progress" | dialog --gauge "Processing selected VM/CT resources...\nCurrent: $sid" 8 60 0
+        
+        # Skip hostpci VMs
+        if [[ "$vm_type" == "vm" ]] && [[ " ${HOSTPCI_VMS[*]} " == *" $vmid "* ]]; then
+            log_info "Skipping vm:$vmid (hostpci present)"
+            results_text+="Skipped vm:$vmid (hostpci present)\n"
+            ((total_skipped++))
+            continue
+        fi
+        
+        # Skip if already in HA group
+        if echo "$ha_manager_status" | awk '{print $1}' | grep -qx "$sid"; then
+            log_info "Skipping $sid (already in HA)"
+            results_text+="Skipped $sid (already in HA)\n"
+            ((total_skipped++))
+            continue
+        fi
+        
+        # Add to HA group
+        if ha-manager add "$sid" --state started --group "$GROUP" \
+            --comment "HA ${vmid} on ${NODES_CSV}" 2>/dev/null; then
+            log_info "Added $sid to HA group \"$GROUP\""
+            results_text+="Added $sid to HA group\n"
+            ((total_added++))
+        else
+            log_error "Failed to add $sid to HA group"
+            results_text+="Failed to add $sid\n"
+        fi
+    done
+    
+    # Show results
+    local summary="Operation completed:\n\n"
+    summary+="Total processed: $total_processed\n"
+    summary+="Successfully added: $total_added\n"
+    summary+="Skipped: $total_skipped\n\n"
+    summary+="Details:\n$results_text"
+    
+    dialog --keep-tite --title "HA Resources Addition Results" \
+           --ok-label "OK" \
+           --msgbox "$summary" 20 80
+    
+    log_info "HA resources processing completed: $total_added added, $total_skipped skipped"
+}
+
+# Main wizard function
+add_vmct_to_ha_resources() {
+    log_info "Starting Add VM/CT to HA Resources wizard"
+    
+    # Initialize wizard variables
+    SELECTED_VMIDS=()
+    current_step=1
+    total_steps=5
+    select_all_mode=false
+    
+    # Collect VMIDs using PCI passthrough (needed for selection display)
+    readarray -t HOSTPCI_VMS < <(get_vms_with_hostpci)
+    
+    while true; do
+        case $current_step in
+            1)
+                # Step 1: Select first HA node
+                log_info "Wizard: Starting step 1 - Select first HA node"
+                select_first_ha_node
+                case $? in
+                    0) 
+                        log_info "Wizard: Step 1 completed successfully, moving to step 2"
+                        current_step=2
+                        ;;
+                    1) 
+                        log_info "User canceled first node selection"
+                        return 0
+                        ;;
+                esac
+                ;;
+            2)
+                # Step 2: Select second HA node
+                log_info "Wizard: Starting step 2 - Select second HA node"
+                select_second_ha_node
+                local step2_result=$?
+                log_info "Wizard: Step 2 returned code: $step2_result"
+                case $step2_result in
+                    0) current_step=3 ;;  # Next
+                    1) current_step=1 ;;  # Back
+                esac
+                ;;
+            3)
+                # Step 3: Confirm node selection
+                confirm_ha_nodes
+                case $? in
+                    0) current_step=4 ;;  # Next
+                    1) current_step=2 ;;  # Back
+                esac
+                ;;
+            4)
+                # Step 4: Select VM/CT
+                select_vm_ct_for_ha
+                case $? in
+                    0) current_step=5 ;;  # Next
+                    1) current_step=3 ;;  # Back
+                    2) ;;                 # Stay on same step
+                esac
+                ;;
+            5)
+                # Step 5: Show confirmation dialog and execute
+                show_confirmation_dialog
+                case $? in
+                    0) # Execute
+                        # Ensure HA group exists
+                        if ! get_groups | grep -qw "$GROUP"; then
+                            log_info "Group '$GROUP' does not exist. Creating restricted group on nodes: $NODES_CSV"
+                            ha-manager groupadd "$GROUP" \
+                                --nodes "$NODES_CSV" \
+                                --restricted 1 \
+                                --comment "Auto-created by pve-tools"
+                        fi
+                        
+                        # Process resources
+                        process_ha_resources
+                        
+                        log_info "Add VM/CT to HA Resources wizard completed"
+                        return 0
+                        ;;
+                    1) current_step=4 ;;  # Back
+                esac
+                ;;
+        esac
+    done
+}
+
 # MAIN SCRIPT EXECUTION
 
 # Main script entry point
@@ -4313,6 +5292,11 @@ main() {
     build_storage_ip_map
     
     log_info "PVE Tools initialized"
+    
+    # Check for updates
+    if check_for_updates; then
+        prompt_for_update
+    fi
     
     # Main application loop
     clear

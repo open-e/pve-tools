@@ -1666,7 +1666,7 @@ step1_select_config() {
         fi
     done
 
-    local i vmid seen_vmids=()
+    local i vmid seen_vmids=() vmid_to_conf_map=()
     for ((i=0; i<${#confs[@]}; i++)); do
         # Extract VM/CT ID from path like /mnt/pve/storage/images/103/103.conf
         local dir_name="$(dirname "${confs[i]}")"
@@ -1687,6 +1687,8 @@ step1_select_config() {
         
         seen_vmids+=("$vmid")
         vmids+=("$vmid")
+        # Map vmid to original config file path
+        vmid_to_conf_map+=("${confs[i]}")
 
         # Get VM/CT type
         local vm_type=$(config_file_type "${confs[i]}")
@@ -1743,7 +1745,7 @@ step1_select_config() {
                 selected_vmid=$(echo "$selected_vmid" | tr -d '"')
                 for ((i=0; i<${#vmids[@]}; i++)); do
                     if [[ "${vmids[i]}" == "$selected_vmid" ]]; then
-                        selected_confs+=("${confs[i]}")
+                        selected_confs+=("${vmid_to_conf_map[i]}")
                         break
                     fi
                 done

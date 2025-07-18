@@ -25,7 +25,7 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.11"
+VERSION="0.12"
 
 # Script mode flag
 VERSION_MODE=false
@@ -1440,13 +1440,13 @@ main_menu() {
 
     cmd=(dialog --keep-tite --title "$VENDOR $PRODUCT Proxmox VE (PVE) Tools - Main Menu"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
-         --menu "Choose an option:" 16 80 10)
+         --menu "Choose an option:" 18 80 10)
     options=("0" "Add Cloned NFS Storage from $PRODUCT Snapshot"
              "1" "Restore VM/CT from Cloned NFS Storage"
-             "2" "Delete Cloned NFS Storage and cloned dataset in $PRODUCT     "
+             "2" "Delete Cloned NFS Storage in PVE & cloned dataset in $PRODUCT     "
              "3" "Cleanup inactive NFS storage"
              "4" "Cleanup unused disks in VM/CT config"
-             "5" "VM/CT Manager - Bulk Actions"
+             "5" "Bulk VM/CT Operations – Start, Stop, Reboot, and More"
              "6" "NFS tuning - set nconnect option"
              "7" "Add VM/CT to Proxmox VE HA Resources"
              "8" "Post known issues fixes and tuning"
@@ -2244,6 +2244,12 @@ perform_restore() {
             esac
         fi
     done
+
+    # Need to initiate fresh config files backup using pve-config-backup daemon
+    log_info "Stopping pve-config-backup daemon"
+    pve-config-backup stop >> /var/log/pve-tools/pve-tools.log 2>&1
+    log_info "Starting pve-config-backup daemon"
+    pve-config-backup start >> /var/log/pve-tools/pve-tools.log 2>&1
 
     # Show final result
     local result_text="Restoration completed!\n\n"

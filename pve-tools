@@ -25,8 +25,8 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.16"
-RELEASE_DATE="2025-07-18"
+VERSION="0.17"
+RELEASE_DATE="2025-07-19"
 
 # Script mode flag
 VERSION_MODE=false
@@ -487,7 +487,7 @@ ENDSCRIPT
     wait
     
     log_info "NFS cleanup complete"
-    dialog --msgbox "Cleanup finished.\nReview:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details." 8 70
+    dialog --msgbox "Cleanup finished.\nReview logs in:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details." 8 70
 }
 
 # Check pve-config-backup daemon status on all cluster nodes
@@ -1036,12 +1036,13 @@ resolve_vmct_conflict() {
     
     log_info "Resolving VM/CT conflict for ID $vmid ($type)"
     
-    local conflict_msg="VM/CT ID $vmid already exists in PVE repository!\n\n"
+    local vm_type_upper=$(echo "$type" | tr '[:lower:]' '[:upper:]')
+    local conflict_msg="$vm_type_upper ID $vmid already exists in PVE repository!\n\n"
     conflict_msg+="Choose an option:\n"
-    conflict_msg+="- Cancel: Skip this VM/CT restoration\n"
+    conflict_msg+="- Cancel: Skip this $vm_type_upper restoration\n"
     conflict_msg+="- New ID: Provide a different ID for restoration"
     
-    dialog --keep-tite --title "VM/CT Conflict Detected" \
+    dialog --keep-tite --title "$vm_type_upper Conflict Detected" \
            --yes-label "New ID" --no-label "Cancel" \
            --yesno "$conflict_msg" 12 70
     
@@ -1973,34 +1974,24 @@ help_about_dialog() {
     help_text+="\n"
     
     # Information from CLAUDE.md
-    help_text+="PROJECT OVERVIEW:\n"
+    help_text+="PROGRAM OVERVIEW:\n"
     help_text+="-----------------\n"
     help_text+="PVE Tools is a bash script that provides Proxmox VE (PVE) integration\n"
-    help_text+="with $VENDOR $PRODUCT storage. The tool enables managing NFS storage\n"
+    help_text+="with $VENDOR $PRODUCT storage. This tool enables management of NFS storage\n"
     help_text+="clones from $PRODUCT snapshots for VM/CT backup and restore operations.\n"
     help_text+="\n"
-    help_text+="CORE FUNCTIONALITY:\n"
-    help_text+="-------------------\n"
-    help_text+="1. Add Cloned NFS Storage from $PRODUCT Snapshot\n"
-    help_text+="   - Creates clones from snapshots and sets up NFS storage in Proxmox\n"
-    help_text+="\n"
-    help_text+="2. Restore VM/CT from Cloned NFS Storage\n"
-    help_text+="   - Restores VMs/CTs from previously created cloned storage\n"
-    help_text+="\n"
-    help_text+="3. Delete Cloned NFS Storage\n"
-    help_text+="   - Removes cloned storage from both Proxmox and $PRODUCT\n"
-    help_text+="\n"
-    help_text+="4. Cleanup inactive NFS storage\n"
-    help_text+="   - Removes unused NFS storage entries\n"
-    help_text+="\n"
-    help_text+="5. VM/CT Manager - Bulk Actions\n"
-    help_text+="   - Perform bulk operations on VMs/CTs\n"
-    help_text+="\n"
-    help_text+="6. NFS tuning - set nconnect option\n"
-    help_text+="   - Optimize NFS performance with connection tuning\n"
-    help_text+="\n"
+    help_text+="MAIN FUNCTIONS:\n"
+    help_text+="---------------\n"
+    help_text+="0. Add Cloned NFS Storage from $PRODUCT Snapshot\n"
+    help_text+="1. Restore VM/CT from Cloned NFS Storage\n"
+    help_text+="2. Delete Cloned NFS Storage in PVE & Cloned Dataset in $PRODUCT\n"
+    help_text+="3. Clean up inactive NFS storage\n"
+    help_text+="4. Clean up unused disks in VM/CT config\n"
+    help_text+="5. Bulk VM/CT Operations – Start, Stop, Reboot, and More\n"
+    help_text+="6. NFS tuning - Set nconnect option\n"
     help_text+="7. Add VM/CT to Proxmox VE HA Resources\n"
-    help_text+="   - Configure high availability for VMs/CTs\n"
+    help_text+="8. Apply known issue fixes and tuning\n"
+    help_text+="9. Help & About pve-tools\n"
     help_text+="\n"
     help_text+="REQUIREMENTS:\n"
     help_text+="-------------\n"
@@ -2009,16 +2000,12 @@ help_about_dialog() {
     help_text+="- Dialog package for TUI interface\n"
     help_text+="- REST API access to $PRODUCT (default port 82)\n"
     help_text+="\n"
-    help_text+="ARCHITECTURE:\n"
-    help_text+="-------------\n"
-    help_text+="- Single bash file application\n"
-    help_text+="- Dialog-based interactive TUI menus\n"
-    help_text+="- REST API communication with $PRODUCT\n"
-    help_text+="- Centralized logging system\n"
-    help_text+="- Wizard-based workflows with step tracking\n"
-    help_text+="- Built-in conflict resolution for VM/CT ID conflicts\n"
-    help_text+="\n"
-    help_text+="For more information, see the project documentation."
+    help_text+="STARTUP FEATURES:\n"
+    help_text+="-----------------\n"
+    help_text+="- Automatic software update checking from GitHub repository\n"
+    help_text+="- Automatic pve-config-backup daemon detection on startup\n"
+    help_text+="- Auto-installation of pve-config-backup from GitHub when not found\n"
+    help_text+="- Background status monitoring of cluster backup daemons\n"
     
     dialog --keep-tite --title "Help & About pve-tools" \
            --ok-label "Close" \
@@ -2602,6 +2589,65 @@ restore_ct() {
 }
 
 
+# Regenerate MAC addresses for network interfaces in VM config
+regenerate_mac_addresses() {
+    local config_file="$1"
+    
+    if [ ! -f "$config_file" ]; then
+        log_error "regenerate_mac_addresses: Config file not found: $config_file"
+        return 1
+    fi
+    
+    log_info "Regenerating MAC addresses for VM config: $config_file"
+    
+    # Find all network interface lines (net0, net1, etc.) with MAC addresses
+    # Handle both formats: macaddr=XX:XX:XX:XX:XX:XX and hwaddr=XX:XX:XX:XX:XX:XX
+    local mac_count=0
+    
+    # Process each network interface line
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^net[0-9]+: ]]; then
+            local net_num=$(echo "$line" | grep -oE "^net[0-9]+" | grep -oE "[0-9]+")
+            local old_mac=""
+            local mac_param=""
+            
+            # Check for virtio=MAC pattern (Proxmox format)
+            if [[ "$line" =~ virtio=([0-9A-Fa-f:]+) ]]; then
+                old_mac="${BASH_REMATCH[1]}"
+                mac_param="virtio"
+            # Check for e1000=MAC pattern
+            elif [[ "$line" =~ e1000=([0-9A-Fa-f:]+) ]]; then
+                old_mac="${BASH_REMATCH[1]}"
+                mac_param="e1000"
+            # Check for rtl8139=MAC pattern
+            elif [[ "$line" =~ rtl8139=([0-9A-Fa-f:]+) ]]; then
+                old_mac="${BASH_REMATCH[1]}"
+                mac_param="rtl8139"
+            # Check for macaddr= pattern (alternative format)
+            elif [[ "$line" =~ macaddr=([0-9A-Fa-f:]+) ]]; then
+                old_mac="${BASH_REMATCH[1]}"
+                mac_param="macaddr"
+            fi
+            
+            if [[ -n "$old_mac" ]]; then
+                # Generate new random MAC address (using Proxmox's range)
+                # Proxmox uses prefix BC:24:11 for auto-generated MACs
+                local new_mac=$(printf "BC:24:11:%02X:%02X:%02X" $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)))
+                
+                # Replace the MAC address in the config file
+                sed -i "s/${mac_param}=${old_mac}/${mac_param}=${new_mac}/g" "$config_file"
+                
+                log_info "Regenerated MAC address for net${net_num}: ${old_mac} -> ${new_mac}"
+                ((mac_count++))
+            fi
+        fi
+    done < "$config_file"
+    
+    log_info "Total MAC addresses regenerated: $mac_count"
+    
+    return 0
+}
+
 restore_vm() {
     local src_conf="$1"
     local host_name="$2"
@@ -2640,6 +2686,9 @@ restore_vm() {
         log_error "Could not find storage reference in VM $vmid config"
         return 1
     fi
+    
+    # Regenerate MAC addresses for network interfaces
+    regenerate_mac_addresses "$dst_conf"
     
     log_info "VM $vmid restored"
     return 0
@@ -2759,6 +2808,32 @@ perform_restore() {
 
     log_info "Restoration completed - Total: $total, Success: $success, Failed: $failed, Skipped: $skipped"
     dialog --msgbox "$result_text" 15 50
+    
+    # Show static IP address warning if any VMs were successfully restored
+    if [ $success -gt 0 ]; then
+        local warning_text="IMPORTANT: Static IP Address Configuration\n\n"
+        warning_text+="If the restored VM use static IP addresses, you must:\n\n"
+        warning_text+="1. Start the VM with network isolated/disconnected\n"
+        warning_text+="2. Access the VM console\n"
+        warning_text+="3. Change static IP addresses to unique values\n"
+        warning_text+="4. Reconnect network after IP configuration\n\n"
+        warning_text+="This is not required if the VM use DHCP for IP assignment.\n\n"
+        warning_text+="To confirm you have read this important information,\ntype 'noted':"
+        
+        local confirm_input=$(mktemp)
+        dialog --ok-label "OK" --no-cancel \
+               --inputbox "$warning_text" 22 70 2> "$confirm_input"
+        local confirmation=$(cat "$confirm_input" | tr -d ' \t\n\r')
+        rm -f "$confirm_input"
+        
+        # Keep showing dialog until user types "noted"
+        while [[ "$confirmation" != "noted" ]]; do
+            dialog --ok-label "OK" --no-cancel \
+                   --inputbox "$warning_text" 20 70 2> "$confirm_input"
+            confirmation=$(cat "$confirm_input" | tr -d ' \t\n\r')
+            rm -f "$confirm_input"
+        done
+    fi
 }
 
 restore_from_clone_wizard() {
@@ -4748,7 +4823,7 @@ show_vmct_usage_warning() {
 delete_cloned_nfs_storage_wizard() {
     # Check if REST API is configured
     if [[ -z "$rest_api_user" || -z "$rest_api_password" || -z "$rest_api_port" ]]; then
-        dialog --msgbox "REST API configuration is not complete. Please use Setup to configure it first." 8 60
+        dialog --msgbox "REST API configuration is incomplete. Please use Setup to configure it first." 8 60
         return 1
     fi
 
@@ -5231,6 +5306,95 @@ except Exception as e:
     return 1
 }
 
+# Get VM/CT detailed info including name and tags
+vm_manager_get_vm_details() {
+    local vmid="$1"
+    
+    # Get VM/CT info from cluster resources
+    local vm_info=$(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
+        python3 -c "
+import sys, json
+try:
+    resources = json.load(sys.stdin)
+    for resource in resources:
+        if str(resource.get('vmid', '')) == '$vmid':
+            res_type = resource.get('type', '')
+            status = resource.get('status', 'unknown')
+            node = resource.get('node', '')
+            lock = resource.get('lock', '')
+            name = resource.get('name', '')
+            
+            # Map resource type to our format
+            if res_type == 'qemu':
+                vm_type = 'vm'
+            elif res_type == 'lxc':
+                vm_type = 'ct'
+            else:
+                vm_type = 'unknown'
+                
+            # Check if VM/CT is suspended (has suspended lock or paused status)
+            if lock == 'suspended' or status == 'paused':
+                status = 'suspended'
+                
+            print(f'{vm_type}|{status}|{node}|{name}')
+            sys.exit(0)
+    print('unknown|unknown|unknown|')
+except Exception as e:
+    print('unknown|unknown|unknown|')
+    print(f'Error: {e}', file=sys.stderr)
+")
+    
+    # Get tags from VM/CT config if available
+    local vm_type_status_node_name="$vm_info"
+    local vm_type
+    IFS='|' read -r vm_type _ _ _ <<< "$vm_type_status_node_name"
+    
+    local tags=""
+    if [[ "$vm_type" == "vm" ]]; then
+        # Get tags from qemu config
+        tags=$(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
+            python3 -c "
+import sys, json
+try:
+    resources = json.load(sys.stdin)
+    for resource in resources:
+        if str(resource.get('vmid', '')) == '$vmid':
+            tags = resource.get('tags', '')
+            print(tags)
+            sys.exit(0)
+    print('')
+except Exception as e:
+    print('')
+    print(f'Error: {e}', file=sys.stderr)
+")
+    elif [[ "$vm_type" == "ct" ]]; then
+        # Get tags from lxc config
+        tags=$(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
+            python3 -c "
+import sys, json
+try:
+    resources = json.load(sys.stdin)
+    for resource in resources:
+        if str(resource.get('vmid', '')) == '$vmid':
+            tags = resource.get('tags', '')
+            print(tags)
+            sys.exit(0)
+    print('')
+except Exception as e:
+    print('')
+    print(f'Error: {e}', file=sys.stderr)
+")
+    fi
+    
+    if [[ -n "$vm_info" && "$vm_info" != "unknown|unknown|unknown|" ]]; then
+        echo "${vm_info}|${tags}"
+        return 0
+    fi
+    
+    echo "unknown|unknown|unknown||"
+    return 1
+}
+
 # Execute action on VM/CT for VM/CT Manager
 vm_manager_execute_action() {
     local vmid="$1"
@@ -5251,6 +5415,8 @@ vm_manager_execute_action() {
     current_node=$(hostname)
     
     log_debug "VM/CT $vmid: type=$vm_type, status=$current_status, node=$vm_node, action=$action"
+    log_debug "Raw vm_type_status_node response: '$vm_type_status_node'"
+    log_debug "Current node: $current_node, VM node: $vm_node"
     
     # Check if action is needed
     case "$action" in
@@ -5295,10 +5461,18 @@ vm_manager_execute_action() {
     # Build command
     if [[ "$vm_type" == "vm" ]]; then
         local base_cmd="qm $action $vmid"
+        log_debug "Building VM command: $base_cmd"
     elif [[ "$vm_type" == "ct" ]]; then
-        local base_cmd="pct $action $vmid"
+        # For containers, reset should be reboot
+        if [[ "$action" == "reset" ]]; then
+            local base_cmd="pct reboot $vmid"
+            log_debug "Building CT command (reset->reboot): $base_cmd"
+        else
+            local base_cmd="pct $action $vmid"
+            log_debug "Building CT command: $base_cmd"
+        fi
     else
-        log_error "Unknown VM/CT type for $vmid"
+        log_error "Unknown VM/CT type '$vm_type' for $vmid"
         return 1
     fi
     
@@ -5306,16 +5480,19 @@ vm_manager_execute_action() {
     if [[ "$vm_node" == "$current_node" ]]; then
         # Execute locally
         cmd_to_run="$base_cmd"
+        log_debug "Executing locally: $cmd_to_run"
         log_info "Executing locally: $cmd_to_run"
         
         result=$(bash -c "$cmd_to_run" 2>&1)
         local exit_code=$?
         
+        log_debug "Command result: exit_code=$exit_code, output='$result'"
+        
         if [[ $exit_code -eq 0 ]]; then
             log_info "Action $action completed successfully for VM/CT $vmid"
             return 0
         else
-            log_error "Action $action failed for VM/CT $vmid: $result"
+            log_error "Action $action failed for VM/CT $vmid: $result (exit code: $exit_code)"
             return 1
         fi
     else
@@ -5323,19 +5500,28 @@ vm_manager_execute_action() {
         if [[ "$vm_type" == "vm" ]]; then
             cmd_to_run="pvesh create /nodes/$vm_node/qemu/$vmid/status/$action"
         elif [[ "$vm_type" == "ct" ]]; then
-            cmd_to_run="pvesh create /nodes/$vm_node/lxc/$vmid/status/$action"
+            # For containers, reset should be reboot in pvesh as well
+            if [[ "$action" == "reset" ]]; then
+                cmd_to_run="pvesh create /nodes/$vm_node/lxc/$vmid/status/reboot"
+                log_debug "Building remote CT command (reset->reboot): $cmd_to_run"
+            else
+                cmd_to_run="pvesh create /nodes/$vm_node/lxc/$vmid/status/$action"
+            fi
         fi
         
+        log_debug "Executing on remote node $vm_node: $cmd_to_run"
         log_info "Executing on node $vm_node: $cmd_to_run"
         
         result=$(bash -c "$cmd_to_run" 2>&1)
         local exit_code=$?
         
+        log_debug "Remote command result: exit_code=$exit_code, output='$result'"
+        
         if [[ $exit_code -eq 0 ]]; then
             log_info "Action $action completed successfully for VM/CT $vmid on node $vm_node"
             return 0
         else
-            log_error "Action $action failed for VM/CT $vmid on node $vm_node: $result"
+            log_error "Action $action failed for VM/CT $vmid on node $vm_node: $result (exit code: $exit_code)"
             return 1
         fi
     fi
@@ -5350,6 +5536,9 @@ vm_manager_execute_actions() {
     local error_count=0
     local current=0
     
+    log_debug "Starting batch action '$action' on $total_count VMs/CTs"
+    log_debug "Selected VMs/CTs: ${vm_manager_selected_vms[*]}"
+    
     # Initialize action counts
     vm_manager_action_counts=("$success_count" "$skip_count" "$error_count")
     
@@ -5357,8 +5546,32 @@ vm_manager_execute_actions() {
         current=$((current + 1))
         local progress=$((current * 100 / total_count))
         
+        # Get VM details for display
+        local vm_details=$(vm_manager_get_vm_details "$vmid")
+        local vm_type vm_name vm_tags
+        IFS='|' read -r vm_type _ _ vm_name vm_tags <<< "$vm_details"
+        
+        # Convert vm_type to display format
+        local display_type
+        if [[ "$vm_type" == "vm" ]]; then
+            display_type="VM"
+        elif [[ "$vm_type" == "ct" ]]; then
+            display_type="CT"
+        else
+            display_type="VM/CT"
+        fi
+        
+        # Build display name with tags
+        local display_name="$vmid"
+        if [[ -n "$vm_name" ]]; then
+            display_name="$vmid ($vm_name)"
+        fi
+        if [[ -n "$vm_tags" ]]; then
+            display_name="$display_name [$vm_tags]"
+        fi
+        
         # Show progress
-        echo "$progress" | dialog --title "Processing VM/CT" --gauge "Executing $action on VM/CT $vmid ($current/$total_count)" 8 60
+        echo "$progress" | dialog --title "Processing $display_type" --gauge "Executing $action on $display_type $display_name ($current/$total_count)" 8 90
         
         # Execute action
         vm_manager_execute_action "$vmid" "$action"

@@ -300,7 +300,7 @@ init_config() {
     if [ ! -f "$CONFIG_FILE" ]; then
         cat > "$CONFIG_FILE" << EOF
 rest_api_user=admin
-rest_api_password=admin
+rest_api_password='admin'
 rest_api_port=82
 EOF
         log_info "Created default config file: $CONFIG_FILE"
@@ -308,8 +308,21 @@ EOF
 
     # Load configuration
     if [ -f "$CONFIG_FILE" ]; then
+        log_debug "init_config: Config file exists, reading content"
+        log_debug "init_config: Config file content:"
+        while IFS= read -r line; do
+            log_debug "init_config: $line"
+        done < "$CONFIG_FILE"
+        
         source "$CONFIG_FILE"
         log_info "Loaded configuration from $CONFIG_FILE"
+        log_debug "init_config: rest_api_user='$rest_api_user'"
+        log_debug "init_config: rest_api_password length=${#rest_api_password}"
+        
+        # Show masked password for debugging
+        local masked_pwd="${rest_api_password:0:4}$(printf '%*s' $((${#rest_api_password} - 4)) | tr ' ' '*')"
+        log_debug "init_config: rest_api_password preview='$masked_pwd'"
+        log_debug "init_config: rest_api_port='$rest_api_port'"
     else
         log_error "Config file not found: $CONFIG_FILE"
         return 1
@@ -317,6 +330,30 @@ EOF
 }
 
 # UTILITY FUNCTIONS
+
+# URL encode a string for safe use in curl credentials
+url_encode() {
+    local string="$1"
+    local encoded=""
+    local length=${#string}
+    
+    log_debug "url_encode: Input string length: $length"
+    
+    for (( i=0; i<length; i++ )); do
+        local char="${string:$i:1}"
+        case "$char" in
+            [a-zA-Z0-9.~_-]) 
+                encoded+="$char" ;;
+            *)
+                local hex_val=$(printf '%%%02X' "'$char")
+                log_debug "url_encode: Encoding char '$char' as '$hex_val'"
+                encoded+="$hex_val" ;;
+        esac
+    done
+    
+    log_debug "url_encode: Output string length: ${#encoded}"
+    echo "$encoded"
+}
 
 # Trim leading and trailing quotes and spaces from user input
 trimq() {
@@ -457,14 +494,10 @@ check_pve_config_backup_status() {
     log_info "Checking pve-config-backup daemon status on all cluster nodes"
     
     dialog --infobox "Checking pve-config-backup daemon status on all nodes..." 5 60
-    sleep 1
 
-    # Get node list from corosync configuration
+    # Get node list from corosync configuration (optimized)
     local node_list
-    node_list=$(awk '
-        $1 == "name:" {node=$2}
-        $1 == "ring0_addr:" {print node, $2}
-    ' /etc/pve/corosync.conf)
+    node_list=$(awk '$1 == "name:" {node=$2} $1 == "ring0_addr:" {print node, $2}' /etc/pve/corosync.conf)
     
     if [ -z "$node_list" ]; then
         log_error "No nodes found in corosync configuration"
@@ -476,34 +509,39 @@ check_pve_config_backup_status() {
     local nodes_need_start=()
     local nodes_ok=()
     
-    # Check each node
+    # Check each node in parallel for faster execution
     echo "$node_list" | while read -r node ip; do
-        log_info "Checking pve-config-backup status on node: $node ($ip)"
-        
-        # Check if pve-config-backup is installed and get its status
-        local status_output
-        status_output=$(ssh -o StrictHostKeyChecking=no root@"$ip" "
-            if [ -f /usr/local/sbin/pve-config-backup ]; then
-                pve-config-backup status 2>/dev/null || echo 'INSTALLED_BUT_ERROR'
+        (
+            log_info "Checking pve-config-backup status on node: $node ($ip)"
+            
+            # Check if pve-config-backup is installed and get its status (with timeout)
+            local status_output
+            status_output=$(timeout 10 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@"$ip" "
+                if [ -f /usr/local/sbin/pve-config-backup ]; then
+                    pve-config-backup status 2>/dev/null || echo 'INSTALLED_BUT_ERROR'
+                else
+                    echo 'NOT_INSTALLED'
+                fi
+            " 2>/dev/null)
+            
+            if [ "$status_output" = "NOT_INSTALLED" ]; then
+                echo "$node $ip" >> /tmp/nodes_need_install
+                log_info "Node $node: pve-config-backup not installed"
+            elif echo "$status_output" | grep -q "Active: inactive (dead)"; then
+                echo "$node $ip" >> /tmp/nodes_need_start
+                log_info "Node $node: pve-config-backup installed but inactive"
+            elif echo "$status_output" | grep -q "Active: active (running)"; then
+                echo "$node $ip" >> /tmp/nodes_ok
+                log_info "Node $node: pve-config-backup running correctly"
             else
-                echo 'NOT_INSTALLED'
+                echo "$node $ip" >> /tmp/nodes_need_install
+                log_info "Node $node: pve-config-backup status unknown, will reinstall"
             fi
-        " 2>/dev/null)
-        
-        if [ "$status_output" = "NOT_INSTALLED" ]; then
-            echo "$node $ip" >> /tmp/nodes_need_install
-            log_info "Node $node: pve-config-backup not installed"
-        elif echo "$status_output" | grep -q "Active: inactive (dead)"; then
-            echo "$node $ip" >> /tmp/nodes_need_start
-            log_info "Node $node: pve-config-backup installed but inactive"
-        elif echo "$status_output" | grep -q "Active: active (running)"; then
-            echo "$node $ip" >> /tmp/nodes_ok
-            log_info "Node $node: pve-config-backup running correctly"
-        else
-            echo "$node $ip" >> /tmp/nodes_need_install
-            log_info "Node $node: pve-config-backup status unknown, will reinstall"
-        fi
+        ) &
     done
+    
+    # Wait for all parallel checks to complete
+    wait
     
     # Read results from temp files
     if [ -f /tmp/nodes_need_install ]; then
@@ -553,7 +591,6 @@ install_pve_config_backup_on_nodes() {
     fi
     
     log_info "Installing pve-config-backup on $node_count nodes"
-    dialog --infobox "Installing pve-config-backup on $node_count nodes..." 5 60
     
     # Process nodes in pairs (node_name node_ip)
     for ((i=0; i<${#nodes[@]}; i+=2)); do
@@ -562,26 +599,28 @@ install_pve_config_backup_on_nodes() {
         
         log_info "Installing pve-config-backup on node: $node ($ip)"
         
+        nohup bash -c "
         (
-        ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
+        timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@'$ip' 'bash -s' << 'ENDSCRIPT'
 # Install pve-config-backup
 cd /tmp
 wget https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup \
     -O /usr/local/sbin/pve-config-backup 2>/dev/null
 
-if [ $? -eq 0 ] && [ -f /usr/local/sbin/pve-config-backup ]; then
+if [ \$? -eq 0 ] && [ -f /usr/local/sbin/pve-config-backup ]; then
     chmod +x /usr/local/sbin/pve-config-backup
     /usr/local/sbin/pve-config-backup install >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
-        echo "INSTALL_SUCCESS"
+    if [ \$? -eq 0 ]; then
+        echo 'INSTALL_SUCCESS'
     else
-        echo "INSTALL_FAILED"
+        echo 'INSTALL_FAILED'
     fi
 else
-    echo "DOWNLOAD_FAILED"
+    echo 'DOWNLOAD_FAILED'
 fi
 ENDSCRIPT
-        ) >> "$LOGS_DIR/pve-config-backup-install-$node.log" 2>&1 &
+        ) >> '$LOGS_DIR/pve-config-backup-install-$node.log' 2>&1
+        " >/dev/null 2>&1 &
     done
     
     wait
@@ -598,7 +637,6 @@ start_pve_config_backup_on_nodes() {
     fi
     
     log_info "Starting pve-config-backup daemon on $node_count nodes"
-    dialog --infobox "Starting pve-config-backup daemon on $node_count nodes..." 5 60
     
     # Process nodes in pairs (node_name node_ip)
     for ((i=0; i<${#nodes[@]}; i+=2)); do
@@ -608,7 +646,7 @@ start_pve_config_backup_on_nodes() {
         log_info "Starting pve-config-backup daemon on node: $node ($ip)"
         
         (
-        ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
+        timeout 15 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@"$ip" "bash -s" << 'ENDSCRIPT'
 # Start pve-config-backup daemon
 if [ -f /usr/local/sbin/pve-config-backup ]; then
     /usr/local/sbin/pve-config-backup start >/dev/null 2>&1
@@ -631,9 +669,6 @@ ENDSCRIPT
 # Ensure pve-config-backup is installed and running on HA nodes (or all nodes if no HA group)
 ensure_pve_config_backup_running() {
     log_info "Ensuring pve-config-backup daemon is installed and running on HA nodes"
-    
-    dialog --infobox "Ensuring pve-config-backup daemon is ready on HA nodes..." 5 65
-    sleep 1
 
     # Get HA nodes list (fallback to all nodes if no HA group exists)
     local ha_nodes_list
@@ -1822,12 +1857,40 @@ prompt_for_update() {
 
 # MAIN MENU SYSTEM
 
+# Check background pve-config-backup status
+check_background_status() {
+    if [ -f /tmp/pve-config-backup-status ]; then
+        local status_info=$(cat /tmp/pve-config-backup-status)
+        if [[ "$status_info" == COMPLETED:* ]]; then
+            local completed_time="${status_info#COMPLETED:}"
+            PVE_CONFIG_BACKUP_STATUS="completed"
+            PVE_CONFIG_BACKUP_RESULT="✓ pve-config-backup check completed at $completed_time"
+        fi
+    elif [ -n "$PVE_CONFIG_BACKUP_PID" ]; then
+        if ! kill -0 "$PVE_CONFIG_BACKUP_PID" 2>/dev/null; then
+            PVE_CONFIG_BACKUP_STATUS="failed"
+            PVE_CONFIG_BACKUP_RESULT="✗ pve-config-backup check failed"
+        else
+            PVE_CONFIG_BACKUP_STATUS="checking"
+            PVE_CONFIG_BACKUP_RESULT="⏳ pve-config-backup check in progress..."
+        fi
+    fi
+}
+
 # Display main menu and handle user selections
 main_menu() {
     local dialog_selected=$(mktemp)
     
+    # Check background status
+    check_background_status
+    
+    # Build menu title with background status
+    local menu_title="$VENDOR $PRODUCT Proxmox VE (PVE) Tools - Main Menu"
+    if [ -n "$PVE_CONFIG_BACKUP_RESULT" ]; then
+        menu_title="$menu_title\n$PVE_CONFIG_BACKUP_RESULT"
+    fi
 
-    cmd=(dialog --keep-tite --title "$VENDOR $PRODUCT Proxmox VE (PVE) Tools - Main Menu"
+    cmd=(dialog --keep-tite --title "$menu_title"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
          --menu "Choose an option:" 18 80 10)
     options=("0" "Add Cloned NFS Storage from $PRODUCT Snapshot"
@@ -1967,51 +2030,72 @@ help_about_dialog() {
 setup_dialog() {
     local dialog_selected=$(mktemp)
     local form_data=$(mktemp)
-    
+    local temp_user="$rest_api_user"
+    local temp_password="$rest_api_password"
+    local temp_port="$rest_api_port"
 
-    # Create form with current values
-    dialog --keep-tite --title "Setup Configuration" \
-           --ok-label "Save" --cancel-label "Back" \
-           --form "Configure $PRODUCT REST API settings:" 12 60 3 \
-           "User:" 1 1 "$rest_api_user" 1 20 20 0 \
-           "Password:" 2 1 "$rest_api_password" 2 20 20 0 \
-           "Port:" 3 1 "$rest_api_port" 3 20 10 0 \
+    # Step 1: Get username and port
+    dialog --keep-tite --title "Setup Configuration - Step 1/2" \
+           --ok-label "Next" --cancel-label "Back" \
+           --form "Configure $PRODUCT REST API settings:" 10 60 2 \
+           "User:" 1 1 "$temp_user" 1 20 20 0 \
+           "Port:" 2 1 "$temp_port" 2 20 10 0 \
            2> "$form_data"
 
     local exit_code=$?
 
     if [ $exit_code -eq 0 ]; then
-        log_info "User saved configuration changes"
-        
-        # Parse form data and save to config
+        # Parse username and port
         local line_count=1
         while IFS= read -r line; do
             case $line_count in
-                1) rest_api_user="$line" ;;
-                2) rest_api_password="$line" ;;
-                3) rest_api_port="$line" ;;
+                1) temp_user="$line" ;;
+                2) temp_port="$line" ;;
             esac
             ((line_count++))
         done < "$form_data"
 
-        # Save to config file
-        cat > "$CONFIG_FILE" << EOF
+        # Step 2: Get password with masking
+        local masked_password=$(printf '%*s' ${#temp_password} | tr ' ' '*')
+        dialog --keep-tite --title "Setup Configuration - Step 2/2" \
+               --ok-label "Save" --cancel-label "Back" \
+               --insecure --passwordbox "Enter REST API password (supports copy&paste):\n" 12 70 \
+               2> "$form_data"
+
+        exit_code=$?
+
+        if [ $exit_code -eq 0 ]; then
+            temp_password=$(cat "$form_data")
+            
+            # Only update if password is not empty
+            if [ -n "$temp_password" ]; then
+                rest_api_user="$temp_user"
+                rest_api_password="$temp_password"
+                rest_api_port="$temp_port"
+
+                log_info "User saved configuration changes"
+                log_debug "setup_config: Parsed user='$rest_api_user'"
+                log_debug "setup_config: Parsed password length=${#rest_api_password}"
+                log_debug "setup_config: Parsed port='$rest_api_port'"
+
+                # Save to config file - properly escape the password to handle special characters
+                cat > "$CONFIG_FILE" << EOF
 rest_api_user=$rest_api_user
-rest_api_password=$rest_api_password
+rest_api_password='$rest_api_password'
 rest_api_port=$rest_api_port
 EOF
 
-        log_info "Configuration saved to $CONFIG_FILE"
-        dialog --msgbox "Configuration saved successfully!" 6 40
-        
-        rm -f "$form_data"
-        rm -f "$dialog_selected"
-        return 0
-    else
-        rm -f "$form_data"
-        rm -f "$dialog_selected"
-        return 1
+                log_info "Configuration saved to $CONFIG_FILE"
+                dialog --msgbox "Configuration saved successfully!" 6 40
+            else
+                dialog --msgbox "Password cannot be empty. Configuration not saved." 6 50
+            fi
+        fi
     fi
+    
+    rm -f "$form_data"
+    rm -f "$dialog_selected"
+    return 0
 }
 
 # RESTORE FROM CLONE WIZARD FUNCTIONS
@@ -2248,11 +2332,18 @@ step1_select_config() {
         return 1
     fi
 
-    # First pass: collect all storage names to calculate max length
-    local storage_names=()
+    # First pass: collect all storage names and VM/CT names to calculate max lengths
+    local storage_names=() vmct_names=()
     for ((i=0; i<${#confs[@]}; i++)); do
         local storage_name=$(get_storage_name_from_mnt_conf_file "${confs[i]}")
         storage_names+=("$storage_name")
+        
+        # Get VM/CT name from config file
+        local vmct_name=$(grep -E "^name[[:space:]]*[:=]" "${confs[i]}" 2>/dev/null | sed -E 's/^name[[:space:]]*[:=][[:space:]]*//' | head -1)
+        if [[ -z "$vmct_name" ]]; then
+            vmct_name="(no name)"
+        fi
+        vmct_names+=("$vmct_name")
     done
 
     # Calculate maximum storage name length for alignment
@@ -2260,6 +2351,14 @@ step1_select_config() {
     for storage_name in "${storage_names[@]}"; do
         if [ ${#storage_name} -gt $max_storage_len ]; then
             max_storage_len=${#storage_name}
+        fi
+    done
+    
+    # Calculate maximum VM/CT name length for alignment
+    local max_vmct_name_len=0
+    for vmct_name in "${vmct_names[@]}"; do
+        if [ ${#vmct_name} -gt $max_vmct_name_len ]; then
+            max_vmct_name_len=${#vmct_name}
         fi
     done
 
@@ -2290,17 +2389,26 @@ step1_select_config() {
         # Get VM/CT type
         local vm_type=$(config_file_type "${confs[i]}")
         
+        # Get VM/CT name from pre-calculated array
+        local vmct_name="${vmct_names[i]}"
+        
         # Get storage name
         local storage_name="${storage_names[i]}"
         
         # Get NFS IP address
         local nfs_ip=$(get_nfs_server_ip_of_given_storage "$storage_name")
         
-        # Format storage name with left alignment
+        # Format storage name with proper alignment
         local formatted_storage=$(printf "%-${max_storage_len}s" "$storage_name")
         
-        # Create display string: "vm/ct  storage_name  nfs_ip"
-        local display_string=$(printf "%-2s  %s  %s" "$vm_type" "$formatted_storage" "$nfs_ip")
+        # Calculate spacing after parentheses to align columns
+        local name_with_parens="($vmct_name)"
+        local total_name_width=$((max_vmct_name_len + 2))  # +2 for parentheses
+        local padding_needed=$((total_name_width - ${#name_with_parens}))
+        local padding=$(printf "%*s" $padding_needed "")
+        
+        # Create display string with parentheses aligned to name: "vm/ct (vmct_name)  storage_name  nfs_ip"
+        local display_string=$(printf "%-2s %s%s  %s  %s" "$vm_type" "$name_with_parens" "$padding" "$formatted_storage" "$nfs_ip")
 
         # Check if this config was previously selected
         local status="off"
@@ -2738,14 +2846,34 @@ nfs_total_steps=5
 rest_api_connection_test() {
     local response status
 
+    log_debug "rest_api_connection_test: Starting connection test"
+    log_debug "rest_api_connection_test: Target IP: $selected_nfs_ip"
+    log_debug "rest_api_connection_test: Target port: $rest_api_port"
+    log_debug "rest_api_connection_test: Username: $rest_api_user"
+    log_debug "rest_api_connection_test: Password length: ${#rest_api_password}"
+    
+    local url="https://$selected_nfs_ip:$rest_api_port/api/v4/conn_test"
+    log_debug "rest_api_connection_test: Full URL: $url"
+    
     response=$(curl -k -s -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/conn_test")
+        "$url" 2>&1)
+    local curl_exit=$?
+    
+    log_debug "rest_api_connection_test: curl exit code: $curl_exit"
+    log_debug "rest_api_connection_test: raw response: $response"
+    
     status=$(echo "$response" | tail -n1)
+    local body=$(echo "$response" | sed '$d')
+    
+    log_debug "rest_api_connection_test: HTTP status: $status"
+    log_debug "rest_api_connection_test: Response body: $body"
 
     if [[ "$status" == "200" ]]; then
+        log_info "rest_api_connection_test: Connection test successful"
         return 0
     else
         log_error "REST API connection test failed (HTTP $status)"
+        log_error "REST API response body: $body"
         return 1
     fi
 }
@@ -2914,7 +3042,7 @@ get_pool_names() {
     local addr="$1"
     local response
 
-    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
         "https://$addr:$rest_api_port/api/v4/pools")
 
     local curl_exit=$?
@@ -2949,7 +3077,7 @@ get_datasets_in_pool() {
     local pool_name="$1"
     local response
 
-    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes")
 
     local curl_exit=$?
@@ -2985,7 +3113,7 @@ get_snapshots_in_dataset() {
     local dataset_name="$2"
     local response
 
-    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
 
     local curl_exit=$?
@@ -3031,7 +3159,7 @@ get_snapshots_with_times() {
     local dataset_name="$2"
     local response
 
-    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
 
     local curl_exit=$?
@@ -3390,7 +3518,7 @@ extract_timestamp_from_snapname() {
         echo "${day_part}-${hourmin}"
     else
         local response
-        response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" -H 'Content-Type: application/json' \
+        response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
             "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
         local curl_exit=$?
         if [[ $curl_exit -ne 0 ]]; then
@@ -3991,7 +4119,7 @@ get_pools() {
     local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
     log_debug "get_pools: Making request to: $url"
     
-    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" \
+    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" \
         -H 'Content-Type: application/json' \
         "$url" 2>/dev/null)
 
@@ -4004,6 +4132,21 @@ get_pools() {
         return 1
     fi
 
+    # Check if response is empty or invalid
+    if [[ -z "$response" ]]; then
+        log_error "get_pools: Empty response from server"
+        return 1
+    fi
+
+    # Log the raw response for debugging
+    log_debug "get_pools: Raw response: ${response:0:200}..."
+    
+    # Check for HTTP error responses
+    if [[ "$response" =~ ^[0-9]{3}[[:space:]] ]]; then
+        log_error "get_pools: HTTP error response: $response"
+        return 1
+    fi
+    
     # Parse JSON response to extract pool names
     printf '%s' "$response" | python3 -c "
 import sys, json
@@ -4014,8 +4157,11 @@ try:
         name = pool.get('name')
         if name:
             print(name)
+except json.JSONDecodeError as e:
+    print(f'get_pools: JSON decode error: {e}', file=sys.stderr)
+    sys.exit(1)
 except Exception as e:
-    print('get_pools: Error: Failed to parse JSON response', file=sys.stderr)
+    print(f'get_pools: Error: {e}', file=sys.stderr)
     sys.exit(1)
 "
 
@@ -4075,7 +4221,7 @@ get_dataset_pool_name() {
 
         # Get nas-volumes for this pool
         local response
-        response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" \
+        response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" \
             -H 'Content-Type: application/json' \
             "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
 
@@ -4140,7 +4286,7 @@ is_clone() {
 
     # Make REST API call to get nas-volumes for the pool
     local response
-    response=$(curl -k -s -X GET -u "$rest_api_user":"$rest_api_password" \
+    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" \
         -H 'Content-Type: application/json' \
         "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
 
@@ -5864,6 +6010,19 @@ add_vmct_to_ha_resources() {
 
 # MAIN SCRIPT EXECUTION
 
+# Cleanup background processes and temporary files
+cleanup_background_processes() {
+    if [ -n "$PVE_CONFIG_BACKUP_PID" ]; then
+        if kill -0 "$PVE_CONFIG_BACKUP_PID" 2>/dev/null; then
+            log_info "Terminating background pve-config-backup check (PID: $PVE_CONFIG_BACKUP_PID)"
+            kill "$PVE_CONFIG_BACKUP_PID" 2>/dev/null
+        fi
+    fi
+    
+    # Clean up temporary files
+    rm -f /tmp/pve-config-backup-status /tmp/pve-config-backup-check.log
+}
+
 # Main script entry point
 main() {
     # Initialize logging system first
@@ -5903,8 +6062,19 @@ main() {
         prompt_for_update
     fi
     
-    # Ensure pve-config-backup daemon is running on HA nodes
-    ensure_pve_config_backup_running
+    # Start pve-config-backup check in background
+    PVE_CONFIG_BACKUP_STATUS="checking"
+    PVE_CONFIG_BACKUP_RESULT=""
+    (
+        ensure_pve_config_backup_running > /tmp/pve-config-backup-check.log 2>&1
+        echo "COMPLETED:$(date '+%H:%M:%S')" > /tmp/pve-config-backup-status
+    ) &
+    PVE_CONFIG_BACKUP_PID=$!
+    
+    log_info "Started pve-config-backup check in background (PID: $PVE_CONFIG_BACKUP_PID)"
+    
+    # Setup cleanup on exit
+    trap 'cleanup_background_processes' EXIT
     
     # Main application loop
     clear

@@ -1961,7 +1961,7 @@ help_about_dialog() {
     
     # Version and release info
     help_text+="pve-tools: version $VERSION\n"
-    help_text+="Release Date: 2024-07-17\n"
+    help_text+="Release Date: $RELEASE_DATE\n"
     help_text+="\n"
     
     # Log paths information

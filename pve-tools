@@ -25,7 +25,7 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.12"
+VERSION="0.15"
 
 # Script mode flag
 VERSION_MODE=false
@@ -449,7 +449,328 @@ ENDSCRIPT
     wait
     
     log_info "NFS cleanup complete"
-    dialog --msgbox "Cleanup finished.\nReview $LOGS_DIR/pve-nfs-cleanup-*.log for details." 8 70
+    dialog --msgbox "Cleanup finished.\nReview:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details." 8 70
+}
+
+# Check pve-config-backup daemon status on all cluster nodes
+check_pve_config_backup_status() {
+    log_info "Checking pve-config-backup daemon status on all cluster nodes"
+    
+    dialog --infobox "Checking pve-config-backup daemon status on all nodes..." 5 60
+    sleep 1
+
+    # Get node list from corosync configuration
+    local node_list
+    node_list=$(awk '
+        $1 == "name:" {node=$2}
+        $1 == "ring0_addr:" {print node, $2}
+    ' /etc/pve/corosync.conf)
+    
+    if [ -z "$node_list" ]; then
+        log_error "No nodes found in corosync configuration"
+        dialog --msgbox "Error: No cluster nodes found" 8 40
+        return 1
+    fi
+    
+    local nodes_need_install=()
+    local nodes_need_start=()
+    local nodes_ok=()
+    
+    # Check each node
+    echo "$node_list" | while read -r node ip; do
+        log_info "Checking pve-config-backup status on node: $node ($ip)"
+        
+        # Check if pve-config-backup is installed and get its status
+        local status_output
+        status_output=$(ssh -o StrictHostKeyChecking=no root@"$ip" "
+            if [ -f /usr/local/sbin/pve-config-backup ]; then
+                pve-config-backup status 2>/dev/null || echo 'INSTALLED_BUT_ERROR'
+            else
+                echo 'NOT_INSTALLED'
+            fi
+        " 2>/dev/null)
+        
+        if [ "$status_output" = "NOT_INSTALLED" ]; then
+            echo "$node $ip" >> /tmp/nodes_need_install
+            log_info "Node $node: pve-config-backup not installed"
+        elif echo "$status_output" | grep -q "Active: inactive (dead)"; then
+            echo "$node $ip" >> /tmp/nodes_need_start
+            log_info "Node $node: pve-config-backup installed but inactive"
+        elif echo "$status_output" | grep -q "Active: active (running)"; then
+            echo "$node $ip" >> /tmp/nodes_ok
+            log_info "Node $node: pve-config-backup running correctly"
+        else
+            echo "$node $ip" >> /tmp/nodes_need_install
+            log_info "Node $node: pve-config-backup status unknown, will reinstall"
+        fi
+    done
+    
+    # Read results from temp files
+    if [ -f /tmp/nodes_need_install ]; then
+        nodes_need_install=($(cat /tmp/nodes_need_install))
+        rm -f /tmp/nodes_need_install
+    fi
+    
+    if [ -f /tmp/nodes_need_start ]; then
+        nodes_need_start=($(cat /tmp/nodes_need_start))
+        rm -f /tmp/nodes_need_start
+    fi
+    
+    if [ -f /tmp/nodes_ok ]; then
+        nodes_ok=($(cat /tmp/nodes_ok))
+        rm -f /tmp/nodes_ok
+    fi
+    
+    # Report status
+    local total_nodes=$(echo "$node_list" | wc -l)
+    local install_count=$((${#nodes_need_install[@]} / 2))
+    local start_count=$((${#nodes_need_start[@]} / 2))
+    local ok_count=$((${#nodes_ok[@]} / 2))
+    
+    log_info "pve-config-backup status check complete - Total: $total_nodes, OK: $ok_count, Need install: $install_count, Need start: $start_count"
+    
+    # Install on nodes that need it
+    if [ $install_count -gt 0 ]; then
+        install_pve_config_backup_on_nodes "${nodes_need_install[@]}"
+    fi
+    
+    # Start on nodes that need it
+    if [ $start_count -gt 0 ]; then
+        start_pve_config_backup_on_nodes "${nodes_need_start[@]}"
+    fi
+    
+    # Final status check
+    dialog --msgbox "pve-config-backup status check complete.\nTotal nodes: $total_nodes\nAlready running: $ok_count\nInstalled: $install_count\nStarted: $start_count" 12 60
+}
+
+# Install pve-config-backup on specified nodes
+install_pve_config_backup_on_nodes() {
+    local nodes=("$@")
+    local node_count=$((${#nodes[@]} / 2))
+    
+    if [ $node_count -eq 0 ]; then
+        return 0
+    fi
+    
+    log_info "Installing pve-config-backup on $node_count nodes"
+    dialog --infobox "Installing pve-config-backup on $node_count nodes..." 5 60
+    
+    # Process nodes in pairs (node_name node_ip)
+    for ((i=0; i<${#nodes[@]}; i+=2)); do
+        local node="${nodes[i]}"
+        local ip="${nodes[i+1]}"
+        
+        log_info "Installing pve-config-backup on node: $node ($ip)"
+        
+        (
+        ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
+# Install pve-config-backup
+cd /tmp
+wget https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup \
+    -O /usr/local/sbin/pve-config-backup 2>/dev/null
+
+if [ $? -eq 0 ] && [ -f /usr/local/sbin/pve-config-backup ]; then
+    chmod +x /usr/local/sbin/pve-config-backup
+    /usr/local/sbin/pve-config-backup install >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo "INSTALL_SUCCESS"
+    else
+        echo "INSTALL_FAILED"
+    fi
+else
+    echo "DOWNLOAD_FAILED"
+fi
+ENDSCRIPT
+        ) >> "$LOGS_DIR/pve-config-backup-install-$node.log" 2>&1 &
+    done
+    
+    wait
+    log_info "pve-config-backup installation complete on all nodes"
+}
+
+# Start pve-config-backup daemon on specified nodes
+start_pve_config_backup_on_nodes() {
+    local nodes=("$@")
+    local node_count=$((${#nodes[@]} / 2))
+    
+    if [ $node_count -eq 0 ]; then
+        return 0
+    fi
+    
+    log_info "Starting pve-config-backup daemon on $node_count nodes"
+    dialog --infobox "Starting pve-config-backup daemon on $node_count nodes..." 5 60
+    
+    # Process nodes in pairs (node_name node_ip)
+    for ((i=0; i<${#nodes[@]}; i+=2)); do
+        local node="${nodes[i]}"
+        local ip="${nodes[i+1]}"
+        
+        log_info "Starting pve-config-backup daemon on node: $node ($ip)"
+        
+        (
+        ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
+# Start pve-config-backup daemon
+if [ -f /usr/local/sbin/pve-config-backup ]; then
+    /usr/local/sbin/pve-config-backup start >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo "START_SUCCESS"
+    else
+        echo "START_FAILED"
+    fi
+else
+    echo "NOT_INSTALLED"
+fi
+ENDSCRIPT
+        ) >> "$LOGS_DIR/pve-config-backup-start-$node.log" 2>&1 &
+    done
+    
+    wait
+    log_info "pve-config-backup daemon start complete on all nodes"
+}
+
+# Ensure pve-config-backup is installed and running on HA nodes (or all nodes if no HA group)
+ensure_pve_config_backup_running() {
+    log_info "Ensuring pve-config-backup daemon is installed and running on HA nodes"
+    
+    dialog --infobox "Ensuring pve-config-backup daemon is ready on HA nodes..." 5 65
+    sleep 1
+
+    # Get HA nodes list (fallback to all nodes if no HA group exists)
+    local ha_nodes_list
+    ha_nodes_list=$(get_ha_nodes)
+    
+    if [ -z "$ha_nodes_list" ]; then
+        log_error "No nodes found in HA configuration or cluster"
+        dialog --msgbox "Error: No cluster nodes found" 8 40
+        return 1
+    fi
+    
+    # Build node list with IPs by looking up each node in corosync.conf
+    local node_list=""
+    while IFS= read -r node_name; do
+        [ -z "$node_name" ] && continue  # Skip empty lines
+        local node_ip
+        node_ip=$(awk -v node="$node_name" '
+            $1 == "name:" && $2 == node {found=1; next}
+            found && $1 == "ring0_addr:" {print $2; found=0}
+        ' /etc/pve/corosync.conf)
+        
+        if [ -n "$node_ip" ]; then
+            node_list+="$node_name $node_ip"$'\n'
+        else
+            log_error "Could not find IP for node: $node_name"
+        fi
+    done <<< "$ha_nodes_list"
+    
+    # Remove trailing newline
+    node_list=$(echo "$node_list" | sed '/^$/d')
+    
+    if [ -z "$node_list" ]; then
+        log_error "No valid node IPs found"
+        dialog --msgbox "Error: No valid node IPs found" 8 40
+        return 1
+    fi
+    
+    local total_nodes=$(echo "$node_list" | wc -l)
+    local processed=0
+    local installed=0
+    local started=0
+    local already_running=0
+    
+    # Clean up any previous results
+    rm -f /tmp/node_results
+    
+    # Process each node
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue  # Skip empty lines
+        
+        local node=$(echo "$line" | cut -d' ' -f1)
+        local ip=$(echo "$line" | cut -d' ' -f2)
+        
+        log_info "Ensuring pve-config-backup is ready on node: $node ($ip)"
+        
+        # Check and handle pve-config-backup on this node
+        local result
+        result=$(ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
+# Check if pve-config-backup is installed
+if [ ! -f /usr/local/sbin/pve-config-backup ]; then
+    # Install pve-config-backup
+    cd /tmp
+    wget https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup \
+        -O /usr/local/sbin/pve-config-backup >/dev/null 2>&1
+    
+    if [ $? -eq 0 ] && [ -f /usr/local/sbin/pve-config-backup ]; then
+        chmod +x /usr/local/sbin/pve-config-backup
+        /usr/local/sbin/pve-config-backup install >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo "INSTALLED"
+            exit 0
+        else
+            echo "INSTALL_FAILED"
+            exit 1
+        fi
+    else
+        echo "DOWNLOAD_FAILED"
+        exit 1
+    fi
+fi
+
+# Check daemon status
+status_output=$(/usr/local/sbin/pve-config-backup status 2>/dev/null)
+if echo "$status_output" | grep -q "Active: active (running)"; then
+    echo "ALREADY_RUNNING"
+elif echo "$status_output" | grep -q "Active: inactive (dead)"; then
+    # Start the daemon
+    /usr/local/sbin/pve-config-backup start >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        echo "STARTED"
+    else
+        echo "START_FAILED"
+        exit 1
+    fi
+else
+    echo "STATUS_UNKNOWN"
+    exit 1
+fi
+ENDSCRIPT
+        2>/dev/null)
+        
+        case "$result" in
+            "INSTALLED")
+                log_info "Node $node: pve-config-backup installed and started"
+                echo "INSTALLED" >> /tmp/node_results
+                ;;
+            "STARTED")
+                log_info "Node $node: pve-config-backup daemon started"
+                echo "STARTED" >> /tmp/node_results
+                ;;
+            "ALREADY_RUNNING")
+                log_info "Node $node: pve-config-backup already running"
+                echo "ALREADY_RUNNING" >> /tmp/node_results
+                ;;
+            *)
+                log_error "Node $node: Failed to ensure pve-config-backup is running"
+                echo "FAILED" >> /tmp/node_results
+                ;;
+        esac
+    done <<< "$node_list"
+    
+    # Count results
+    if [ -f /tmp/node_results ]; then
+        installed=$(grep -c "INSTALLED" /tmp/node_results)
+        started=$(grep -c "STARTED" /tmp/node_results)
+        already_running=$(grep -c "ALREADY_RUNNING" /tmp/node_results)
+        rm -f /tmp/node_results
+    fi
+    
+    log_info "pve-config-backup setup complete on HA nodes - Total: $total_nodes, Already running: $already_running, Installed: $installed, Started: $started"
+    
+    # Only show dialog if action was taken (installations or starts)
+    if [ $installed -gt 0 ] || [ $started -gt 0 ]; then
+        dialog --msgbox "pve-config-backup setup complete on HA nodes.\nTotal nodes: $total_nodes\nAlready running: $already_running\nInstalled: $installed\nStarted: $started" 12 60
+    fi
+    
+    return 0
 }
 
 # Cleanup unused disks in VM/CT configs
@@ -864,7 +1185,7 @@ nfs_tuning_step1_storage_selection() {
             local mounted_nconnect
             config_nconnect=$(get_current_nconnect "$storage")
             mounted_nconnect=$(get_mounted_nconnect "$storage")
-            dialog_args+=("$storage" "nconnect: config = $(printf '%2s' "$config_nconnect")   mounted = $(printf '%2s' "$mounted_nconnect")" "off")
+            dialog_args+=("$storage" "nconnect: config = $(printf '%2s' "$config_nconnect")   mounted = $(printf '%2s' "$mounted_nconnect")" "on")
         fi
     done <<< "$nfs_storages"
     
@@ -876,7 +1197,7 @@ nfs_tuning_step1_storage_selection() {
     
     cmd=(dialog --keep-tite --title "Step 1/2: Storage Selection"
          --ok-label "Next" --cancel-label "Back"
-         --checklist "Select storage to update (use SPACE to select):" 20 70 10)
+         --checklist "Select storage to update (use SPACE to select):" 20 100 10)
     options=("${dialog_args[@]}")
     
     dialog_menu
@@ -913,7 +1234,7 @@ nfs_tuning_step2_nconnect_selection() {
     
     cmd=(dialog --keep-tite --title "Step 2/2: nconnect Value"
          --ok-label "Next" --cancel-label "Back"
-         --radiolist "Choose new nconnect value:" 23 50 16)
+         --radiolist "Choose new nconnect value:" 20 100 10)
     options=("${dialog_args[@]}")
     
     dialog_menu
@@ -1273,6 +1594,54 @@ restore_ha_policy_shutdown() {
     fi
 }
 
+# Check if hardware watchdog is configured
+check_watchdog_module() {
+    local pve_ha_config="/etc/default/pve-ha-manager"
+    
+    if [ ! -f "$pve_ha_config" ]; then
+        log_error "pve-ha-manager config file not found: $pve_ha_config"
+        return 1
+    fi
+    
+    # Check if WATCHDOG_MODULE line exists and is uncommented
+    if grep -q "^WATCHDOG_MODULE=" "$pve_ha_config"; then
+        return 1  # Already configured (uncommented)
+    else
+        return 0  # Not configured (commented or missing)
+    fi
+}
+
+# Fix hardware watchdog configuration
+fix_watchdog_module() {
+    log_info "Configuring hardware watchdog (ipmi_watchdog)"
+    
+    local pve_ha_config="/etc/default/pve-ha-manager"
+    
+    if [ ! -f "$pve_ha_config" ]; then
+        log_error "pve-ha-manager config file not found: $pve_ha_config"
+        return 1
+    fi
+    
+    # Check if commented line exists
+    if grep -q "^#WATCHDOG_MODULE=" "$pve_ha_config"; then
+        # Uncomment the line
+        sed -i 's/^#WATCHDOG_MODULE=/WATCHDOG_MODULE=/' "$pve_ha_config" >> "$LOG_FILE" 2>&1
+        log_info "Uncommented WATCHDOG_MODULE line in $pve_ha_config"
+    else
+        # Add the line if it doesn't exist
+        echo "WATCHDOG_MODULE=ipmi_watchdog" >> "$pve_ha_config"
+        log_info "Added WATCHDOG_MODULE=ipmi_watchdog to $pve_ha_config"
+    fi
+    
+    if [ $? -eq 0 ]; then
+        log_info "Successfully configured hardware watchdog (ipmi_watchdog)"
+        return 0
+    else
+        log_error "Failed to configure hardware watchdog"
+        return 1
+    fi
+}
+
 # Main function for post known issues fixes and tuning
 post_known_issues_fixes() {
     local dialog_selected=$(mktemp)
@@ -1316,6 +1685,26 @@ post_known_issues_fixes() {
         fi
     else
         dialog --msgbox "HA Policy Shutdown Fix Already Applied\n\nThe HA shutdown policy is already set to 'Migrate'." 10 60
+    fi
+    
+    # Hardware Watchdog Configuration Fix
+    if check_watchdog_module; then
+        # Hardware watchdog is not configured, offer to configure it
+        dialog --title "Hardware Watchdog Configuration Fix" \
+               --yes-label "Confirm" \
+               --no-label "Skip" \
+               --yesno "Hardware Watchdog Configuration\n\nDescription:\nHardware watchdogs are preferred for reliability, as they operate independently of the operating system. Software watchdogs, which are kernel-based, act as a fallback when hardware options are unavailable.\n\nTo configure the watchdog module, edit the configuration file:\n /etc/default/pve-ha-manager\n\nToggle the setting by (un)commenting the line:\n#WATCHDOG_MODULE=ipmi_watchdog    Commented => PVE keeps the default softdog software watchdog.\nWATCHDOG_MODULE=ipmi_watchdog    Uncommented => watchdog-mux auto-loads the ipmi_watchdog driver, turning on hardware fencing.\n\nRemoving the # activates the specified hardware watchdog, replacing the software-based fallback.\n\nDo you want to apply this fix?" 24 80
+        
+        if [ $? -eq 0 ]; then
+            if fix_watchdog_module; then
+                dialog --msgbox "Hardware Watchdog Configuration Fix Applied Successfully!\n\nThe WATCHDOG_MODULE has been configured to use ipmi_watchdog." 10 60
+                fixes_applied=$((fixes_applied + 1))
+            else
+                dialog --msgbox "Error: Failed to apply Hardware Watchdog Configuration fix.\nCheck the log file for details." 10 60
+            fi
+        fi
+    else
+        dialog --msgbox "Hardware Watchdog Configuration Fix Already Applied\n\nThe WATCHDOG_MODULE is already configured." 10 60
     fi
     
     # Summary
@@ -2162,7 +2551,7 @@ perform_restore() {
         local type=$(config_file_type "$conf")
 
         # Show progress
-        dialog --title "Restoring..." --infobox "Processing VM/CT $vmid ($current/$total)\nType: $type\nFile: $conf" 8 60
+        dialog --title "Restoring..." --infobox "Processing VM/CT $vmid ($current/$total)\nType: $type\nFile: $conf" 8 100
         sleep 1
 
         log_info "Processing VM/CT $vmid ($current/$total) - Type: $type"
@@ -4263,7 +4652,7 @@ delete_cloned_nfs_storage_wizard() {
         dialog --keep-tite \
             --title "Select Cloned NFS Storage to Delete" \
             --ok-label "Select" --cancel-label "Cancel" \
-            --menu "Choose a cloned NFS storage to delete:" 15 60 8 \
+            --menu "Choose a cloned NFS storage to delete:" 18 100 10 \
             "${menu_items[@]}" 2> "$dialog_selected"
 
         exit_code=$?
@@ -5513,6 +5902,9 @@ main() {
     if check_for_updates; then
         prompt_for_update
     fi
+    
+    # Ensure pve-config-backup daemon is running on HA nodes
+    ensure_pve_config_backup_running
     
     # Main application loop
     clear

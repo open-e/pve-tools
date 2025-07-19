@@ -25,7 +25,7 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.17"
+VERSION="0.18"
 RELEASE_DATE="2025-07-19"
 
 # Script mode flag
@@ -77,6 +77,7 @@ nfs_total_steps=5
 # NFS tuning variables
 selected_nfs_storages=""
 selected_nfs_nconnect=""
+selected_nfs_sync=""
 
 # Disk type constants
 DISK_TYPES="(scsi|ide|sata|virtio|efidisk|tpmstate|nvme)"
@@ -359,6 +360,11 @@ url_encode() {
 # Trim leading and trailing quotes and spaces from user input
 trimq() {
     echo "${1}" | tr -d " \"'"
+}
+
+# Convert string to uppercase
+upper() {
+    echo "${1}" | tr '[:lower:]' '[:upper:]'
 }
 
 # Cleanup inactive NFS storage on all cluster nodes
@@ -1036,7 +1042,7 @@ resolve_vmct_conflict() {
     
     log_info "Resolving VM/CT conflict for ID $vmid ($type)"
     
-    local vm_type_upper=$(echo "$type" | tr '[:lower:]' '[:upper:]')
+    local vm_type_upper=$(upper "$type")
     local conflict_msg="$vm_type_upper ID $vmid already exists in PVE repository!\n\n"
     conflict_msg+="Choose an option:\n"
     conflict_msg+="- Cancel: Skip this $vm_type_upper restoration\n"
@@ -1070,10 +1076,10 @@ get_new_vmct_id() {
     local type="$2"
     local input_file=$(mktemp)
     
-    log_info "Prompting user for new VM/CT ID for $type $original_id"
+    log_info "Prompting user for new $(upper "$type") ID for $type $original_id"
     
     while true; do
-        dialog --keep-tite --title "Enter New VM/CT ID" \
+        dialog --keep-tite --title "Enter New $(upper "$type") ID" \
                --ok-label "OK" --cancel-label "Cancel" \
                --inputbox "Enter new ID for $type $original_id:" 8 50 2> "$input_file"
         
@@ -1102,7 +1108,7 @@ get_new_vmct_id() {
         # Valid new ID provided
         new_vmct_id="$user_input"
         rm -f "$input_file"
-        log_info "User provided new VM/CT ID: $new_vmct_id for original ID: $original_id"
+        log_info "User provided new $(upper "$type") ID: $new_vmct_id for original ID: $original_id"
         return 0
     done
 }
@@ -1118,7 +1124,7 @@ select_host_for_conflict() {
         return 1
     fi
     
-    log_info "Selecting host for conflicting VM/CT ID $vmid ($type)"
+    log_info "Selecting host for conflicting $(upper "$type") ID $vmid ($type)"
     
     # Get available hosts
     while IFS= read -r line; do
@@ -1137,9 +1143,9 @@ select_host_for_conflict() {
     done
     
     local dialog_selected=$(mktemp)
-    dialog --keep-tite --title "Select Target Host for VM/CT $vmid" \
+    dialog --keep-tite --title "Select Target Host for $(upper "$type") $vmid" \
            --ok-label "Select" --cancel-label "Cancel" \
-           --menu "Choose PVE host to restore VM/CT $vmid ($type) to:" 15 60 8 \
+           --menu "Choose PVE host to restore $(upper "$type") $vmid ($type) to:" 15 60 8 \
            "${menu_items[@]}" 2> "$dialog_selected"
     
     local exit_code=$?
@@ -1148,7 +1154,7 @@ select_host_for_conflict() {
     
     if [ $exit_code -eq 0 ] && [ -n "$selected_index" ]; then
         conflict_selected_host="${hosts[selected_index]}"
-        log_info "User selected host: $conflict_selected_host for VM/CT $vmid"
+        log_info "User selected host: $conflict_selected_host for $(upper "$type") $vmid"
         return 0
     else
         return 1
@@ -1202,6 +1208,57 @@ get_mounted_nconnect() {
     echo "${current_nconnect:-1}"
 }
 
+get_current_sync() {
+    local storage="$1"
+    local sync_val
+    
+    log_debug "Getting current sync option for storage: $storage"
+    
+    # Check storage.cfg for sync/async option in options field
+    sync_val=$(awk -v storage="$storage" '
+        $1 == "nfs:" && $2 == storage { in_block = 1; next }
+        in_block && /^[[:space:]]*options[[:space:]]+/ {
+            options_line = $0
+            # Look for sync or async in the options line
+            if (match(options_line, /sync/)) {
+                if (match(options_line, /async/)) {
+                    print "async"
+                } else {
+                    print "sync"
+                }
+            } else {
+                print "sync"  # Default to sync for HA reliability
+            }
+            exit
+        }
+        /^nfs:/ && $2 != storage { in_block = 0 }
+    ' /etc/pve/storage.cfg)
+    
+    log_debug "Extracted sync value for $storage: ${sync_val:-sync}"
+    echo "${sync_val:-sync}"
+}
+
+get_mounted_sync() {
+    local storage="$1"
+    local current_sync
+    local mount_output
+    
+    log_debug "Getting mounted sync option for storage: $storage"
+    mount_output=$(mount | grep nfs | grep "$storage")
+    log_debug "Mount output for $storage: $mount_output"
+    
+    # Check if sync is present in mount options
+    if echo "$mount_output" | grep -q ",sync,\|,sync "; then
+        current_sync="sync"
+    else
+        # NFS defaults to async if not specified, but we treat missing option as sync for HA
+        current_sync="async"
+    fi
+    
+    log_debug "Extracted sync value for $storage: $current_sync"
+    echo "$current_sync"
+}
+
 nfs_tuning_step1_storage_selection() {
     local dialog_selected=$(mktemp)
     
@@ -1220,9 +1277,13 @@ nfs_tuning_step1_storage_selection() {
         if [[ -n "$storage" ]]; then
             local config_nconnect
             local mounted_nconnect
+            local config_sync
+            local mounted_sync
             config_nconnect=$(get_current_nconnect "$storage")
             mounted_nconnect=$(get_mounted_nconnect "$storage")
-            dialog_args+=("$storage" "nconnect: config = $(printf '%2s' "$config_nconnect")   mounted = $(printf '%2s' "$mounted_nconnect")" "on")
+            config_sync=$(get_current_sync "$storage")
+            mounted_sync=$(get_mounted_sync "$storage")
+            dialog_args+=("$storage" "nconnect cfg=$(printf '%2s' "$config_nconnect") mnt=$(printf '%2s' "$mounted_nconnect") sync: cfg=$config_sync mnt=$mounted_sync" "on")
         fi
     done <<< "$nfs_storages"
     
@@ -1232,7 +1293,7 @@ nfs_tuning_step1_storage_selection() {
         return 1
     fi
     
-    cmd=(dialog --keep-tite --title "Step 1/2: Storage Selection"
+    cmd=(dialog --keep-tite --title "Step 1/3: Storage Selection"
          --ok-label "Next" --cancel-label "Back"
          --checklist "Select storage to update (use SPACE to select):" 20 100 10)
     options=("${dialog_args[@]}")
@@ -1269,7 +1330,7 @@ nfs_tuning_step2_nconnect_selection() {
         fi
     done
     
-    cmd=(dialog --keep-tite --title "Step 2/2: nconnect Value"
+    cmd=(dialog --keep-tite --title "Step 2/3: nconnect Value"
          --ok-label "Next" --cancel-label "Back"
          --radiolist "Choose new nconnect value:" 20 100 10)
     options=("${dialog_args[@]}")
@@ -1293,16 +1354,48 @@ nfs_tuning_step2_nconnect_selection() {
     esac
 }
 
-execute_nfs_nconnect_update() {
+nfs_tuning_step3_sync_selection() {
+    local dialog_selected=$(mktemp)
+    
+    local dialog_args=()
+    dialog_args+=("sync" "sync (default - guaranteed write completion for HA)" "on")
+    dialog_args+=("async" "async (better performance - less reliable)" "off")
+    
+    cmd=(dialog --keep-tite --title "Step 3/3: Sync Option"
+         --ok-label "Next" --cancel-label "Back"
+         --radiolist "Choose sync option for NFS mounts:" 15 70 5)
+    options=("${dialog_args[@]}")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # OK/Next button
+            if [[ -z "$selected_option" ]]; then
+                dialog --title "Error" --msgbox "Please select a sync option." 8 50
+                return 2  # Stay on same step
+            fi
+            selected_nfs_sync="$selected_option"
+            log_info "Selected sync option: $selected_nfs_sync"
+            return 0  # Proceed to execute
+            ;;
+        1)  # Cancel button (Back)
+            return 2  # Go back to previous step
+            ;;
+    esac
+}
+
+execute_nfs_tuning_update() {
     local temp_dir="/tmp/nfs-tuning-$$"
     local results_file="$temp_dir/results.txt"
     
     mkdir -p "$temp_dir"
     
-    log_info "Starting nconnect update process"
-    echo "Starting nconnect update process" > "$results_file"
+    log_info "Starting NFS tuning update process"
+    echo "Starting NFS tuning update process" > "$results_file"
     echo "Selected storages: $(echo "$selected_nfs_storages" | tr '\n' ' ')" >> "$results_file"
     echo "Selected nconnect value: $selected_nfs_nconnect" >> "$results_file"
+    echo "Selected sync option: $selected_nfs_sync" >> "$results_file"
     echo "" >> "$results_file"
     
     # Count total storages for progress calculation
@@ -1323,7 +1416,7 @@ execute_nfs_nconnect_update() {
     mkfifo "$progress_pipe"
     
     # Start progress dialog in background
-    dialog --title "Updating nconnect Settings" \
+    dialog --title "Updating NFS Tuning Settings" \
            --gauge "Initializing..." 8 60 0 < "$progress_pipe" &
     local dialog_pid=$!
     
@@ -1350,9 +1443,18 @@ execute_nfs_nconnect_update() {
             current_step=$((current_step + 1))
             update_progress "Updating $storage configuration..." >&3
             
-            log_info "Updating $storage configuration with nconnect=$selected_nfs_nconnect"
-            log_debug "Executing: pvesm set $storage --options nconnect=$selected_nfs_nconnect"
-            pvesm set "$storage" --options "nconnect=$selected_nfs_nconnect" 2>/dev/null || true
+            log_info "Updating $storage configuration with nconnect=$selected_nfs_nconnect, sync=$selected_nfs_sync"
+            
+            # Build options string based on selected sync option
+            local options_string="nconnect=$selected_nfs_nconnect"
+            if [[ "$selected_nfs_sync" == "sync" ]]; then
+                options_string="${options_string},sync"
+            else
+                options_string="${options_string},async"
+            fi
+            
+            log_debug "Executing: pvesm set $storage --options $options_string"
+            pvesm set "$storage" --options "$options_string" 2>/dev/null || true
             
             # Attempt to unmount
             current_step=$((current_step + 1))
@@ -1403,10 +1505,11 @@ execute_nfs_nconnect_update() {
             update_progress "Verifying $storage..." >&3
             
             local mounted_nconnect
+            local mounted_sync
             local attempts=0
             local max_attempts=10
             
-            log_debug "Starting verification for $storage (expected: $selected_nfs_nconnect)"
+            log_debug "Starting verification for $storage (expected: nconnect=$selected_nfs_nconnect, sync=$selected_nfs_sync)"
             
             # Try multiple times to get the mount info, as it may take time to update
             while [[ $attempts -lt $max_attempts ]]; do
@@ -1414,11 +1517,12 @@ execute_nfs_nconnect_update() {
                 log_debug "Verification attempt $attempts/$max_attempts for $storage"
                 
                 mounted_nconnect=$(get_mounted_nconnect "$storage")
-                log_debug "Got nconnect value: $mounted_nconnect for $storage"
+                mounted_sync=$(get_mounted_sync "$storage")
+                log_debug "Got values for $storage: nconnect=$mounted_nconnect, sync=$mounted_sync"
                 
-                # Check if we got the expected value
-                if [[ "$mounted_nconnect" == "$selected_nfs_nconnect" ]]; then
-                    log_debug "Expected nconnect value found for $storage, stopping retries"
+                # Check if we got the expected values
+                if [[ "$mounted_nconnect" == "$selected_nfs_nconnect" && "$mounted_sync" == "$selected_nfs_sync" ]]; then
+                    log_debug "Expected values found for $storage, stopping retries"
                     break
                 fi
                 
@@ -1428,16 +1532,16 @@ execute_nfs_nconnect_update() {
                 fi
             done
             
-            log_debug "Final verification for $storage: expected=$selected_nfs_nconnect, actual=$mounted_nconnect"
+            log_debug "Final verification for $storage: expected nconnect=$selected_nfs_nconnect, actual=$mounted_nconnect; expected sync=$selected_nfs_sync, actual=$mounted_sync"
             
-            if [[ "$mounted_nconnect" == "$selected_nfs_nconnect" ]]; then
-                log_info "$storage: SUCCESS - nconnect=$mounted_nconnect"
+            if [[ "$mounted_nconnect" == "$selected_nfs_nconnect" && "$mounted_sync" == "$selected_nfs_sync" ]]; then
+                log_info "$storage: SUCCESS - nconnect=$mounted_nconnect, sync=$mounted_sync"
                 log_debug "RESULT: $storage SUCCESS"
-                echo "$storage: SUCCESS - nconnect=$mounted_nconnect" >> "$results_file"
+                echo "$storage: SUCCESS - nconnect=$mounted_nconnect, sync=$mounted_sync" >> "$results_file"
             else
-                log_info "$storage: FAILED - expected=$selected_nfs_nconnect, actual=$mounted_nconnect"
-                log_debug "RESULT: $storage FAILED - expected=$selected_nfs_nconnect, actual=$mounted_nconnect"
-                echo "$storage: FAILED - expected=$selected_nfs_nconnect, actual=$mounted_nconnect" >> "$results_file"
+                log_info "$storage: FAILED - expected nconnect=$selected_nfs_nconnect, actual=$mounted_nconnect; expected sync=$selected_nfs_sync, actual=$mounted_sync"
+                log_debug "RESULT: $storage FAILED - expected nconnect=$selected_nfs_nconnect, actual=$mounted_nconnect; expected sync=$selected_nfs_sync, actual=$mounted_sync"
+                echo "$storage: FAILED - expected nconnect=$selected_nfs_nconnect, actual=$mounted_nconnect; expected sync=$selected_nfs_sync, actual=$mounted_sync" >> "$results_file"
                 has_failures=true
             fi
         fi
@@ -1461,7 +1565,7 @@ execute_nfs_nconnect_update() {
     # Add failure note if needed
     if [[ "$has_failures" == "true" ]]; then
         echo "" >> "$results_file"
-        echo "NOTE: To apply and mount NFS with a new nconnect option value," >> "$results_file"
+        echo "NOTE: To apply and mount NFS with new nconnect and sync option values," >> "$results_file"
         echo " all VMs must be stopped or their disks migrated to other storage." >> "$results_file"
     fi
     
@@ -1473,11 +1577,12 @@ execute_nfs_nconnect_update() {
 
 nfs_tuning_wizard() {
     local nfs_current_step=1
-    local nfs_total_steps=2
+    local nfs_total_steps=3
     
     # Clear previous selections
     selected_nfs_storages=""
     selected_nfs_nconnect=""
+    selected_nfs_sync=""
     
     while true; do
         case $nfs_current_step in
@@ -1497,15 +1602,29 @@ nfs_tuning_wizard() {
             2)
                 nfs_tuning_step2_nconnect_selection
                 case $? in
-                    0)  # Next - execute and return to main menu
-                        execute_nfs_nconnect_update
-                        return 0
+                    0)  # Next - advance to step 3
+                        nfs_current_step=3
                         ;;
                     1)  # Back to main menu
                         return 0
                         ;;
                     2)  # Back - return to step 1
                         nfs_current_step=1
+                        ;;
+                esac
+                ;;
+            3)
+                nfs_tuning_step3_sync_selection
+                case $? in
+                    0)  # Next - execute and return to main menu
+                        execute_nfs_tuning_update
+                        return 0
+                        ;;
+                    1)  # Back to main menu
+                        return 0
+                        ;;
+                    2)  # Back - return to step 2
+                        nfs_current_step=2
                         ;;
                 esac
                 ;;
@@ -1886,11 +2005,8 @@ main_menu() {
     # Check background status
     check_background_status
     
-    # Build menu title with background status
+    # Build menu title
     local menu_title="$VENDOR $PRODUCT Proxmox VE (PVE) Tools - Main Menu"
-    if [ -n "$PVE_CONFIG_BACKUP_RESULT" ]; then
-        menu_title="$menu_title\n$PVE_CONFIG_BACKUP_RESULT"
-    fi
 
     cmd=(dialog --keep-tite --title "$menu_title"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
@@ -1901,7 +2017,7 @@ main_menu() {
              "3" "Cleanup inactive NFS storage"
              "4" "Cleanup unused disks in VM/CT config"
              "5" "Bulk VM/CT Operations – Start, Stop, Reboot, and More"
-             "6" "NFS tuning - set nconnect option"
+             "6" "NFS tuning - set nconnect, sync options"
              "7" "Add VM/CT to Proxmox VE HA Resources"
              "8" "Post known issues fixes and tuning"
              "9" "Help & About pve-tools")
@@ -1930,7 +2046,7 @@ main_menu() {
                 5)  # VM/CT Manager - Bulk Actions
                     vm_ct_manager_bulk_actions
                     ;;
-                6)  # NFS tuning - set nconnect option
+                6)  # NFS tuning - set nconnect, sync options
                     nfs_tuning_wizard
                     ;;
                 7)  # Add VM/CT to Proxmox VE HA Resources
@@ -1978,7 +2094,21 @@ help_about_dialog() {
     help_text+="-----------------\n"
     help_text+="PVE Tools is a bash script that provides Proxmox VE (PVE) integration\n"
     help_text+="with $VENDOR $PRODUCT storage. This tool enables management of NFS storage\n"
-    help_text+="clones from $PRODUCT snapshots for VM/CT backup and restore operations.\n"
+    help_text+="clones from $PRODUCT snapshots for VM/CT restore if missing, or clone VM/CT\n"
+    help_text+="if original one is existing. The OODP (On Off-site Data Protection) must be\n"
+    help_text+="configured and running in $PRODUCT, additionally the pve-config-backup\n"
+    help_text+="daemon must be running on every Proxmox VE host. The pve-tools will\n"
+    help_text+="automatically install and start the pve-config-backup daemon if missing.\n"
+    help_text+="The pve-config-backup daemon provides a unique mechanism for instant backup\n"
+    help_text+="of VM/CT configuration files. These backed-up configuration files are stored\n"
+    help_text+="in the same directory as the associated virtual disks, simplifying backup\n"
+    help_text+="management. Administrators familiar with virtualization platforms where all\n"
+    help_text+="VM components reside in a single directory will appreciate the similar\n"
+    help_text+="convenience provided in Proxmox VE. OODP provides continuous backup and\n"
+    help_text+="disaster recovery, with intervals as short as one minute. Its highly\n"
+    help_text+="efficient architecture minimizes system resource usage, enabling\n"
+    help_text+="uninterrupted backup operations even under heavy workloads and in\n"
+    help_text+="environments hosting thousands of virtual machines (VMs) or containers (CTs).\n"
     help_text+="\n"
     help_text+="MAIN FUNCTIONS:\n"
     help_text+="---------------\n"
@@ -1988,7 +2118,7 @@ help_about_dialog() {
     help_text+="3. Clean up inactive NFS storage\n"
     help_text+="4. Clean up unused disks in VM/CT config\n"
     help_text+="5. Bulk VM/CT Operations – Start, Stop, Reboot, and More\n"
-    help_text+="6. NFS tuning - Set nconnect option\n"
+    help_text+="6. NFS tuning - Set nconnect, sync options\n"
     help_text+="7. Add VM/CT to Proxmox VE HA Resources\n"
     help_text+="8. Apply known issue fixes and tuning\n"
     help_text+="9. Help & About pve-tools\n"
@@ -2701,6 +2831,7 @@ perform_restore() {
     local failed=0
     local success=0
     local skipped=0
+    local any_new_ids_used=false
 
     for conf in "${selected_confs[@]}"; do
         ((current++))
@@ -2709,10 +2840,11 @@ perform_restore() {
         local type=$(config_file_type "$conf")
 
         # Show progress
-        dialog --title "Restoring..." --infobox "Processing VM/CT $vmid ($current/$total)\nType: $type\nFile: $conf" 8 100
+        local type_upper=$(upper "$type")
+        dialog --title "Restoring..." --infobox "Processing $type_upper $vmid ($current/$total)\nType: $type\nFile: $conf" 8 100
         sleep 1
 
-        log_info "Processing VM/CT $vmid ($current/$total) - Type: $type"
+        log_info "Processing $type_upper $vmid ($current/$total) - Type: $type"
 
         # Check if VM/CT already exists in PVE repository
         if check_vmct_exists "$vmid"; then
@@ -2733,6 +2865,7 @@ perform_restore() {
                         ct)
                             if restore_ct "$conf" "$conflict_selected_host" "$new_vmct_id"; then
                                 ((success++))
+                                any_new_ids_used=true
                                 log_info "Successfully restored CT $vmid as $new_vmct_id"
                             else
                                 ((failed++))
@@ -2742,6 +2875,7 @@ perform_restore() {
                         vm)
                             if restore_vm "$conf" "$conflict_selected_host" "$new_vmct_id"; then
                                 ((success++))
+                                any_new_ids_used=true
                                 log_info "Successfully restored VM $vmid as $new_vmct_id"
                             else
                                 ((failed++))
@@ -2809,8 +2943,8 @@ perform_restore() {
     log_info "Restoration completed - Total: $total, Success: $success, Failed: $failed, Skipped: $skipped"
     dialog --msgbox "$result_text" 15 50
     
-    # Show static IP address warning if any VMs were successfully restored
-    if [ $success -gt 0 ]; then
+    # Show static IP address warning only if any VMs were restored with new IDs (due to conflicts)
+    if [ $success -gt 0 ] && [ "$any_new_ids_used" = true ]; then
         local warning_text="IMPORTANT: Static IP Address Configuration\n\n"
         warning_text+="If the restored VM use static IP addresses, you must:\n\n"
         warning_text+="1. Start the VM with network isolated/disconnected\n"
@@ -4772,6 +4906,8 @@ show_vmct_usage_warning() {
     # Build warning message
     local warning_msg="WARNING: The following VMs/CTs are using storage '$storage_name':\n\n"
     local vm_count=0
+    local has_vms=false
+    local has_cts=false
     
     while IFS='|' read -r vmct_id vmct_type vmct_name tags; do
         log_debug "show_vmct_usage_warning: Read line: ID='$vmct_id', Type='$vmct_type', Name='$vmct_name', Tags='$tags'"
@@ -4782,6 +4918,13 @@ show_vmct_usage_warning() {
             continue
         fi
         
+        # Track which types we have
+        if [[ "$vmct_type" == "vm" ]]; then
+            has_vms=true
+        elif [[ "$vmct_type" == "ct" ]]; then
+            has_cts=true
+        fi
+        
         warning_msg="${warning_msg}ID: $vmct_id | Type: $vmct_type | Name: $vmct_name | Tags: $tags\n"
         ((vm_count++))
         
@@ -4790,7 +4933,19 @@ show_vmct_usage_warning() {
     
     log_debug "show_vmct_usage_warning: Total VMs/CTs processed: $vm_count"
     
-    warning_msg="${warning_msg}\nDeleting this storage will make these VMs/CTs unusable!\n\nDo you want to continue with deletion?"
+    # Build appropriate type description
+    local type_desc=""
+    if [[ "$has_vms" == true && "$has_cts" == true ]]; then
+        type_desc="VMs/CTs"
+    elif [[ "$has_vms" == true ]]; then
+        type_desc="VMs"
+    elif [[ "$has_cts" == true ]]; then
+        type_desc="CTs"
+    else
+        type_desc="VMs/CTs"
+    fi
+    
+    warning_msg="${warning_msg}\nDeleting this storage will make these $type_desc unusable!\n\nDo you want to continue with deletion?"
     
     log_debug "show_vmct_usage_warning: Final warning message:"
     log_debug "show_vmct_usage_warning: $warning_msg"

@@ -25,7 +25,7 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.19"
+VERSION="0.20"
 RELEASE_DATE="2025-07-19"
 
 # Script mode flag
@@ -1976,6 +1976,226 @@ prompt_for_update() {
     esac
 }
 
+# Check for pve-config-backup updates from GitHub
+check_pve_config_backup_updates() {
+    local current_version
+    local remote_version
+    
+    log_info "Checking for pve-config-backup updates"
+    
+    # Get current version from local file
+    if [ ! -f /usr/local/sbin/pve-config-backup ]; then
+        log_info "pve-config-backup not installed locally"
+        return 2  # Not installed
+    fi
+    
+    current_version=$(grep 'VERSION=' /usr/local/sbin/pve-config-backup | cut -d= -f2 | tr -d '"' | head -1)
+    
+    if [ -z "$current_version" ]; then
+        log_error "Failed to retrieve current pve-config-backup version"
+        return 1
+    fi
+    
+    log_info "Current pve-config-backup version: $current_version"
+    
+    # Get remote version from GitHub
+    remote_version=$(wget -qO- https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+    
+    if [ -z "$remote_version" ]; then
+        log_error "Failed to retrieve remote pve-config-backup version"
+        return 1
+    fi
+    
+    log_info "Remote pve-config-backup version: $remote_version"
+    
+    # Compare versions (simple string comparison)
+    if [ "$remote_version" != "$current_version" ]; then
+        # Version is different, check if it's newer
+        if [ "$remote_version" \> "$current_version" ]; then
+            log_info "New pve-config-backup version available: $remote_version"
+            return 0  # Update available
+        else
+            log_info "Current pve-config-backup version is newer or equal"
+            return 1  # No update needed
+        fi
+    else
+        log_info "Already running latest pve-config-backup version"
+        return 1  # No update needed
+    fi
+}
+
+# Update pve-config-backup on all cluster nodes
+update_pve_config_backup() {
+    local remote_version
+    
+    log_info "Starting pve-config-backup update on all cluster nodes"
+    
+    # Get remote version for logging
+    remote_version=$(wget -qO- https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+    
+    if [ -z "$remote_version" ]; then
+        log_error "Failed to retrieve remote pve-config-backup version for update"
+        return 1
+    fi
+    
+    log_info "Updating to pve-config-backup version: $remote_version"
+    
+    # Get HA nodes list (fallback to all nodes if no HA group exists)
+    local ha_nodes_list
+    ha_nodes_list=$(get_ha_nodes)
+    
+    if [ -z "$ha_nodes_list" ]; then
+        log_error "No nodes found in HA configuration or cluster"
+        dialog --msgbox "Error: No cluster nodes found for update" 8 40
+        return 1
+    fi
+    
+    # Build node list with IPs
+    local node_list=""
+    while IFS= read -r node_name; do
+        [ -z "$node_name" ] && continue
+        local node_ip
+        node_ip=$(awk -v node="$node_name" '
+            $1 == "name:" && $2 == node {found=1; next}
+            found && $1 == "ring0_addr:" {print $2; found=0}
+        ' /etc/pve/corosync.conf)
+        
+        if [ -n "$node_ip" ]; then
+            node_list+="$node_name $node_ip"$'\n'
+        else
+            log_error "Could not find IP for node: $node_name"
+        fi
+    done <<< "$ha_nodes_list"
+    
+    # Remove trailing newline
+    node_list=$(echo "$node_list" | sed '/^$/d')
+    
+    if [ -z "$node_list" ]; then
+        log_error "No valid node IPs found for update"
+        dialog --msgbox "Error: No valid node IPs found for update" 8 40
+        return 1
+    fi
+    
+    local total_nodes=$(echo "$node_list" | wc -l)
+    local updated=0
+    local failed=0
+    
+    dialog --infobox "Updating pve-config-backup on $total_nodes nodes..." 5 60
+    
+    # Process each node
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        
+        local node=$(echo "$line" | cut -d' ' -f1)
+        local ip=$(echo "$line" | cut -d' ' -f2)
+        
+        log_info "Updating pve-config-backup on node: $node ($ip)"
+        
+        # Update pve-config-backup on this node
+        local result
+        result=$(ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
+# Stop the daemon before update
+if [ -f /usr/local/sbin/pve-config-backup ]; then
+    /usr/local/sbin/pve-config-backup stop >/dev/null 2>&1
+fi
+
+# Create backup of current version
+if [ -f /usr/local/sbin/pve-config-backup ]; then
+    current_ver=$(grep 'VERSION=' /usr/local/sbin/pve-config-backup | cut -d= -f2 | tr -d '"' | head -1)
+    if [ -n "$current_ver" ]; then
+        cp /usr/local/sbin/pve-config-backup "/usr/local/sbin/pve-config-backup.ver.${current_ver}" 2>/dev/null
+    fi
+fi
+
+# Download new version
+cd /tmp
+wget https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup \
+    -O /usr/local/sbin/pve-config-backup >/dev/null 2>&1
+
+if [ $? -eq 0 ] && [ -f /usr/local/sbin/pve-config-backup ]; then
+    chmod +x /usr/local/sbin/pve-config-backup
+    # Reinstall and restart the service
+    /usr/local/sbin/pve-config-backup install >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        /usr/local/sbin/pve-config-backup start >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo "UPDATE_SUCCESS"
+        else
+            echo "START_FAILED"
+        fi
+    else
+        echo "INSTALL_FAILED" 
+    fi
+else
+    echo "DOWNLOAD_FAILED"
+fi
+ENDSCRIPT
+        2>/dev/null)
+        
+        case "$result" in
+            "UPDATE_SUCCESS")
+                log_info "Node $node: pve-config-backup updated successfully"
+                ((updated++))
+                ;;
+            *)
+                log_error "Node $node: pve-config-backup update failed - $result"
+                ((failed++))
+                ;;
+        esac
+    done <<< "$node_list"
+    
+    log_info "pve-config-backup update complete - Total: $total_nodes, Updated: $updated, Failed: $failed"
+    
+    if [ $updated -gt 0 ]; then
+        dialog --msgbox "pve-config-backup update complete!\nTotal nodes: $total_nodes\nUpdated: $updated\nFailed: $failed\n\nNew version: $remote_version" 12 60
+    else
+        dialog --msgbox "pve-config-backup update failed on all nodes.\nPlease check logs for details." 10 50
+    fi
+    
+    return 0
+}
+
+# Check and prompt for pve-config-backup updates
+check_and_update_pve_config_backup() {
+    local update_status
+    update_status=$(check_pve_config_backup_updates)
+    local check_result=$?
+    
+    case $check_result in
+        0)  # Update available
+            local current_version remote_version
+            current_version=$(grep 'VERSION=' /usr/local/sbin/pve-config-backup | cut -d= -f2 | tr -d '"' | head -1)
+            remote_version=$(wget -qO- https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+            
+            dialog --title "pve-config-backup Update Available" \
+                   --yes-label "Update" \
+                   --no-label "Skip" \
+                   --yesno "A new version of pve-config-backup is available!\n\nCurrent version: $current_version\nNew version: $remote_version\n\nWould you like to update now?" 12 60
+            
+            case $? in
+                0)  # Yes - update
+                    update_pve_config_backup
+                    ;;
+                1)  # No - skip
+                    log_info "User declined pve-config-backup update"
+                    ;;
+                *)  # Error or ESC
+                    log_info "pve-config-backup update dialog cancelled"
+                    ;;
+            esac
+            ;;
+        1)  # No update needed
+            log_info "pve-config-backup is up to date"
+            ;;
+        2)  # Not installed
+            log_info "pve-config-backup not installed, will be handled by ensure_pve_config_backup_running"
+            ;;
+        *)  # Error
+            log_error "Failed to check pve-config-backup updates"
+            ;;
+    esac
+}
+
 # MAIN MENU SYSTEM
 
 # Check background pve-config-backup status
@@ -2424,9 +2644,28 @@ is_mnt_conf_file_form_existing_vmct() {
 
 # this is NEW get to restore func
 get_cloned_config_file_list() {
+    local config_files=()
+    
     for storage in $(get_cloned_storage_list); do
-        ls -1 /mnt/pve/"$storage"/images/*/*.conf 2>/dev/null
-    done | sort | uniq
+        # Find VM disk files and extract VM IDs
+        for disk_file in /mnt/pve/"$storage"/images/*/vm-[0-9]*-disk-*; do
+            if [[ -f "$disk_file" ]]; then
+                # Extract VM ID from disk filename (vm-201-disk-0.qcow2 -> 201)
+                local vm_id=$(basename "$disk_file" | sed -n 's/vm-\([0-9]\+\)-disk-.*/\1/p')
+                if [[ -n "$vm_id" ]]; then
+                    # Look for corresponding config file in the same directory
+                    local vm_dir=$(dirname "$disk_file")
+                    local config_file="$vm_dir/$vm_id.conf"
+                    if [[ -f "$config_file" ]]; then
+                        config_files+=("$config_file")
+                    fi
+                fi
+            fi
+        done
+    done
+    
+    # Remove duplicates and sort
+    printf '%s\n' "${config_files[@]}" | sort | uniq
 }
 
 
@@ -5098,7 +5337,7 @@ delete_cloned_nfs_storage_wizard() {
 
     # Final confirmation dialog - user must type "delete"
     local confirm_input=$(mktemp)
-    dialog --inputbox "To confirm deletion of storage\n'$selected_storage'\ntype 'delete':" 8 70 2> "$confirm_input"
+    dialog --inputbox "To confirm deletion of storage\n'$selected_storage'\ntype 'delete':" 10 70 2> "$confirm_input"
     exit_code=$?
     local confirmation=$(trimq "$(cat "$confirm_input")")
     rm -f "$confirm_input"
@@ -6430,6 +6669,9 @@ main() {
     if check_for_updates; then
         prompt_for_update
     fi
+    
+    # Check for pve-config-backup updates
+    check_and_update_pve_config_backup
     
     # Start pve-config-backup check in background
     PVE_CONFIG_BACKUP_STATUS="checking"

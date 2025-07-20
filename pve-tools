@@ -25,7 +25,7 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.20"
+VERSION="0.21"
 RELEASE_DATE="2025-07-19"
 
 # Script mode flag
@@ -2676,8 +2676,10 @@ step1_select_config() {
     # Use cached config list if available, otherwise get fresh list
     if [ "${#cached_config_list[@]}" -eq 0 ]; then
         while IFS= read -r line; do
-            cached_config_list+=("$line")
-            log_debug "Added config file to cache: $line"
+            if [[ -n "$line" ]]; then
+                cached_config_list+=("$line")
+                log_debug "Added config file to cache: $line"
+            fi
         done < <(get_cloned_config_file_list)
     fi
     
@@ -2685,7 +2687,7 @@ step1_select_config() {
     confs=("${cached_config_list[@]}")
 
     if [ "${#confs[@]}" -eq 0 ]; then
-        dialog --msgbox "No VMs/CTs found to restore." 8 40
+        dialog --msgbox "No VMs/CTs found to restore.\nPlease add cloned NFS storage first." 10 50
         return 1
     fi
 
@@ -2719,26 +2721,12 @@ step1_select_config() {
         fi
     done
 
-    local i vmid seen_vmids=() vmid_to_conf_map=()
+    local i vmid vmid_to_conf_map=()
     for ((i=0; i<${#confs[@]}; i++)); do
         # Extract VM/CT ID from path like /mnt/pve/storage/images/103/103.conf
         local dir_name="$(dirname "${confs[i]}")"
         vmid=$(basename "$dir_name")
         
-        # Skip if we've already seen this VM ID
-        local skip=false
-        for seen_vmid in "${seen_vmids[@]}"; do
-            if [[ "$seen_vmid" == "$vmid" ]]; then
-                skip=true
-                break
-            fi
-        done
-        
-        if [[ "$skip" == true ]]; then
-            continue
-        fi
-        
-        seen_vmids+=("$vmid")
         vmids+=("$vmid")
         # Map vmid to original config file path
         vmid_to_conf_map+=("${confs[i]}")

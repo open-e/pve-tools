@@ -37,6 +37,7 @@ PRODUCT="JovianDSS"
 
 CONFIG_DIR="/etc/$(basename "$0" .sh)"
 CONFIG_FILE="$CONFIG_DIR/config.conf"
+FACTORY_DEFAULTS_FILE="$CONFIG_DIR/factory.defaults"
 LOGS_DIR="/var/log/$(basename "$0" .sh)"
 LOG_FILE="$LOGS_DIR/$(basename "$0" .sh).log"
 
@@ -258,7 +259,7 @@ check_for_dialog_and_install_if_missing() {
     fi
     
     log_info "Dialog not found, attempting to install"
-    echo "Installing missing dialog package. Please wait..."
+    log_info "Installing missing dialog package. Please wait..."
     
     # Update package list
     if ! apt-get update >/dev/null 2>&1; then
@@ -304,8 +305,31 @@ init_config() {
 rest_api_user=admin
 rest_api_password='admin'
 rest_api_port=82
+custom_ips=
+storage_vm_name_contains=$(lower "$PRODUCT")
+storage_vm_start_at_boot=yes
+storage_vm_start_shutdown_order=1
+storage_vm_startup_deleay=300
+storage_vm_shutdown_timeout=180
 EOF
         log_info "Created default config file: $CONFIG_FILE"
+    fi
+
+    # Create factory defaults file if it doesn't exist
+    if [ ! -f "$FACTORY_DEFAULTS_FILE" ]; then
+        cat > "$FACTORY_DEFAULTS_FILE" << EOF
+# Factory defaults for pve-tools configuration
+rest_api_user=admin
+rest_api_password='admin'
+rest_api_port=82
+custom_ips=
+storage_vm_name_contains=$(lower "$PRODUCT")
+storage_vm_start_at_boot=yes
+storage_vm_start_shutdown_order=1
+storage_vm_startup_deleay=300
+storage_vm_shutdown_timeout=180
+EOF
+        log_info "Created factory defaults file: $FACTORY_DEFAULTS_FILE"
     fi
 
     # Load configuration
@@ -325,6 +349,20 @@ EOF
         local masked_pwd="${rest_api_password:0:4}$(printf '%*s' $((${#rest_api_password} - 4)) | tr ' ' '*')"
         log_debug "init_config: rest_api_password preview='$masked_pwd'"
         log_debug "init_config: rest_api_port='$rest_api_port'"
+        
+        # Set defaults for new configuration variables if not present
+        storage_vm_name_contains="${storage_vm_name_contains:-$(lower "$PRODUCT")}"
+        storage_vm_start_at_boot="${storage_vm_start_at_boot:-yes}"
+        storage_vm_start_shutdown_order="${storage_vm_start_shutdown_order:-1}"
+        storage_vm_startup_deleay="${storage_vm_startup_deleay:-300}"
+        storage_vm_shutdown_timeout="${storage_vm_shutdown_timeout:-180}"
+        custom_ips="${custom_ips:-}"
+        
+        log_debug "init_config: storage_vm_name_contains='$storage_vm_name_contains'"
+        log_debug "init_config: storage_vm_start_at_boot='$storage_vm_start_at_boot'"
+        log_debug "init_config: storage_vm_start_shutdown_order='$storage_vm_start_shutdown_order'"
+        log_debug "init_config: storage_vm_startup_deleay='$storage_vm_startup_deleay'"
+        log_debug "init_config: storage_vm_shutdown_timeout='$storage_vm_shutdown_timeout'"
     else
         log_error "Config file not found: $CONFIG_FILE"
         return 1
@@ -332,6 +370,11 @@ EOF
 }
 
 # UTILITY FUNCTIONS
+
+# Convert string to lowercase
+lower() {
+    echo "$1" | tr '[:upper:]' '[:lower:]'
+}
 
 # URL encode a string for safe use in curl credentials
 url_encode() {
@@ -2230,7 +2273,7 @@ main_menu() {
 
     cmd=(dialog --keep-tite --title "$menu_title"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
-         --menu "Choose an option:" 18 80 10)
+         --menu "Choose an option:" 19 85 11)
     options=("0" "Add Cloned NFS Storage from $PRODUCT Snapshot"
              "1" "Restore VM/CT from Cloned NFS Storage"
              "2" "Delete Cloned NFS Storage in PVE & cloned dataset in $PRODUCT     "
@@ -2239,8 +2282,9 @@ main_menu() {
              "5" "Bulk VM/CT Operations – Start, Stop, Reboot, and More"
              "6" "NFS tuning - set nconnect, sync options"
              "7" "Add VM/CT to Proxmox VE HA Resources"
-             "8" "Post known issues fixes and tuning"
-             "9" "Help & About pve-tools")
+             "8" "Setup Start-at-boot for $PRODUCT VMs"
+             "9" "Post known issues fixes and tuning"
+             "10" "Help & About pve-tools")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -2272,10 +2316,13 @@ main_menu() {
                 7)  # Add VM/CT to Proxmox VE HA Resources
                     add_vmct_to_ha_resources
                     ;;
-                8)  # Post known issues fixes and tuning
+                8)  # Setup Start-at-boot for storage VMs
+                    setup_storage_vm_startup_wizard
+                    ;;
+                9)  # Post known issues fixes and tuning
                     post_known_issues_fixes
                     ;;
-                9)  # Help & About pve-tools
+                10)  # Help & About pve-tools
                     help_about_dialog
                     ;;
             esac
@@ -2340,8 +2387,9 @@ help_about_dialog() {
     help_text+="5. Bulk VM/CT Operations – Start, Stop, Reboot, and More\n"
     help_text+="6. NFS tuning - Set nconnect, sync options\n"
     help_text+="7. Add VM/CT to Proxmox VE HA Resources\n"
-    help_text+="8. Apply known issue fixes and tuning\n"
-    help_text+="9. Help & About pve-tools\n"
+    help_text+="8. Setup Start-at-boot for $PRODUCT VMs - Configure automatic startup\n"
+    help_text+="9. Apply known issue fixes and tuning\n"
+    help_text+="10. Help & About pve-tools\n"
     help_text+="\n"
     help_text+="REQUIREMENTS:\n"
     help_text+="-------------\n"
@@ -2364,8 +2412,42 @@ help_about_dialog() {
     return 0
 }
 
-# Display setup dialog for REST API configuration
+# Display setup dialog menu
 setup_dialog() {
+    local dialog_selected=$(mktemp)
+    
+    cmd=(dialog --keep-tite --title "Setup Configuration"
+         --ok-label "Select" --cancel-label "Back" 
+         --menu "Choose setup option:" 12 70 4)
+    options=("1" "REST API Configuration"
+             "2" "Storage VM Startup Settings"
+             "3" "Custom IPs Configuration")
+
+    dialog_menu
+    rm -f "$dialog_selected"
+
+    case $dialog_exit_code in
+        0)  # Select
+            case "$selected_option" in
+                1)  # REST API Configuration
+                    setup_rest_api_dialog
+                    ;;
+                2)  # Storage VM Startup Settings
+                    setup_storage_vm_dialog
+                    ;;
+                3)  # Custom IPs Configuration
+                    setup_custom_ips_dialog
+                    ;;
+            esac
+            ;;
+        1)  # Back
+            return 0
+            ;;
+    esac
+}
+
+# Display setup dialog for REST API configuration
+setup_rest_api_dialog() {
     local dialog_selected=$(mktemp)
     local form_data=$(mktemp)
     local temp_user="$rest_api_user"
@@ -2373,7 +2455,7 @@ setup_dialog() {
     local temp_port="$rest_api_port"
 
     # Step 1: Get username and port
-    dialog --keep-tite --title "Setup Configuration - Step 1/2" \
+    dialog --keep-tite --title "REST API Configuration - Step 1/2" \
            --ok-label "Next" --cancel-label "Back" \
            --form "Configure $PRODUCT REST API settings:" 10 60 2 \
            "User:" 1 1 "$temp_user" 1 20 20 0 \
@@ -2395,7 +2477,7 @@ setup_dialog() {
 
         # Step 2: Get password with masking
         local masked_password=$(printf '%*s' ${#temp_password} | tr ' ' '*')
-        dialog --keep-tite --title "Setup Configuration - Step 2/2" \
+        dialog --keep-tite --title "REST API Configuration - Step 2/2" \
                --ok-label "Save" --cancel-label "Back" \
                --insecure --passwordbox "Enter REST API password (supports copy&paste):\n" 12 70 \
                2> "$form_data"
@@ -2411,20 +2493,13 @@ setup_dialog() {
                 rest_api_password="$temp_password"
                 rest_api_port="$temp_port"
 
-                log_info "User saved configuration changes"
-                log_debug "setup_config: Parsed user='$rest_api_user'"
-                log_debug "setup_config: Parsed password length=${#rest_api_password}"
-                log_debug "setup_config: Parsed port='$rest_api_port'"
+                log_info "User saved REST API configuration changes"
+                log_debug "setup_rest_api: Parsed user='$rest_api_user'"
+                log_debug "setup_rest_api: Parsed password length=${#rest_api_password}"
+                log_debug "setup_rest_api: Parsed port='$rest_api_port'"
 
-                # Save to config file - properly escape the password to handle special characters
-                cat > "$CONFIG_FILE" << EOF
-rest_api_user=$rest_api_user
-rest_api_password='$rest_api_password'
-rest_api_port=$rest_api_port
-EOF
-
-                log_info "Configuration saved to $CONFIG_FILE"
-                dialog --msgbox "Configuration saved successfully!" 6 40
+                save_config_file
+                dialog --msgbox "REST API configuration saved successfully!" 6 50
             else
                 dialog --msgbox "Password cannot be empty. Configuration not saved." 6 50
             fi
@@ -2434,6 +2509,199 @@ EOF
     rm -f "$form_data"
     rm -f "$dialog_selected"
     return 0
+}
+
+# Display setup dialog for storage VM startup settings
+setup_storage_vm_dialog() {
+    local dialog_selected=$(mktemp)
+    local form_data=$(mktemp)
+    local temp_name_contains="$storage_vm_name_contains"
+    local temp_start_at_boot="$storage_vm_start_at_boot"
+    local temp_start_order="$storage_vm_start_shutdown_order"
+    local temp_startup_delay="$storage_vm_startup_deleay"
+    local temp_shutdown_timeout="$storage_vm_shutdown_timeout"
+
+    log_debug "setup_storage_vm_dialog: temp_name_contains='$temp_name_contains'"
+    log_debug "setup_storage_vm_dialog: temp_start_at_boot='$temp_start_at_boot'"
+    log_debug "setup_storage_vm_dialog: temp_start_order='$temp_start_order'"
+    log_debug "setup_storage_vm_dialog: temp_startup_delay='$temp_startup_delay'"
+    log_debug "setup_storage_vm_dialog: temp_shutdown_timeout='$temp_shutdown_timeout'"
+
+    dialog --keep-tite --title "Storage VM Startup Configuration" \
+           --ok-label "Save" --cancel-label "Back" --extra-button --extra-label "Restore to Factory" \
+           --form "Configure storage VM startup settings:" 14 85 5 \
+           "$PRODUCT VM name contains (case insensitive):" 1 1 "$temp_name_contains" 1 50 30 0 \
+           "Start-at-boot (yes/no):" 2 1 "$temp_start_at_boot" 2 50 10 0 \
+           "Start/shutdown order:" 3 1 "$temp_start_order" 3 50 10 0 \
+           "Startup delay (sec):" 4 1 "$temp_startup_delay" 4 50 10 0 \
+           "Shutdown timeout (sec):" 5 1 "$temp_shutdown_timeout" 5 50 10 0 \
+           2> "$form_data"
+
+    local exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        # Parse form data
+        local line_count=1
+        while IFS= read -r line; do
+            case $line_count in
+                1) temp_name_contains="$line" ;;
+                2) temp_start_at_boot="$line" ;;
+                3) temp_start_order="$line" ;;
+                4) temp_startup_delay="$line" ;;
+                5) temp_shutdown_timeout="$line" ;;
+            esac
+            ((line_count++))
+        done < "$form_data"
+
+        # Validate inputs
+        if [[ "$temp_start_at_boot" != "yes" && "$temp_start_at_boot" != "no" ]]; then
+            dialog --msgbox "Start-at-boot must be 'yes' or 'no'." 6 40
+        elif [[ ! "$temp_start_order" =~ ^[0-9]+$ ]]; then
+            dialog --msgbox "Start/shutdown order must be a number." 6 40
+        elif [[ ! "$temp_startup_delay" =~ ^[0-9]+$ ]]; then
+            dialog --msgbox "Startup delay must be a number." 6 40
+        elif [[ ! "$temp_shutdown_timeout" =~ ^[0-9]+$ ]]; then
+            dialog --msgbox "Shutdown timeout must be a number." 6 40
+        else
+            # Update variables
+            storage_vm_name_contains="$temp_name_contains"
+            storage_vm_start_at_boot="$temp_start_at_boot"
+            storage_vm_start_shutdown_order="$temp_start_order"
+            storage_vm_startup_deleay="$temp_startup_delay"
+            storage_vm_shutdown_timeout="$temp_shutdown_timeout"
+
+            log_info "User saved storage VM startup configuration changes"
+            save_config_file
+            dialog --msgbox "Storage VM startup configuration saved successfully!" 6 60
+        fi
+    elif [ $exit_code -eq 3 ]; then
+        # Restore to Factory button pressed
+        if restore_factory_defaults_storage_vm; then
+            # Reload dialog with factory defaults
+            setup_storage_vm_dialog
+            return $?
+        fi
+    fi
+    
+    rm -f "$form_data"
+    rm -f "$dialog_selected"
+    return 0
+}
+
+# Display setup dialog for custom IPs configuration
+setup_custom_ips_dialog() {
+    local dialog_selected=$(mktemp)
+    local form_data=$(mktemp)
+    local temp_custom_ips="$custom_ips"
+
+    dialog --keep-tite --title "Custom IPs Configuration" \
+           --ok-label "Save" --cancel-label "Back" \
+           --inputbox "Enter custom IPs (comma-separated):" 10 60 "$temp_custom_ips" \
+           2> "$form_data"
+
+    local exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        temp_custom_ips=$(cat "$form_data")
+        custom_ips="$temp_custom_ips"
+
+        log_info "User saved custom IPs configuration changes"
+        save_config_file
+        dialog --msgbox "Custom IPs configuration saved successfully!" 6 50
+    fi
+    
+    rm -f "$form_data"
+    rm -f "$dialog_selected"
+    return 0
+}
+
+# Restore factory defaults for storage VM configuration
+restore_factory_defaults_storage_vm() {
+    log_info "Restoring factory defaults for storage VM configuration"
+    
+    if [ ! -f "$FACTORY_DEFAULTS_FILE" ]; then
+        log_error "Factory defaults file not found: $FACTORY_DEFAULTS_FILE"
+        dialog --title "Error" --msgbox "Factory defaults file not found. Cannot restore defaults." 8 60
+        return 1
+    fi
+    
+    # Confirm with user
+    dialog --keep-tite --title "Restore Factory Defaults" \
+           --yes-label "Restore" --no-label "Cancel" \
+           --yesno "This will restore storage VM startup settings to factory defaults.\n\nCurrent settings will be lost. Continue?" 10 60
+    
+    if [ $? -ne 0 ]; then
+        log_info "User canceled factory defaults restore"
+        return 1
+    fi
+    
+    # Load factory defaults for storage VM settings only
+    local factory_storage_vm_name_contains=""
+    local factory_storage_vm_start_at_boot=""
+    local factory_storage_vm_start_shutdown_order=""
+    local factory_storage_vm_startup_deleay=""
+    local factory_storage_vm_shutdown_timeout=""
+    
+    # Source factory defaults and extract only storage VM settings
+    if [ -f "$FACTORY_DEFAULTS_FILE" ]; then
+        while IFS='=' read -r key value; do
+            # Skip comments and empty lines
+            [[ "$key" =~ ^[[:space:]]*# ]] && continue
+            [[ -z "$key" ]] && continue
+            
+            case "$key" in
+                storage_vm_name_contains)
+                    factory_storage_vm_name_contains="$value"
+                    ;;
+                storage_vm_start_at_boot)
+                    factory_storage_vm_start_at_boot="$value"
+                    ;;
+                storage_vm_start_shutdown_order)
+                    factory_storage_vm_start_shutdown_order="$value"
+                    ;;
+                storage_vm_startup_deleay)
+                    factory_storage_vm_startup_deleay="$value"
+                    ;;
+                storage_vm_shutdown_timeout)
+                    factory_storage_vm_shutdown_timeout="$value"
+                    ;;
+            esac
+        done < "$FACTORY_DEFAULTS_FILE"
+        
+        # Update current variables with factory defaults
+        storage_vm_name_contains="$factory_storage_vm_name_contains"
+        storage_vm_start_at_boot="$factory_storage_vm_start_at_boot"
+        storage_vm_start_shutdown_order="$factory_storage_vm_start_shutdown_order"
+        storage_vm_startup_deleay="$factory_storage_vm_startup_deleay"
+        storage_vm_shutdown_timeout="$factory_storage_vm_shutdown_timeout"
+        
+        # Save to config file
+        save_config_file
+        
+        log_info "Factory defaults restored for storage VM configuration"
+        dialog --msgbox "Factory defaults restored successfully!" 6 50
+        return 0
+    else
+        log_error "Failed to read factory defaults file"
+        dialog --title "Error" --msgbox "Failed to read factory defaults file." 8 50
+        return 1
+    fi
+}
+
+# Save current configuration to file
+save_config_file() {
+    cat > "$CONFIG_FILE" << EOF
+rest_api_user=$rest_api_user
+rest_api_password='$rest_api_password'
+rest_api_port=$rest_api_port
+custom_ips=${custom_ips:-}
+storage_vm_name_contains=${storage_vm_name_contains:-$(lower "$PRODUCT")}
+storage_vm_start_at_boot=${storage_vm_start_at_boot:-yes}
+storage_vm_start_shutdown_order=${storage_vm_start_shutdown_order:-1}
+storage_vm_startup_deleay=${storage_vm_startup_deleay:-300}
+storage_vm_shutdown_timeout=${storage_vm_shutdown_timeout:-180}
+EOF
+    log_info "Configuration saved to $CONFIG_FILE"
 }
 
 # RESTORE FROM CLONE WIZARD FUNCTIONS
@@ -6601,6 +6869,607 @@ add_vmct_to_ha_resources() {
                 esac
                 ;;
         esac
+    done
+}
+
+# STORAGE VM STARTUP CONFIGURATION FUNCTIONS
+
+# Get VMs/CTs that match the storage pattern
+get_storage_vms() {
+    local pattern="$storage_vm_name_contains"
+    if [[ -z "$pattern" ]]; then
+        pattern="$(lower "$PRODUCT")"
+    fi
+    local vm_ct_data=""
+    
+    # Get all VMs
+    {
+        for conf_file in /etc/pve/nodes/*/qemu-server/*.conf; do
+        if [[ -f "$conf_file" ]]; then
+            local vmid=$(basename "$conf_file" .conf)
+            local name=""
+            local boot=""
+            local startup=""
+            
+            # Extract VM name, boot and startup settings
+            while IFS= read -r line; do
+                case "$line" in
+                    name:*) name="${line#name: }" ;;
+                    boot:*) boot="${line#boot: }" ;;
+                    startup:*) startup="${line#startup: }" ;;
+                esac
+            done < "$conf_file"
+            
+            # Check if name contains the pattern
+            if [[ "$name" == *"$pattern"* ]]; then
+                local start_at_boot="no"
+                local order=""
+                local up=""
+                local down=""
+                
+                log_debug "get_storage_vms: Found VM $vmid ($name) - boot='$boot' startup='$startup'"
+                # Parse boot setting
+                if [[ "$boot" == *"1"* ]]; then
+                    start_at_boot="yes"
+                fi
+                
+                # Parse startup settings
+                if [[ -n "$startup" ]]; then
+                    if [[ "$startup" =~ order=([0-9]+) ]]; then
+                        order="${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$startup" =~ up=([0-9]+) ]]; then
+                        up="${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$startup" =~ down=([0-9]+) ]]; then
+                        down="${BASH_REMATCH[1]}"
+                    fi
+                fi
+                
+                log_debug "get_storage_vms: VM $vmid parsed - start_at_boot='$start_at_boot' order='$order' up='$up' down='$down'"
+                vm_ct_data+="${vmid}|${name:-VM-$vmid}|vm|${start_at_boot}|${order:-}|${up:-}|${down:-}|$conf_file"$'\n'
+            fi
+        fi
+        done
+    } 2>/dev/null
+    
+    # Get all CTs
+    {
+        for conf_file in /etc/pve/nodes/*/lxc/*.conf; do
+        if [[ -f "$conf_file" ]]; then
+            local ctid=$(basename "$conf_file" .conf)
+            local hostname=""
+            local boot=""
+            local startup=""
+            
+            # Extract CT hostname, boot and startup settings
+            while IFS= read -r line; do
+                case "$line" in
+                    hostname:*) hostname="${line#hostname: }" ;;
+                    boot:*) boot="${line#boot: }" ;;
+                    startup:*) startup="${line#startup: }" ;;
+                esac
+            done < "$conf_file"
+            
+            # Check if hostname contains the pattern
+            if [[ "$hostname" == *"$pattern"* ]]; then
+                local start_at_boot="no"
+                local order=""
+                local up=""
+                local down=""
+                
+                # Parse boot setting
+                if [[ "$boot" == *"1"* ]]; then
+                    start_at_boot="yes"
+                fi
+                
+                # Parse startup settings  
+                if [[ -n "$startup" ]]; then
+                    if [[ "$startup" =~ order=([0-9]+) ]]; then
+                        order="${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$startup" =~ up=([0-9]+) ]]; then
+                        up="${BASH_REMATCH[1]}"
+                    fi
+                    if [[ "$startup" =~ down=([0-9]+) ]]; then
+                        down="${BASH_REMATCH[1]}"
+                    fi
+                fi
+                
+                vm_ct_data+="${ctid}|${hostname:-CT-$ctid}|ct|${start_at_boot}|${order:-}|${up:-}|${down:-}|$conf_file"$'\n'
+            fi
+        fi
+        done
+    } 2>/dev/null
+    
+    echo "$vm_ct_data"
+}
+
+# Select storage VMs for startup configuration
+select_storage_vms() {
+    local vm_ct_data
+    local select_all_mode=true  # Start with all selected
+    local menu_items=()
+    
+    # Get storage VM/CT data
+    vm_ct_data=$(get_storage_vms)
+    if [[ -z "$vm_ct_data" ]]; then
+        local pattern="$storage_vm_name_contains"
+        if [[ -z "$pattern" ]]; then
+            pattern="$(lower "$PRODUCT")"
+        fi
+        dialog --title "No Storage VMs Found" \
+               --msgbox "No VMs or CTs found with name containing '$pattern'." 8 60
+        return 1
+    fi
+    
+    # Initialize selected list with all VMs if starting in select all mode
+    if $select_all_mode; then
+        storage_vm_selected=()
+        while IFS='|' read -r vmid name type boot order up down conf_file; do
+            if [[ -n "$vmid" ]]; then
+                storage_vm_selected+=("$vmid")
+            fi
+        done <<< "$vm_ct_data"
+    fi
+    
+    while true; do
+        menu_items=()
+        local select_label
+        
+        if $select_all_mode; then
+            select_label="Deselect All"
+        else
+            select_label="Select All"
+        fi
+        
+        # Calculate maximum VM name length for proper column alignment
+        local max_name_len=8  # minimum width for "VM Name" header
+        while IFS='|' read -r vmid name type boot order up down conf_file; do
+            if [[ -n "$vmid" && -n "$name" ]]; then
+                local name_len=${#name}
+                if [[ $name_len -gt $max_name_len ]]; then
+                    max_name_len=$name_len
+                fi
+            fi
+        done <<< "$vm_ct_data"
+        
+        log_debug "select_storage_vms: Calculated max VM name length: $max_name_len"
+        
+        # Build header info using simple heredoc
+        local header
+        header=$(cat <<EOF
+Legend:
+order:  Start/shutdownorder
+up:     Startup delay (sec)
+down:   Shutdown timeout (sec)
+EOF
+)
+        log_debug "select_storage_vms: Final header: '$header'"
+        
+        # Build menu items with formatted columns
+        while IFS='|' read -r vmid name type boot order up down conf_file; do
+            if [[ -n "$vmid" ]]; then
+                # Format the display string with columns using calculated name width
+                local name_part=$(printf "(%s)" "$name")
+                local display_string=$(printf "%-*s [%s]  Start-at-boot: %-3s | order=%-2s | up=%-3s | down=%-3s" \
+                    $((max_name_len + 2)) "$name_part" "$type" "$boot" "${order:-N/A}" "${up:-N/A}" "${down:-N/A}")
+                
+                # Check if this VM/CT is selected
+                local selection_status="off"
+                for selected_vm in "${storage_vm_selected[@]}"; do
+                    if [[ "$selected_vm" == "$vmid" ]]; then
+                        selection_status="on"
+                        break
+                    fi
+                done
+                
+                menu_items+=("$vmid" "$display_string" "$selection_status")
+            fi
+        done <<< "$vm_ct_data"
+        
+        # Create dialog
+        local product_name="$PRODUCT"
+        local formatted_header="$(echo -e "$header")"
+        log_debug "select_storage_vms: Header for dialog: '$header'"
+        log_debug "select_storage_vms: Header length: ${#header}"
+        cmd=(dialog --keep-tite --title "Setup Start-at-boot for $product_name VMs"
+             --ok-label "Next" --cancel-label "Back" --extra-button --extra-label "$select_label"
+             --checklist "$formatted_header" 20 120 12)
+        options=("${menu_items[@]}")
+        
+        dialog_menu
+        
+        case $dialog_exit_code in
+            0)  # Next
+                if [[ -n "$selected_option" ]]; then
+                    # Parse selected VMs/CTs
+                    storage_vm_selected=()
+                    IFS=' ' read -ra ADDR <<< "$selected_option"
+                    for vmid in "${ADDR[@]}"; do
+                        storage_vm_selected+=("$vmid")
+                    done
+                    log_info "Selected storage VMs/CTs: ${storage_vm_selected[*]}"
+                    return 0
+                else
+                    dialog --title "Warning" --msgbox "Please select at least one VM or CT." 8 50
+                fi
+                ;;
+            1)  # Back
+                return 1
+                ;;
+            3)  # Select All/Deselect All
+                if $select_all_mode; then
+                    # Deselect all
+                    storage_vm_selected=()
+                    select_all_mode=false
+                else
+                    # Select all
+                    storage_vm_selected=()
+                    while IFS='|' read -r vmid name type boot order up down conf_file; do
+                        if [[ -n "$vmid" ]]; then
+                            storage_vm_selected+=("$vmid")
+                        fi
+                    done <<< "$vm_ct_data"
+                    select_all_mode=true
+                fi
+                ;;
+        esac
+    done
+}
+
+# Show startup configuration confirmation
+confirm_startup_configuration() {
+    log_debug "confirm_startup_configuration: Displaying values:"
+    log_debug "confirm_startup_configuration: storage_vm_start_at_boot='${storage_vm_start_at_boot}'"
+    log_debug "confirm_startup_configuration: storage_vm_start_shutdown_order='${storage_vm_start_shutdown_order}'"
+    log_debug "confirm_startup_configuration: storage_vm_startup_deleay='${storage_vm_startup_deleay}'"
+    log_debug "confirm_startup_configuration: storage_vm_shutdown_timeout='${storage_vm_shutdown_timeout}'"
+    
+    local summary="Apply the following startup configuration to selected:\n\n"
+    summary+="Start-at-boot: ${storage_vm_start_at_boot}\n"
+    summary+="Start/shutdown order: ${storage_vm_start_shutdown_order}\n"
+    summary+="Startup delay: ${storage_vm_startup_deleay} seconds\n"
+    summary+="Shutdown timeout: ${storage_vm_shutdown_timeout} seconds\n\n"
+    summary+="\n\n"
+    summary+="Selected: ${#storage_vm_selected[@]} items\n\n"
+    
+    # Get VM/CT data for name and tag information
+    local vm_ct_data
+    vm_ct_data=$(get_storage_vms)
+    
+    # Calculate maximum VM name length for proper column alignment
+    local max_name_len=8  # minimum width for "VM Name" header
+    while IFS='|' read -r vmid name type boot order up down conf_file; do
+        if [[ -n "$vmid" && -n "$name" ]]; then
+            # Check if this VM is in our selected list
+            for selected_vmid in "${storage_vm_selected[@]}"; do
+                if [[ "$selected_vmid" == "$vmid" ]]; then
+                    local name_len=${#name}
+                    if [[ $name_len -gt $max_name_len ]]; then
+                        max_name_len=$name_len
+                    fi
+                    break
+                fi
+            done
+        fi
+    done <<< "$vm_ct_data"
+    
+    # Build the VM/CT list with proper alignment
+    log_debug "confirm_startup_configuration: Building VM list with ${#storage_vm_selected[@]} selected VMs"
+    log_debug "confirm_startup_configuration: Max name length calculated: $max_name_len"
+    
+    for selected_vmid in "${storage_vm_selected[@]}"; do
+        local vm_name=""
+        local vm_type=""
+        log_debug "confirm_startup_configuration: Processing selected vmid: $selected_vmid"
+        
+        # Find the name and type for this vmid
+        while IFS='|' read -r vmid name type boot order up down conf_file; do
+            if [[ "$vmid" == "$selected_vmid" ]]; then
+                vm_name="$name"
+                vm_type="$type"
+                log_debug "confirm_startup_configuration: Found vmid $vmid: name='$name', type='$type'"
+                break
+            fi
+        done <<< "$vm_ct_data"
+        
+        # Format with proper alignment
+        if [[ -n "$vm_name" ]]; then
+            local name_part="($vm_name)"
+            local formatted_line="$(printf "  - %-3s %-*s [%s]" "$selected_vmid" $((max_name_len + 2)) "$name_part" "$vm_type")"
+            log_debug "confirm_startup_configuration: Adding formatted line: '$formatted_line'"
+            summary+="$formatted_line\n"
+        else
+            log_debug "confirm_startup_configuration: VM name not found for vmid: $selected_vmid"
+            summary+="  - $selected_vmid (name not found)\n"
+        fi
+    done
+    
+    log_debug "confirm_startup_configuration: Final summary length: ${#summary}"
+    log_debug "confirm_startup_configuration: Summary content:"
+    log_debug "$summary"
+    
+    dialog --keep-tite --title "Confirm Startup Configuration" \
+           --ok-label "Confirm" --cancel-label "Cancel" \
+           --yesno "$summary" 20 80
+    
+    return $?
+}
+
+# Apply startup settings to selected VMs/CTs
+apply_startup_settings() {
+    local total_processed=0
+    local total_success=0
+    local total_errors=0
+    local results_text=""
+    
+    # Get VM/CT data for name information
+    local vm_ct_data
+    vm_ct_data=$(get_storage_vms)
+    
+    # Calculate max name length for formatting
+    local max_name_len=8
+    if [[ -n "$vm_ct_data" ]]; then
+        while IFS='|' read -r vmid name type boot order up down conf_file; do
+            if [[ -n "$vmid" && -n "$name" ]]; then
+                local name_len=${#name}
+                if [[ $name_len -gt $max_name_len ]]; then
+                    max_name_len=$name_len
+                fi
+            fi
+        done <<< "$vm_ct_data"
+    fi
+    
+    # Helper function to get VM name and type from data
+    get_vm_info() {
+        local search_vmid="$1"
+        local vm_name=""
+        local vm_type=""
+        
+        if [[ -n "$vm_ct_data" ]]; then
+            while IFS='|' read -r vmid name type boot order up down conf_file; do
+                if [[ "$vmid" == "$search_vmid" ]]; then
+                    vm_name="$name"
+                    vm_type="$type"
+                    break
+                fi
+            done <<< "$vm_ct_data"
+        fi
+        
+        echo "$vm_name|$vm_type"
+    }
+    
+    for vmid in "${storage_vm_selected[@]}"; do
+        log_info "Processing startup configuration for VM/CT $vmid"
+        local config_file=""
+        local type=""
+        
+        # Get VM name and type information
+        local vm_info
+        vm_info=$(get_vm_info "$vmid")
+        local vm_name=$(echo "$vm_info" | cut -d'|' -f1)
+        local vm_data_type=$(echo "$vm_info" | cut -d'|' -f2)
+        
+        # Determine if it's a VM or CT
+        if [[ -f "/etc/pve/nodes/$(hostname)/qemu-server/$vmid.conf" ]]; then
+            config_file="/etc/pve/nodes/$(hostname)/qemu-server/$vmid.conf"
+            type="VM"
+        elif [[ -f "/etc/pve/nodes/$(hostname)/lxc/$vmid.conf" ]]; then
+            config_file="/etc/pve/nodes/$(hostname)/lxc/$vmid.conf"
+            type="CT"
+        else
+            # Try to find the config file on any node
+            for node_conf in /etc/pve/nodes/*/qemu-server/$vmid.conf; do
+                if [[ -f "$node_conf" ]]; then
+                    config_file="$node_conf"
+                    type="VM"
+                    break
+                fi
+            done
+            if [[ -z "$config_file" ]]; then
+                for node_conf in /etc/pve/nodes/*/lxc/$vmid.conf; do
+                    if [[ -f "$node_conf" ]]; then
+                        config_file="$node_conf"
+                        type="CT"
+                        break
+                    fi
+                done
+            fi
+        fi
+        
+        if [[ -z "$config_file" ]]; then
+            log_error "Configuration file not found for VM/CT $vmid"
+            local name_part="($vm_name)"
+            local formatted_result=$(printf "%-3s %-*s [%s]: ERROR - Config file not found" "$vmid" $((max_name_len + 2)) "$name_part" "$vm_data_type")
+            results_text+="$formatted_result\n"
+            ((total_errors++))
+            ((total_processed++))
+            continue
+        fi
+        
+        # Create backup of config file
+        local backup_file="${config_file}.backup.$(date +%Y%m%d_%H%M%S)"
+        if ! cp "$config_file" "$backup_file" 2>/dev/null; then
+            log_error "Failed to backup config file for VM/CT $vmid"
+            local name_part="($vm_name)"
+            local formatted_result=$(printf "%-3s %-*s [%s]: ERROR - Failed to backup config" "$vmid" $((max_name_len + 2)) "$name_part" "$vm_data_type")
+            results_text+="$formatted_result\n"
+            ((total_errors++))
+            ((total_processed++))
+            continue
+        fi
+        
+        # Prepare new configuration lines
+        local boot_line=""
+        local startup_line=""
+        
+        log_debug "apply_startup_settings: Applying values for VM/CT $vmid:"
+        log_debug "apply_startup_settings: storage_vm_start_at_boot='${storage_vm_start_at_boot}'"
+        log_debug "apply_startup_settings: storage_vm_start_shutdown_order='${storage_vm_start_shutdown_order}'"
+        log_debug "apply_startup_settings: storage_vm_startup_deleay='${storage_vm_startup_deleay}'"
+        log_debug "apply_startup_settings: storage_vm_shutdown_timeout='${storage_vm_shutdown_timeout}'"
+        
+        if [[ "$storage_vm_start_at_boot" == "yes" ]]; then
+            boot_line="boot: 1"
+        else
+            boot_line="boot: 0"
+        fi
+        
+        startup_line="startup: order=${storage_vm_start_shutdown_order},up=${storage_vm_startup_deleay},down=${storage_vm_shutdown_timeout}"
+        
+        log_debug "apply_startup_settings: boot_line='$boot_line'"
+        log_debug "apply_startup_settings: startup_line='$startup_line'"
+        
+        # Read current config and prepare new one
+        local temp_config=$(mktemp)
+        local boot_updated=false
+        local startup_updated=false
+        
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^boot: ]]; then
+                echo "$boot_line" >> "$temp_config"
+                boot_updated=true
+            elif [[ "$line" =~ ^startup: ]]; then
+                echo "$startup_line" >> "$temp_config"
+                startup_updated=true
+            else
+                echo "$line" >> "$temp_config"
+            fi
+        done < "$config_file"
+        
+        # Add missing lines if not updated
+        if ! $boot_updated; then
+            echo "$boot_line" >> "$temp_config"
+        fi
+        if ! $startup_updated; then
+            echo "$startup_line" >> "$temp_config"
+        fi
+        
+        # Replace the original config file
+        if mv "$temp_config" "$config_file" 2>/dev/null; then
+            log_info "Successfully updated startup configuration for VM/CT $vmid"
+            local name_part="($vm_name)"
+            local formatted_result=$(printf "%-3s %-*s [%s]: SUCCESS" "$vmid" $((max_name_len + 2)) "$name_part" "$vm_data_type")
+            results_text+="$formatted_result\n"
+            ((total_success++))
+        else
+            log_error "Failed to update config file for VM/CT $vmid"
+            local name_part="($vm_name)"
+            local formatted_result=$(printf "%-3s %-*s [%s]: ERROR - Failed to update config" "$vmid" $((max_name_len + 2)) "$name_part" "$vm_data_type")
+            results_text+="$formatted_result\n"
+            # Restore backup
+            cp "$backup_file" "$config_file" 2>/dev/null
+            ((total_errors++))
+        fi
+        
+        ((total_processed++))
+        rm -f "$temp_config"
+    done
+    
+    # Show results
+    local summary="Startup configuration completed:\n\n"
+    summary+="Total processed: $total_processed\n"
+    summary+="Successfully configured: $total_success\n"
+    summary+="Errors: $total_errors\n\n"
+    summary+="Details:\n$results_text"
+    
+    dialog --keep-tite --title "Startup Configuration Results" \
+           --ok-label "OK" \
+           --msgbox "$summary" 20 80
+    
+    log_info "Startup configuration completed: $total_success configured, $total_errors errors"
+}
+
+# Configure startup settings wizard step
+configure_startup_settings_wizard() {
+    log_debug "configure_startup_settings_wizard: Displaying values:"
+    log_debug "configure_startup_settings_wizard: storage_vm_start_at_boot='${storage_vm_start_at_boot}'"
+    log_debug "configure_startup_settings_wizard: storage_vm_start_shutdown_order='${storage_vm_start_shutdown_order}'"
+    log_debug "configure_startup_settings_wizard: storage_vm_startup_deleay='${storage_vm_startup_deleay}'"
+    log_debug "configure_startup_settings_wizard: storage_vm_shutdown_timeout='${storage_vm_shutdown_timeout}'"
+    
+    local summary
+    summary=$(cat <<EOF
+Note: Startup settings apply only to the JovianDSS VM. 
+All other VMs are managed by Proxmox HA, 
+which uses its own logic to control startup/shutdown based on HA settings, 
+not the VM's configuration.
+
+Current startup configuration:
+
+Start-at-boot: ${storage_vm_start_at_boot}
+Start/shutdown order: ${storage_vm_start_shutdown_order}
+Startup delay: ${storage_vm_startup_deleay} seconds
+Shutdown timeout: ${storage_vm_shutdown_timeout} seconds
+
+These settings will be applied to all selected VMs.
+EOF
+)
+
+    dialog --keep-tite --title "$PRODUCT Startup Configuration Settings" \
+           --yes-label "Continue" --no-label "Back to Main" --extra-button --extra-label "Modify Settings" \
+           --yesno "$summary" 20 100
+    
+    local exit_code=$?
+    
+    case $exit_code in
+        0)  # Continue button - use current settings
+            return 0
+            ;;
+        1)  # Back button
+            return 1
+            ;;
+        3)  # Modify Settings button
+            if setup_storage_vm_dialog; then
+                # Settings were modified, show confirmation again
+                configure_startup_settings_wizard
+                return $?
+            else
+                # User cancelled the settings dialog
+                configure_startup_settings_wizard
+                return $?
+            fi
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Main wizard function for storage VM startup configuration
+setup_storage_vm_startup_wizard() {
+    log_info "Starting Setup Start-at-boot for $PRODUCT VMs wizard"
+    
+    # Check if running as root (required for config file modification)
+    if [[ $EUID -ne 0 ]]; then
+        dialog --title "Error" --msgbox "This function must be run as root to modify VM/CT configuration files." 8 70
+        return 1
+    fi
+    
+    # Initialize wizard variables
+    storage_vm_selected=()
+    
+    while true; do
+        # Step 1: Configure startup settings
+        if ! configure_startup_settings_wizard; then
+            return 0  # Back to main menu
+        fi
+        
+        # Step 2: Select VMs/CTs
+        if ! select_storage_vms; then
+            continue  # Go back to configuration
+        fi
+        
+        # Step 3: Confirm configuration
+        if ! confirm_startup_configuration; then
+            continue  # Go back to VM selection
+        fi
+        
+        # Step 4: Apply settings
+        apply_startup_settings
+        
+        return 0  # Back to main menu
     done
 }
 

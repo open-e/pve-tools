@@ -25,11 +25,14 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.22"
-RELEASE_DATE="2025-07-21"
+VERSION="0.23"
+RELEASE_DATE="2025-07-22"
 
 # Script mode flag
 VERSION_MODE=false
+
+# Debug mode flag
+DEBUG_MODE=true
 
 # Product information
 VENDOR="Open-E"
@@ -38,6 +41,7 @@ PRODUCT="JovianDSS"
 CONFIG_DIR="/etc/$(basename "$0" .sh)"
 CONFIG_FILE="$CONFIG_DIR/config.conf"
 FACTORY_DEFAULTS_FILE="$CONFIG_DIR/factory.defaults"
+CONNECTED_STORAGE_SERVERS_DIR="$CONFIG_DIR/connected"
 LOGS_DIR="/var/log/$(basename "$0" .sh)"
 LOG_FILE="$LOGS_DIR/$(basename "$0" .sh).log"
 
@@ -54,12 +58,6 @@ cached_config_list=()  # Cache config list to avoid repeated discovery
 # Conflict resolution variables
 new_vmct_id=""
 conflict_selected_host=""
-
-# API configuration
-rest_api_user=admin
-rest_api_password=admin
-rest_api_port=82
-selected_nfs_ip=""
 
 # Storage to IP mapping table
 declare -A storage_ip_map
@@ -241,7 +239,7 @@ log_error() {
 
 # Log debug message
 log_debug() {
-    if [[ -f "$LOG_FILE" ]]; then
+    if [[ "$DEBUG_MODE" == "true" && -f "$LOG_FILE" ]]; then
         log "DEBUG" "$1"
     fi
 }
@@ -2418,10 +2416,9 @@ setup_dialog() {
     
     cmd=(dialog --keep-tite --title "Setup Configuration"
          --ok-label "Select" --cancel-label "Back" 
-         --menu "Choose setup option:" 12 70 4)
+         --menu "Choose setup option:" 12 70 2)
     options=("1" "REST API Configuration"
-             "2" "Storage VM Startup Settings"
-             "3" "Custom IPs Configuration")
+             "2" "Storage VM Startup Settings")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -2434,9 +2431,6 @@ setup_dialog() {
                     ;;
                 2)  # Storage VM Startup Settings
                     setup_storage_vm_dialog
-                    ;;
-                3)  # Custom IPs Configuration
-                    setup_custom_ips_dialog
                     ;;
             esac
             ;;
@@ -2959,8 +2953,8 @@ step1_select_config() {
         return 1
     fi
 
-    # First pass: collect all storage names and VM/CT names to calculate max lengths
-    local storage_names=() vmct_names=()
+    # First pass: collect all storage names, VM/CT names, and pool names to calculate max lengths
+    local storage_names=() vmct_names=() pool_names=()
     for ((i=0; i<${#confs[@]}; i++)); do
         local storage_name=$(get_storage_name_from_mnt_conf_file "${confs[i]}")
         storage_names+=("$storage_name")
@@ -2971,6 +2965,14 @@ step1_select_config() {
             vmct_name="(no name)"
         fi
         vmct_names+=("$vmct_name")
+        
+        # Get NFS IP and pool name
+        local nfs_ip=$(get_nfs_server_ip_of_given_storage "$storage_name")
+        local pool_name=$(get_dataset_pool_name "$storage_name" "$nfs_ip" 2>/dev/null)
+        if [[ -z "$pool_name" ]]; then
+            pool_name="(unknown)"
+        fi
+        pool_names+=("$pool_name")
     done
 
     # Calculate maximum storage name length for alignment
@@ -2986,6 +2988,14 @@ step1_select_config() {
     for vmct_name in "${vmct_names[@]}"; do
         if [ ${#vmct_name} -gt $max_vmct_name_len ]; then
             max_vmct_name_len=${#vmct_name}
+        fi
+    done
+    
+    # Calculate maximum pool name length for alignment
+    local max_pool_len=0
+    for pool_name in "${pool_names[@]}"; do
+        if [ ${#pool_name} -gt $max_pool_len ]; then
+            max_pool_len=${#pool_name}
         fi
     done
 
@@ -3008,11 +3018,17 @@ step1_select_config() {
         # Get storage name
         local storage_name="${storage_names[i]}"
         
+        # Get pool name from pre-calculated array
+        local pool_name="${pool_names[i]}"
+        
         # Get NFS IP address
         local nfs_ip=$(get_nfs_server_ip_of_given_storage "$storage_name")
         
         # Format storage name with proper alignment
         local formatted_storage=$(printf "%-${max_storage_len}s" "$storage_name")
+        
+        # Format pool name with proper alignment
+        local formatted_pool=$(printf "%-${max_pool_len}s" "$pool_name")
         
         # Calculate spacing after parentheses to align columns
         local name_with_parens="($vmct_name)"
@@ -3020,8 +3036,8 @@ step1_select_config() {
         local padding_needed=$((total_name_width - ${#name_with_parens}))
         local padding=$(printf "%*s" $padding_needed "")
         
-        # Create display string with parentheses aligned to name: "vm/ct (vmct_name)  storage_name  nfs_ip"
-        local display_string=$(printf "%-2s %s%s  %s  %s" "$vm_type" "$name_with_parens" "$padding" "$formatted_storage" "$nfs_ip")
+        # Create display string with parentheses aligned: "vm/ct (vmct_name)  storage_name  nfs_ip  pool_name"
+        local display_string=$(printf "%-2s %s%s  %s  %-16s  %s" "$vm_type" "$name_with_parens" "$padding" "$formatted_storage" "$nfs_ip" "$formatted_pool")
 
         # Check if this config was previously selected
         local status="off"
@@ -3043,7 +3059,7 @@ step1_select_config() {
 
     cmd=(dialog --keep-tite --title "Step 1/$total_steps: Select VM/CT for Restore"
          --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "$select_label"
-         --checklist "Choose VM/CT for restore (use SPACE to select/deselect):" 20 100 10)
+         --checklist "Choose VM/CT for restore (use SPACE to select/deselect):" 20 120 10)
     options=("${menu_items[@]}")
     dialog_menu
     rm -f "$dialog_selected"
@@ -3583,6 +3599,127 @@ rest_api_connection_test() {
     fi
 }
 
+# Function to get product information from JovianDSS REST API
+get_jovian_product_info() {
+    local ip="$1"
+    local response status
+    
+    log_debug "get_jovian_product_info: Getting product info for IP: $ip"
+    
+    local url="https://$ip:$rest_api_port/api/v4/product"
+    log_debug "get_jovian_product_info: Full URL: $url"
+    
+    response=$(curl -k -s -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
+        "$url" 2>&1)
+    local curl_exit=$?
+    
+    log_debug "get_jovian_product_info: curl exit code: $curl_exit"
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "get_jovian_product_info: curl failed for IP $ip"
+        return 1
+    fi
+    
+    status=$(echo "$response" | tail -n1)
+    local body=$(echo "$response" | sed '$d')
+    
+    log_debug "get_jovian_product_info: HTTP status: $status"
+    
+    if [[ "$status" == "200" ]]; then
+        log_debug "get_jovian_product_info: Successfully got product info for $ip"
+        echo "$body"
+        return 0
+    else
+        log_error "get_jovian_product_info: Failed to get product info for $ip (HTTP $status)"
+        return 1
+    fi
+}
+
+# Function to update connected storage servers info
+update_connected_storage_servers() {
+    log_info "Updating connected storage servers information"
+    
+    # Create connected directory if it doesn't exist
+    if [[ ! -d "$CONNECTED_STORAGE_SERVERS_DIR" ]]; then
+        mkdir -p "$CONNECTED_STORAGE_SERVERS_DIR"
+        log_info "Created connected storage servers directory: $CONNECTED_STORAGE_SERVERS_DIR"
+    fi
+    
+    # Remove all existing connected files
+    rm -f "$CONNECTED_STORAGE_SERVERS_DIR"/* 2>/dev/null
+    log_debug "Removed existing connected server info files"
+    
+    # Get all available IPs
+    local available_ips=()
+    while IFS= read -r ip; do
+        [[ -n "$ip" ]] && available_ips+=("$ip")
+    done < <(get_current_storage_servers_ip)
+    
+    log_debug "Found ${#available_ips[@]} available IPs: ${available_ips[*]}"
+    
+    # For each IP, try to get product information
+    local ip
+    for ip in "${available_ips[@]}"; do
+        log_debug "Processing IP: $ip"
+        
+        # Skip non-IP entries (special menu options)
+        if [[ "$ip" == "Enter new IP" || "$ip" == "Manage custom IPs" ]]; then
+            continue
+        fi
+        
+        # Skip invalid IP addresses
+        if ! validate_ip "$ip"; then
+            log_debug "Skipping invalid IP format: $ip"
+            continue
+        fi
+        
+        local product_info
+        if product_info=$(get_jovian_product_info "$ip" 2>/dev/null); then
+            # Parse JSON response and extract fields
+            local vendor_name=$(echo "$product_info" | grep -o '"vendor_name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"vendor_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            local name=$(echo "$product_info" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            local host_name=$(echo "$product_info" | grep -o '"host_name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"host_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            local version_name=$(echo "$product_info" | grep -o '"version_name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"version_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            local serial_number=$(echo "$product_info" | grep -o '"serial_number"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"serial_number"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            local up=$(echo "$product_info" | grep -o '"up"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"up"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            local release_date=$(echo "$product_info" | grep -o '"release_date"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"release_date"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            
+            # Create info file for this IP
+            local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$ip"
+            cat > "$info_file" << EOF
+vendor_name=$vendor_name
+name=$name
+host_name=$host_name
+version_name=$version_name
+serial_number=$serial_number
+up=$up
+release_date=$release_date
+EOF
+            log_info "Created server info file for IP $ip with hostname: $host_name"
+        else
+            log_debug "Failed to get product info for IP: $ip"
+        fi
+    done
+}
+
+# Function to get hostname for IP from connected servers
+get_hostname_for_ip() {
+    local ip="$1"
+    local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$ip"
+    
+    if [[ -f "$info_file" ]]; then
+        local host_name=$(grep "^host_name=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+        if [[ -n "$host_name" ]]; then
+            echo "$host_name"
+            return 0
+        fi
+    fi
+    
+    # Return "Unknown" if no hostname found
+    echo "Unknown"
+    return 1
+}
+
 get_custom_ips() {
     if [[ -f "$CONFIG_FILE" ]]; then
         grep "^custom_ips=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr ',' '\n' | grep -v '^$'
@@ -3962,7 +4099,18 @@ nfs_step1_select_ip() {
 
     local i
     for ((i=0; i<${#ips[@]}; i++)); do
-        menu_items+=("$i" "${ips[i]}")
+        local ip="${ips[i]}"
+        local hostname
+        if [[ "$ip" == "Enter new IP" ]]; then
+            hostname=""
+        else
+            hostname=$(get_hostname_for_ip "$ip")
+        fi
+        if [[ -n "$hostname" && "$hostname" != "Unknown" ]]; then
+            menu_items+=("$i" "$(printf "%-16s - %s" "$ip" "$hostname")")
+        else
+            menu_items+=("$i" "$(printf "%-16s" "$ip")")
+        fi
     done
 
     local dialog_selected=$(mktemp)
@@ -3973,7 +4121,7 @@ nfs_step1_select_ip() {
 
     cmd=(dialog --keep-tite --title "Step 1/$nfs_total_steps: Select $PRODUCT NFS Storage IP (VIP)"
          --ok-label "Next" --cancel-label "Back to Main" $extra_button
-         --menu "Choose $PRODUCT NFS Storage IP (VIP):" 15 60 8)
+         --menu "Choose $PRODUCT NFS Storage IP (VIP):" 15 80 8)
     options=("${menu_items[@]}")
     dialog_menu
     rm -f "$dialog_selected"
@@ -4536,6 +4684,9 @@ perform_clone_and_setup() {
 }
 
 add_nfs_storage_wizard() {
+    # Update connected storage servers information
+    update_connected_storage_servers
+    
     # Reset NFS wizard variables
     selected_nfs_ip=""
     selected_pool=""
@@ -7519,6 +7670,9 @@ main() {
     
     # Build storage to IP mapping table
     build_storage_ip_map
+    
+    # Update connected storage servers information
+    update_connected_storage_servers
     
     log_info "PVE Tools initialized"
     

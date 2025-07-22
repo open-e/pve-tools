@@ -25,7 +25,7 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.23"
+VERSION="0.24"
 RELEASE_DATE="2025-07-22"
 
 # Script mode flag
@@ -534,7 +534,6 @@ ENDSCRIPT
     wait
     
     log_info "NFS cleanup complete"
-    dialog --msgbox "Cleanup finished.\nReview logs in:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details." 8 70
 }
 
 # Check pve-config-backup daemon status on all cluster nodes
@@ -5656,18 +5655,8 @@ delete_cloned_nfs_storage_wizard() {
         fi
     done <<< "$cloned_storages_with_ips"
 
-    # Show selection dialog with warning
+    # Show selection dialog
     local dialog_selected=$(mktemp)
-    dialog --keep-tite \
-        --title "Delete Cloned NFS Storage" \
-        --ok-label "Continue" --cancel-label "Cancel" \
-        --msgbox "WARNING: This action will delete the cloned NFS storage in Proxmox VE, as well as the corresponding cloned dataset in $VENDOR $PRODUCT on which it is based.\n\nThis operation is irreversible!" 10 60
-
-    local exit_code=$?
-    if [[ $exit_code -ne 0 ]]; then
-        rm -f "$dialog_selected"
-        return 1
-    fi
 
     # Storage selection loop to handle back button
     while true; do
@@ -5744,7 +5733,7 @@ delete_cloned_nfs_storage_wizard() {
 
     # Final confirmation dialog - user must type "delete"
     local confirm_input=$(mktemp)
-    dialog --inputbox "To confirm deletion of storage\n'$selected_storage'\ntype 'delete':" 10 70 2> "$confirm_input"
+    dialog --inputbox "WARNING: This action will delete the cloned NFS storage '$selected_storage' in Proxmox VE, as well as the corresponding cloned dataset in $VENDOR $PRODUCT on which it is based.\n\nThis operation is irreversible!\n\nTo confirm deletion, type 'delete':" 18 80 2> "$confirm_input"
     exit_code=$?
     local confirmation=$(trimq "$(cat "$confirm_input")")
     rm -f "$confirm_input"
@@ -5761,9 +5750,11 @@ This may take a moment." 8 50
 
     # Execute deletion
     if delete_pve_NFS_storage "$selected_storage"; then
-        dialog --msgbox "Successfully deleted cloned NFS storage '$selected_storage'." 8 60
+        dialog --msgbox "Successfully deleted cloned NFS storage '$selected_storage'.\n\nCleanup finished.\nReview logs in:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details." 12 70
+        return 0
     else
         dialog --msgbox "Error: Failed to delete cloned NFS storage '$selected_storage'. Check the log file for details." 8 70
+        return 1
     fi
 }
 
@@ -6004,7 +5995,7 @@ vm_manager_confirm_critical_action() {
             ;;
     esac
     
-    local prompt_text="CRITICAL ACTION: $description\\n\\nEffects on $vm_count VM/CT(s):\\n$warning\\n\\nTo confirm this action, type '$action':"
+    local prompt_text="CRITICAL ACTION:\n$description\\n\\nEffects on $vm_count VM/CT(s):\\n$warning\\n\\nTo confirm this action, type '$action':"
     
     while true; do
         # Confirmation input with description

@@ -25,7 +25,7 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.24"
+VERSION="0.26"
 RELEASE_DATE="2025-07-22"
 
 # Script mode flag
@@ -408,6 +408,54 @@ upper() {
     echo "${1}" | tr '[:lower:]' '[:upper:]'
 }
 
+# Parse and format OODP Task Destinations
+parse_oodp_destinations() {
+    local destinations_raw="$1"
+    local formatted_output=""
+    
+    log_debug "parse_oodp_destinations: Input raw data: '$destinations_raw'"
+    
+    # Extract content between [ and ]
+    local json_content
+    json_content=$(echo "$destinations_raw" | sed 's/.*\[\(.*\)\].*/\1/')
+    log_debug "parse_oodp_destinations: Extracted JSON content: '$json_content'"
+    
+    # Extract dataset and plan using sed/grep
+    local dataset_full
+    local plan_content
+    
+    # Extract dataset value (everything between "dataset":" and "plan")
+    dataset_full=$(echo "$json_content" | sed 's/.*"dataset"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    log_debug "parse_oodp_destinations: Full dataset: '$dataset_full'"
+    
+    # Extract plan value (everything between "plan":" and the end)
+    plan_content=$(echo "$json_content" | sed 's/.*"plan"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    log_debug "parse_oodp_destinations: Plan content: '$plan_content'"
+    
+    # Parse dataset: split IP:port and dataset path
+    local ip_port
+    local dataset_path
+    
+    if [[ "$dataset_full" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+)/(.+)$ ]]; then
+        ip_port="${BASH_REMATCH[1]}"
+        dataset_path="${BASH_REMATCH[2]}"
+        log_debug "parse_oodp_destinations: IP:port='$ip_port', dataset path='$dataset_path'"
+    else
+        log_error "parse_oodp_destinations: Failed to parse dataset format: '$dataset_full'"
+        return 1
+    fi
+    
+    # Format output as requested
+    formatted_output="Task Destinations:\n"
+    formatted_output="${formatted_output}    DST:    ${dataset_path}    ${ip_port}\n"
+    formatted_output="${formatted_output}    plan:    ${plan_content}"
+    
+    log_debug "parse_oodp_destinations: Formatted output: '$formatted_output'"
+    echo -e "$formatted_output"
+    
+    return 0
+}
+
 # Cleanup inactive NFS storage on all cluster nodes
 cleanup_inactive_nfs_storage() {
     log_info "Starting NFS cleanup on all cluster nodes"
@@ -431,10 +479,10 @@ cleanup_inactive_nfs_storage() {
     log_info "Found cluster nodes: $(echo "$node_list" | wc -l) nodes"
     
     # Process each node
-    echo "$node_list" | while read -r node ip; do
+    while read -r node ip; do
         log_info "Processing cleanup for node: $node ($ip)"
         (
-        ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
+        ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" < /dev/null << 'ENDSCRIPT'
 log_info() { true; }
 log_debug() { true; }
 log_error() { true; }
@@ -529,7 +577,7 @@ echo "$pve_directories" | while read -r dir; do
 done
 ENDSCRIPT
         ) >> "$LOGS_DIR/pve-nfs-cleanup-$node.log" 2>&1 &
-    done
+    done < <(echo "$node_list")
 
     wait
     
@@ -557,7 +605,7 @@ check_pve_config_backup_status() {
     local nodes_ok=()
     
     # Check each node in parallel for faster execution
-    echo "$node_list" | while read -r node ip; do
+    while read -r node ip; do
         (
             log_info "Checking pve-config-backup status on node: $node ($ip)"
             
@@ -569,7 +617,7 @@ check_pve_config_backup_status() {
                 else
                     echo 'NOT_INSTALLED'
                 fi
-            " 2>/dev/null)
+            " < /dev/null 2>/dev/null)
             
             if [ "$status_output" = "NOT_INSTALLED" ]; then
                 echo "$node $ip" >> /tmp/nodes_need_install
@@ -585,7 +633,7 @@ check_pve_config_backup_status() {
                 log_info "Node $node: pve-config-backup status unknown, will reinstall"
             fi
         ) &
-    done
+    done < <(echo "$node_list")
     
     # Wait for all parallel checks to complete
     wait
@@ -646,12 +694,17 @@ install_pve_config_backup_on_nodes() {
         
         log_info "Installing pve-config-backup on node: $node ($ip)"
         
+        # Create GitHub URL with lowercase vendor
+        local vendor_lower github_url
+        vendor_lower=$(lower "$VENDOR")
+        github_url="https://raw.githubusercontent.com/${vendor_lower}/pve-config-backup/main/pve-config-backup"
+        
         nohup bash -c "
         (
-        timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@'$ip' 'bash -s' << 'ENDSCRIPT'
+        timeout 30 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@'$ip' \"bash -s\" << ENDSCRIPT
 # Install pve-config-backup
 cd /tmp
-wget https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup \
+wget '$github_url' \\
     -O /usr/local/sbin/pve-config-backup 2>/dev/null
 
 if [ \$? -eq 0 ] && [ -f /usr/local/sbin/pve-config-backup ]; then
@@ -771,20 +824,25 @@ ensure_pve_config_backup_running() {
         
         log_info "Ensuring pve-config-backup is ready on node: $node ($ip)"
         
+        # Create GitHub URL with lowercase vendor  
+        local vendor_lower github_url
+        vendor_lower=$(lower "$VENDOR")
+        github_url="https://raw.githubusercontent.com/${vendor_lower}/pve-config-backup/main/pve-config-backup"
+
         # Check and handle pve-config-backup on this node
         local result
-        result=$(ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
+        result=$(ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" < /dev/null << ENDSCRIPT
 # Check if pve-config-backup is installed
 if [ ! -f /usr/local/sbin/pve-config-backup ]; then
     # Install pve-config-backup
     cd /tmp
-    wget https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup \
+    wget '$github_url' \\
         -O /usr/local/sbin/pve-config-backup >/dev/null 2>&1
     
-    if [ $? -eq 0 ] && [ -f /usr/local/sbin/pve-config-backup ]; then
+    if [ \$? -eq 0 ] && [ -f /usr/local/sbin/pve-config-backup ]; then
         chmod +x /usr/local/sbin/pve-config-backup
         /usr/local/sbin/pve-config-backup install >/dev/null 2>&1
-        if [ $? -eq 0 ]; then
+        if [ \$? -eq 0 ]; then
             echo "INSTALLED"
             exit 0
         else
@@ -798,13 +856,13 @@ if [ ! -f /usr/local/sbin/pve-config-backup ]; then
 fi
 
 # Check daemon status
-status_output=$(/usr/local/sbin/pve-config-backup status 2>/dev/null)
-if echo "$status_output" | grep -q "Active: active (running)"; then
+status_output=\$(/usr/local/sbin/pve-config-backup status 2>/dev/null)
+if echo "\$status_output" | grep -q "Active: active (running)"; then
     echo "ALREADY_RUNNING"
-elif echo "$status_output" | grep -q "Active: inactive (dead)"; then
+elif echo "\$status_output" | grep -q "Active: inactive (dead)"; then
     # Start the daemon
     /usr/local/sbin/pve-config-backup start >/dev/null 2>&1
-    if [ $? -eq 0 ]; then
+    if [ \$? -eq 0 ]; then
         echo "STARTED"
     else
         echo "START_FAILED"
@@ -835,7 +893,7 @@ ENDSCRIPT
                 echo "FAILED" >> /tmp/node_results
                 ;;
         esac
-    done <<< "$node_list"
+    done < <(echo "$node_list")
     
     # Count results
     if [ -f /tmp/node_results ]; then
@@ -1849,7 +1907,7 @@ post_known_issues_fixes() {
         dialog --title "ZFS Import Scan Service Fix" \
                --yes-label "Confirm" \
                --no-label "Skip" \
-               --yesno "Proxmox Host Attempts to Import Open-E JovianDSS ZFS Pool After Reboot\n\nDescription:\nWhen running Open-E JovianDSS as a virtual machine on a Proxmox host, the host system may attempt to import a ZFS pool that belongs to the Open-E JovianDSS VM. This typically occurs if the Open-E JovianDSS VM accesses its data disks via PCI passthrough.\n\nObserved Behavior:\nAfter rebooting the Proxmox host, the system tries to auto-import the ZFS pool from the passthrough disks, which may lead to errors.\n\nWorkaround:\nDisable the zfs-import-scan.service on the Proxmox host to prevent automatic import of ZFS pools that belong to the Open-E JovianDSS VM.\n\nDo you want to apply this fix?" 22 80
+               --yesno "Proxmox VE Host Attempts to Import Open-E JovianDSS ZFS Pool After Reboot\n\nDescription:\nWhen running Open-E JovianDSS as a virtual machine on a Proxmox VE host, the host system may attempt to import a ZFS pool that belongs to the Open-E JovianDSS VM. This typically occurs if the Open-E JovianDSS VM accesses its data disks via PCI passthrough.\n\nObserved Behavior:\nAfter rebooting the Proxmox VE host, the system tries to auto-import the ZFS pool from the passthrough disks, which may lead to errors.\n\nWorkaround:\nDisable the zfs-import-scan.service on the Proxmox VE host to prevent automatic import of ZFS pools that belong to the Open-E JovianDSS VM.\n\nDo you want to apply this fix?" 22 80
         
         if [ $? -eq 0 ]; then
             if fix_zfs_import_scan_service; then
@@ -1916,35 +1974,112 @@ post_known_issues_fixes() {
 
 # AUTO-UPDATE FUNCTIONS
 
+# Ensure jq is installed for JSON parsing
+ensure_jq_installed() {
+    if ! command -v jq >/dev/null 2>&1; then
+        log_info "Installing jq for JSON parsing..."
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update >/dev/null 2>&1 && apt-get install -y jq >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y jq >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y jq >/dev/null 2>&1
+        else
+            log_error "Could not install jq: package manager not supported"
+            return 1
+        fi
+        
+        if command -v jq >/dev/null 2>&1; then
+            log_info "jq installed successfully"
+        else
+            log_error "Failed to install jq"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# Get commit information from GitHub API
+get_commit_info() {
+    local commit_message=""
+    local vendor_lower
+    local api_url
+    
+    # Convert VENDOR to lowercase for URL
+    vendor_lower=$(lower "$VENDOR")
+    api_url="https://api.github.com/repos/${vendor_lower}/pve-tools/commits/main"
+    
+    log_debug "Getting commit info from: $api_url"
+    
+    # Try to get commit info from GitHub API
+    if command -v jq >/dev/null 2>&1; then
+        log_debug "Using jq for JSON parsing"
+        # Use jq if available
+        commit_message=$(curl -s "$api_url" 2>/dev/null | jq -r '.commit.message // empty' 2>/dev/null)
+        log_debug "Commit message via jq: '$commit_message'"
+    else
+        log_debug "Using grep/sed fallback for JSON parsing"
+        # Fallback to grep/sed parsing
+        commit_message=$(curl -s "$api_url" 2>/dev/null | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
+        log_debug "Commit message via grep/sed: '$commit_message'"
+    fi
+    
+    if [ -n "$commit_message" ] && [ "$commit_message" != "null" ] && [ "$commit_message" != "empty" ]; then
+        # Truncate very long commit messages and clean up formatting
+        local formatted_message
+        formatted_message=$(echo "$commit_message" | head -c 200 | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        log_debug "Formatted commit message: '$formatted_message'"
+        echo "$formatted_message"
+    else
+        log_error "Failed to retrieve commit information from GitHub API: $api_url"
+        log_debug "Raw commit_message value: '$commit_message'"
+        return 1
+    fi
+}
+
 # Check for script updates from GitHub
 check_for_updates() {
     local current_version="$VERSION"
     local remote_version
+    local vendor_lower
+    local github_url
     
     log_info "Checking for updates - current version: $current_version"
     
+    # Convert VENDOR to lowercase for URL
+    vendor_lower=$(lower "$VENDOR")
+    github_url="https://raw.githubusercontent.com/${vendor_lower}/pve-tools/main/pve-tools"
+    
+    log_debug "Fetching remote version from: $github_url"
+    
     # Get remote version from GitHub
-    remote_version=$(wget -qO- https://raw.githubusercontent.com/open-e/pve-tools/main/pve-tools | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+    remote_version=$(wget -qO- "$github_url" | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
     
     if [ -z "$remote_version" ]; then
-        log_error "Failed to retrieve remote version"
+        log_error "Failed to retrieve remote version from: $github_url"
+        log_debug "wget command failed or no VERSION found in remote script"
         return 1
     fi
     
     log_info "Remote version: $remote_version"
+    log_debug "Version comparison: current='$current_version' vs remote='$remote_version'"
     
     # Compare versions (simple string comparison)
     if [ "$remote_version" != "$current_version" ]; then
+        log_debug "Versions are different, checking if remote is newer"
         # Version is different, check if it's newer
         if [ "$remote_version" \> "$current_version" ]; then
             log_info "New version available: $remote_version"
+            log_debug "Update available: remote version '$remote_version' > current version '$current_version'"
             return 0  # Update available
         else
             log_info "Current version is newer or equal"
+            log_debug "No update needed: remote version '$remote_version' <= current version '$current_version'"
             return 1  # No update needed
         fi
     else
         log_info "Already running latest version"
+        log_debug "Versions are identical: '$current_version'"
         return 1  # No update needed
     fi
 }
@@ -1953,24 +2088,39 @@ check_for_updates() {
 update_script() {
     local current_version="$VERSION"
     local script_path
+    local vendor_lower
+    local github_url
     
     # Get the path of the currently running script
     script_path=$(readlink -f "$0")
     
     log_info "Starting script update from $script_path"
+    log_debug "Script path resolved to: $script_path"
+    
+    # Convert VENDOR to lowercase for URL
+    vendor_lower=$(lower "$VENDOR")
+    github_url="https://raw.githubusercontent.com/${vendor_lower}/pve-tools/main/pve-tools"
+    
+    log_debug "Download URL: $github_url"
     
     # Create backup of current script
-    if ! cp "$script_path" "${script_path}.ver.${current_version}" >> "$LOG_FILE" 2>&1; then
-        log_error "Failed to create backup of current script"
+    local backup_path="${script_path}.ver.${current_version}"
+    log_debug "Creating backup at: $backup_path"
+    
+    if ! cp "$script_path" "$backup_path" >> "$LOG_FILE" 2>&1; then
+        log_error "Failed to create backup of current script at: $backup_path"
+        log_debug "cp command failed, check permissions and disk space"
         dialog --msgbox "Error: Failed to create backup of current script" 8 50
         return 1
     fi
     
-    log_info "Created backup: ${script_path}.ver.${current_version}"
+    log_info "Created backup: $backup_path"
     
     # Download new version
-    if ! wget https://raw.githubusercontent.com/open-e/pve-tools/main/pve-tools -O "$script_path" >> "$LOG_FILE" 2>&1; then
-        log_error "Failed to download new version"
+    log_debug "Downloading new version from: $github_url"
+    if ! wget "$github_url" -O "$script_path" >> "$LOG_FILE" 2>&1; then
+        log_error "Failed to download new version from: $github_url"
+        log_debug "wget command failed, check network connectivity and URL accessibility"
         dialog --msgbox "Error: Failed to download new version\nRestoring backup..." 8 50
         
         # Restore backup on failure
@@ -1992,14 +2142,46 @@ update_script() {
 # Prompt user for update
 prompt_for_update() {
     local remote_version
+    local commit_info
+    local update_message
+    
+    # Convert VENDOR to lowercase for URL
+    local vendor_lower
+    local github_url
+    vendor_lower=$(lower "$VENDOR")
+    github_url="https://raw.githubusercontent.com/${vendor_lower}/pve-tools/main/pve-tools"
+    
+    log_debug "Fetching remote version for update prompt from: $github_url"
     
     # Get remote version for display
-    remote_version=$(wget -qO- https://raw.githubusercontent.com/open-e/pve-tools/main/pve-tools | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+    remote_version=$(wget -qO- "$github_url" | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
     
+    log_debug "Retrieved remote version for prompt: '$remote_version'"
+    
+    # Get commit description
+    log_debug "Fetching commit description for update prompt"
+    commit_info=$(get_commit_info 2>/dev/null)
+    
+    if [ -n "$commit_info" ]; then
+        log_debug "Successfully retrieved commit info: '$commit_info'"
+    else
+        log_debug "No commit info available, will show version-only prompt"
+    fi
+    
+    # Build update message with or without commit info
+    if [ -n "$commit_info" ]; then
+        update_message="A new version of pve-tools is available!\n\nCurrent version: $VERSION\nNew version: $remote_version\n\nWhat's new:\n$commit_info\n\nWould you like to update now?"
+        log_debug "Built update message with commit info"
+    else
+        update_message="A new version of pve-tools is available!\n\nCurrent version: $VERSION\nNew version: $remote_version\n\nWould you like to update now?"
+        log_debug "Built update message without commit info"
+    fi
+    
+    log_debug "Showing update dialog to user"
     dialog --title "Update Available" \
            --yes-label "Update" \
            --no-label "Continue" \
-           --yesno "A new version of pve-tools is available!\n\nCurrent version: $VERSION\nNew version: $remote_version\n\nWould you like to update now?" 12 60
+           --yesno "$update_message" 16 80
     
     case $? in
         0)  # Yes - update
@@ -2038,15 +2220,25 @@ check_pve_config_backup_updates() {
     
     log_info "Current pve-config-backup version: $current_version"
     
+    # Convert VENDOR to lowercase for URL
+    local vendor_lower
+    local github_url
+    vendor_lower=$(lower "$VENDOR")
+    github_url="https://raw.githubusercontent.com/${vendor_lower}/pve-config-backup/main/pve-config-backup"
+    
+    log_debug "Fetching remote pve-config-backup version from: $github_url"
+    
     # Get remote version from GitHub
-    remote_version=$(wget -qO- https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+    remote_version=$(wget -qO- "$github_url" | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
     
     if [ -z "$remote_version" ]; then
-        log_error "Failed to retrieve remote pve-config-backup version"
+        log_error "Failed to retrieve remote pve-config-backup version from: $github_url"
+        log_debug "wget command failed or no VERSION found in remote pve-config-backup script"
         return 1
     fi
     
     log_info "Remote pve-config-backup version: $remote_version"
+    log_debug "pve-config-backup version comparison: current='$current_version' vs remote='$remote_version'"
     
     # Compare versions (simple string comparison)
     if [ "$remote_version" != "$current_version" ]; then
@@ -2067,18 +2259,28 @@ check_pve_config_backup_updates() {
 # Update pve-config-backup on all cluster nodes
 update_pve_config_backup() {
     local remote_version
+    local vendor_lower
+    local github_url
     
     log_info "Starting pve-config-backup update on all cluster nodes"
     
+    # Convert VENDOR to lowercase for URL
+    vendor_lower=$(lower "$VENDOR")
+    github_url="https://raw.githubusercontent.com/${vendor_lower}/pve-config-backup/main/pve-config-backup"
+    
+    log_debug "Fetching pve-config-backup for update from: $github_url"
+    
     # Get remote version for logging
-    remote_version=$(wget -qO- https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+    remote_version=$(wget -qO- "$github_url" | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
     
     if [ -z "$remote_version" ]; then
-        log_error "Failed to retrieve remote pve-config-backup version for update"
+        log_error "Failed to retrieve remote pve-config-backup version for update from: $github_url"
+        log_debug "wget command failed or no VERSION found in remote pve-config-backup script"
         return 1
     fi
     
     log_info "Updating to pve-config-backup version: $remote_version"
+    log_debug "pve-config-backup update URL: $github_url"
     
     # Get HA nodes list (fallback to all nodes if no HA group exists)
     local ha_nodes_list
@@ -2131,9 +2333,17 @@ update_pve_config_backup() {
         
         log_info "Updating pve-config-backup on node: $node ($ip)"
         
+        # Create GitHub URL with lowercase vendor
+        local vendor_lower github_url
+        vendor_lower=$(lower "$VENDOR")
+        github_url="https://raw.githubusercontent.com/${vendor_lower}/pve-config-backup/main/pve-config-backup"
+
         # Update pve-config-backup on this node
+        log_debug "SSH connecting to $node ($ip) for pve-config-backup update"
+        log_debug "Using update URL: $github_url"
         local result
-        result=$(ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << 'ENDSCRIPT'
+        result=$(ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" < /dev/null << ENDSCRIPT
+
 # Stop the daemon before update
 if [ -f /usr/local/sbin/pve-config-backup ]; then
     /usr/local/sbin/pve-config-backup stop >/dev/null 2>&1
@@ -2141,15 +2351,15 @@ fi
 
 # Create backup of current version
 if [ -f /usr/local/sbin/pve-config-backup ]; then
-    current_ver=$(grep 'VERSION=' /usr/local/sbin/pve-config-backup | cut -d= -f2 | tr -d '"' | head -1)
-    if [ -n "$current_ver" ]; then
-        cp /usr/local/sbin/pve-config-backup "/usr/local/sbin/pve-config-backup.ver.${current_ver}" 2>/dev/null
+    current_ver=\$(grep 'VERSION=' /usr/local/sbin/pve-config-backup | cut -d= -f2 | tr -d '\"' | head -1)
+    if [ -n \"\$current_ver\" ]; then
+        cp /usr/local/sbin/pve-config-backup \"/usr/local/sbin/pve-config-backup.ver.\${current_ver}\" 2>/dev/null
     fi
 fi
 
 # Download new version
 cd /tmp
-wget https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup \
+wget '$github_url' \
     -O /usr/local/sbin/pve-config-backup >/dev/null 2>&1
 
 if [ $? -eq 0 ] && [ -f /usr/local/sbin/pve-config-backup ]; then
@@ -2182,7 +2392,7 @@ ENDSCRIPT
                 ((failed++))
                 ;;
         esac
-    done <<< "$node_list"
+    done < <(echo "$node_list")
     
     log_info "pve-config-backup update complete - Total: $total_nodes, Updated: $updated, Failed: $failed"
     
@@ -2203,9 +2413,15 @@ check_and_update_pve_config_backup() {
     
     case $check_result in
         0)  # Update available
-            local current_version remote_version
+            local current_version remote_version vendor_lower github_url
             current_version=$(grep 'VERSION=' /usr/local/sbin/pve-config-backup | cut -d= -f2 | tr -d '"' | head -1)
-            remote_version=$(wget -qO- https://raw.githubusercontent.com/open-e/pve-config-backup/main/pve-config-backup | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+            
+            vendor_lower=$(lower "$VENDOR")
+            github_url="https://raw.githubusercontent.com/${vendor_lower}/pve-config-backup/main/pve-config-backup"
+            
+            log_debug "Fetching remote pve-config-backup version for dialog from: $github_url"
+            remote_version=$(wget -qO- "$github_url" | grep '^VERSION=' | cut -d= -f2 | tr -d '"')
+            log_debug "Dialog will show: current='$current_version' vs remote='$remote_version'"
             
             dialog --title "pve-config-backup Update Available" \
                    --yes-label "Update" \
@@ -2258,6 +2474,585 @@ check_background_status() {
     fi
 }
 
+# System checkup summary
+checkup_summary() {
+    log_info "Starting system checkup summary"
+    
+    # Status display variables - customize these to change status appearance
+    local PASSED='PASSED'
+    local FAILED='FAILED !'
+    local STOPPED='STOPPED'
+    local MISSING='MISSING'
+    local DISABLED='DISABLED'
+    
+    local summary=""
+    local temp_file=$(mktemp)
+    
+    # Header
+    summary="SYSTEM CHECKUP SUMMARY\n"
+    summary="${summary}========================\n\n"
+    
+    # 1. VENDOR PRODUCT On- & Off-site Data Protection tasks status
+    summary="${summary}1. $VENDOR $PRODUCT On- & Off-site Data Protection tasks status:\n"
+    
+    # Source OODP checkup functions
+    if [[ -f "./oodp-checkup.sh" ]]; then
+        source "./oodp-checkup.sh"
+        log_debug "checkup_summary: Sourced oodp-checkup.sh successfully"
+    elif [[ -f "/usr/local/sbin/oodp-checkup.sh" ]]; then
+        source "/usr/local/sbin/oodp-checkup.sh"
+        log_debug "checkup_summary: Sourced /usr/local/sbin/oodp-checkup.sh successfully"
+    else
+        log_error "checkup_summary: oodp-checkup.sh not found"
+        summary="${summary}   ERROR: OODP checkup script not found\n"
+        summary="${summary}\n"
+    fi
+    
+    # Perform OODP checkup if functions are available
+    if declare -f perform_oodp_checkup >/dev/null; then
+        local oodp_temp_file=$(mktemp)
+        
+        # Ensure storage IP mapping is available
+        if [[ ${#storage_ip_map[@]} -eq 0 ]]; then
+            log_debug "checkup_summary: Building storage IP map for OODP checkup"
+            build_storage_ip_map
+        fi
+        
+        # Perform OODP checkup
+        perform_oodp_checkup "$oodp_temp_file"
+        
+        if [[ -f "$oodp_temp_file" ]] && [[ -s "$oodp_temp_file" ]]; then
+            summary="${summary}$(cat "$oodp_temp_file")\n"
+            log_debug "checkup_summary: Added OODP checkup results to summary"
+        else
+            summary="${summary}   No OODP checkup results available\n"
+            summary="${summary}\n"
+            log_debug "checkup_summary: No OODP checkup results available"
+        fi
+        
+        rm -f "$oodp_temp_file"
+    else
+        summary="${summary}   ERROR: OODP checkup functions not available\n"
+        summary="${summary}\n"
+        log_error "checkup_summary: perform_oodp_checkup function not found"
+    fi
+    
+    summary="${summary}\n"
+    
+    # 2. pve-config-backup daemon STATUS
+    summary="${summary}2. pve-config-backup Daemon Status:\n"
+    
+    # Check if ha-nodes group exists
+    local ha_nodes_list
+    ha_nodes_list=$(get_ha_nodes)
+    log_debug "HA nodes list: '$ha_nodes_list'"
+    
+    # Check if ha-nodes group actually exists using get_groups function
+    local ha_groups_exist
+    ha_groups_exist=$(get_groups | grep -c "^ha-nodes$")
+    log_debug "HA groups exist count: $ha_groups_exist"
+    
+    if [ "$ha_groups_exist" -gt 0 ]; then
+        summary="${summary}   The ha-nodes group is present, checkup is done for group hosts\n"
+        log_info "HA-nodes group exists, checking only HA nodes: $(echo "$ha_nodes_list" | tr '\n' ',')"
+    else
+        summary="${summary}   The ha-nodes group is not defined, checkup is done for all PVE hosts\n"
+        log_info "HA-nodes group does not exist, checking all nodes"
+    fi
+    
+    # Get node list from corosync configuration
+    local node_list
+    node_list=$(awk '$1 == "name:" {node=$2} $1 == "ring0_addr:" {print node, $2}' /etc/pve/corosync.conf)
+    log_debug "Node list from corosync.conf: '$node_list'"
+    local node_list_line_count
+    node_list_line_count=$(echo "$node_list" | wc -l)
+    log_debug "Node list has $node_list_line_count lines"
+    log_info "TESTING: About to start processing $node_list_line_count nodes"
+    
+    # Use clustered location for collecting SSH results
+    local cluster_temp_file="/etc/pve/.pve-tools-status-$$"
+    > "$cluster_temp_file"  # Initialize empty file
+    
+    log_debug "Starting to process node list"
+    log_info "TESTING: Entering while loop now"
+    local node_count=0
+    while read -r node ip; do
+        node_count=$((node_count + 1))
+        log_info "TESTING: Loop iteration $node_count: Processing node: '$node' with IP: '$ip'"
+        log_debug "Loop iteration $node_count: Processing node: '$node' with IP: '$ip'"
+        
+        # Debug: Check if we have empty values
+        if [ -z "$node" ]; then
+            log_debug "Empty node name detected, skipping"
+            continue
+        fi
+        if [ -z "$ip" ]; then
+            log_debug "Empty IP detected for node '$node', skipping"
+            continue
+        fi
+        
+        # Check if node should be checked (if ha-nodes group exists, only check those)
+        if [ "$ha_groups_exist" -gt 0 ]; then
+            log_debug "Checking if node '$node' is in ha-nodes list: '$ha_nodes_list'"
+            local grep_result
+            grep_result=$(echo "$ha_nodes_list" | grep "$node")
+            log_debug "Grep result for '$node': '$grep_result'"
+            if ! echo "$ha_nodes_list" | grep -q "^${node}$"; then
+                log_debug "Skipping node '$node' - not in ha-nodes group"
+                continue
+            else
+                log_debug "Node '$node' found in ha-nodes group - will check"
+            fi
+        fi
+        
+        log_info "Checking pve-config-backup status on node: $node ($ip)"
+        
+        local status_output
+        status_output=$(timeout 5 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 root@"$ip" "
+            if [ -f /usr/local/sbin/pve-config-backup ]; then
+                if pve-config-backup status >/dev/null 2>&1; then
+                    echo 'active (running)'
+                else
+                    echo 'inactive (dead)'
+                fi
+            else
+                echo 'not-installed'
+            fi" < /dev/null 2>/dev/null)
+        
+        if [ -z "$status_output" ]; then
+            status_output="connection failed"
+            log_debug "SSH connection failed for node: $node ($ip)"
+        else
+            log_debug "SSH status result for $node: '$status_output'"
+        fi
+        
+        # Determine overall status
+        local node_status="$PASSED"
+        if [ "$status_output" != "active (running)" ]; then
+            node_status="$STOPPED"
+        fi
+        
+        # Format with right-aligned status
+        local info_text="   ${node}:    ${status_output}"
+        local text_length=${#info_text}
+        local status_length=${#node_status}
+        local total_width=94
+        local padding=$((total_width - text_length - status_length))
+        
+        if [ $padding -lt 1 ]; then
+            padding=1
+        fi
+        
+        printf "%s%*s%s\n" "$info_text" $padding "" "$node_status" >> "$cluster_temp_file"
+        log_debug "Added to temp file: '$info_text' with status '$node_status'"
+        log_info "Node $node: pve-config-backup is $(echo "$status_output" | sed 's/active (running)/running/; s/inactive (dead)/not running/; s/not-installed/not installed/')"
+    done < <(echo "$node_list")
+    
+    log_info "TESTING: Exited while loop. Total iterations: $node_count"
+    log_debug "Finished processing all nodes. Total loop iterations: $node_count"
+    log_debug "Finished processing all nodes. Temp file contents:"
+    if [ -f "$cluster_temp_file" ]; then
+        log_debug "$(cat "$cluster_temp_file")"
+    else
+        log_debug "Temp file does not exist!"
+    fi
+    
+    if [ -f "$cluster_temp_file" ]; then
+        summary="${summary}$(cat "$cluster_temp_file")\n"
+        rm -f "$cluster_temp_file"
+    fi
+    
+    # Also clean up the original temp_file if it exists
+    if [ -f "$temp_file" ]; then
+        rm -f "$temp_file"
+    fi
+    
+    summary="${summary}\n"
+    
+    # 2. ha-nodes group STATUS
+    summary="${summary}3. HA Nodes Group Status:\n"
+    
+    # HA nodes group status
+    local ha_group_status="$PASSED"
+    local ha_group_info="ha-nodes group         PRESENT"
+    if [ "$ha_groups_exist" -eq 0 ]; then
+        ha_group_status="$MISSING"
+        ha_group_info="ha-nodes group         not defined yet"
+    fi
+    
+    # Format ha-nodes group line with right-aligned status
+    local info_text="   ${ha_group_info}"
+    local text_length=${#info_text}
+    local status_length=${#ha_group_status}
+    local total_width=94
+    local padding=$((total_width - text_length - status_length))
+    
+    if [ $padding -lt 1 ]; then
+        padding=1
+    fi
+    
+    printf "%s%*s%s\n" "$info_text" $padding "" "$ha_group_status" >> "$temp_file"
+    
+    if [ -f "$temp_file" ]; then
+        summary="${summary}$(cat "$temp_file")\n"
+        rm -f "$temp_file"
+    fi
+    
+    summary="${summary}   Proxmox VE HA Resources:\n"
+    
+    # Create temp file for HA resources
+    local ha_temp_file=$(mktemp)
+    
+    # List HA resources - try file first, then ha-manager command
+    local ha_resource_count=0
+    
+    # Method 1: Try reading from resources.cfg file
+    if [ -f /etc/pve/ha/resources.cfg ] && [ -r /etc/pve/ha/resources.cfg ]; then
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^(vm|ct):[[:space:]]*([0-9]+) ]]; then
+                local vm_type="${BASH_REMATCH[1]}"
+                local vmid="${BASH_REMATCH[2]}"
+                
+                local vm_info
+                vm_info=$(vm_manager_get_vm_type_status_node "$vmid" 2>/dev/null)
+                
+                local resource_status="$PASSED"
+                local resource_info=""
+                
+                if [ -n "$vm_info" ]; then
+                    IFS='|' read -r vm_info_type vm_info_status vm_info_node <<< "$vm_info"
+                    resource_info="   ${vm_type}:${vmid}  ${vm_info_type}|${vm_info_status}|${vm_info_node}"
+                else
+                    resource_info="   ${vm_type}:${vmid}  missing"
+                    resource_status="$MISSING"
+                fi
+                
+                # Format HA resource line with right-aligned status
+                local res_text_length=${#resource_info}
+                local res_status_length=${#resource_status}
+                local res_padding=$((total_width - res_text_length - res_status_length))
+                
+                if [ $res_padding -lt 1 ]; then
+                    res_padding=1
+                fi
+                
+                printf "%s%*s%s\n" "$resource_info" $res_padding "" "$resource_status" >> "$ha_temp_file"
+                ha_resource_count=$((ha_resource_count + 1))
+            fi
+        done < /etc/pve/ha/resources.cfg
+        
+    # Method 2: Fallback to ha-manager command if file not accessible
+    elif command -v ha-manager >/dev/null 2>&1; then
+        local ha_manager_output
+        ha_manager_output=$(ha-manager config 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$ha_manager_output" ]; then
+            # Parse resource lines from ha-manager config output
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^(vm|ct):([0-9]+)$ ]]; then
+                    local vm_type="${BASH_REMATCH[1]}"
+                    local vmid="${BASH_REMATCH[2]}"
+                    
+                    local vm_info
+                    vm_info=$(vm_manager_get_vm_type_status_node "$vmid" 2>/dev/null)
+                    
+                    local resource_status="$PASSED"
+                    local resource_info=""
+                    
+                    if [ -n "$vm_info" ]; then
+                        IFS='|' read -r vm_info_type vm_info_status vm_info_node <<< "$vm_info"
+                        resource_info="   ${vm_type}:${vmid}  ${vm_info_type}|${vm_info_status}|${vm_info_node}"
+                    else
+                        resource_info="   ${vm_type}:${vmid}  missing"
+                        resource_status="$MISSING"
+                    fi
+                    
+                    # Format HA resource line with right-aligned status
+                    local res_text_length=${#resource_info}
+                    local res_status_length=${#resource_status}
+                    local res_padding=$((total_width - res_text_length - res_status_length))
+                    
+                    if [ $res_padding -lt 1 ]; then
+                        res_padding=1
+                    fi
+                    
+                    printf "%s%*s%s\n" "$resource_info" $res_padding "" "$resource_status" >> "$ha_temp_file"
+                    ha_resource_count=$((ha_resource_count + 1))
+                fi
+            done <<< "$ha_manager_output"
+        fi
+    fi
+    
+    # Show appropriate message based on results
+    if [ $ha_resource_count -eq 0 ]; then
+        if [ -f /etc/pve/ha/resources.cfg ] || command -v ha-manager >/dev/null 2>&1; then
+            printf "%s%*s%s\n" "   No HA resources configured" $((total_width - 30 - 4)) "" "NONE" >> "$ha_temp_file"
+        else
+            printf "%s%*s%s\n" "   HA not configured or not available" $((total_width - 36 - 4)) "" "N/A" >> "$ha_temp_file"
+        fi
+    fi
+    
+    if [ -f "$ha_temp_file" ]; then
+        summary="${summary}$(cat "$ha_temp_file")\n"
+        rm -f "$ha_temp_file"
+    fi
+    
+    summary="${summary}\n"
+    
+    # 3. $PRODUCT VM Start-at-boot STATUS
+    summary="${summary}4. $PRODUCT VM Start-at-boot Status:\n"
+    
+    log_info "DEBUG: Starting point 3 checkup - $PRODUCT VM Start-at-boot Status"
+    
+    # Get storage VMs with their start-at-boot settings using existing function
+    local storage_vms
+    storage_vms=$(get_storage_vms)
+    
+    log_info "DEBUG: get_storage_vms output: $storage_vms"
+    log_info "DEBUG: PRODUCT variable value: '$PRODUCT'"
+    
+    if [ -n "$storage_vms" ]; then
+        log_info "DEBUG: storage_vms is not empty, processing entries"
+        local vm_count=0
+        local matched_count=0
+        
+        echo "$storage_vms" | while IFS='|' read -r vmid vm_name vm_type start_at_boot order up down conf_file; do
+            vm_count=$((vm_count + 1))
+            log_info "DEBUG: Processing VM #$vm_count: vmid='$vmid' vm_name='$vm_name' vm_type='$vm_type' start_at_boot='$start_at_boot' order='$order' up='$up' down='$down'"
+            
+            # Case-insensitive pattern matching
+            if [[ "${vm_name,,}" =~ ${PRODUCT,,} ]]; then
+                matched_count=$((matched_count + 1))
+                log_info "DEBUG: VM '$vm_name' matches PRODUCT pattern '$PRODUCT' (match #$matched_count)"
+                
+                local vm_status="$PASSED"
+                
+                # Set defaults for missing values
+                [ -z "$up" ] && up="300"
+                [ -z "$down" ] && down="180"
+                
+                log_info "DEBUG: Final values - order='$order' up='$up' down='$down'"
+                
+                # Determine overall status - PASSED only if all settings match factory defaults
+                if [ "$start_at_boot" != "yes" ]; then
+                    vm_status="$DISABLED"
+                    log_info "DEBUG: VM status set to DISABLED because start_at_boot='$start_at_boot' != 'yes'"
+                elif [ -z "$order" ] || [ "$order" != "$storage_vm_start_shutdown_order" ] || [ "$up" != "$storage_vm_startup_deleay" ] || [ "$down" != "$storage_vm_shutdown_timeout" ]; then
+                    vm_status="$FAILED"
+                    log_info "DEBUG: VM status set to FAILED because settings don't match factory defaults - order='$order' (expected '$storage_vm_start_shutdown_order'), up='$up' (expected '$storage_vm_startup_deleay'), down='$down' (expected '$storage_vm_shutdown_timeout')"
+                else
+                    vm_status="$PASSED"
+                    log_info "DEBUG: VM status set to PASSED because all settings match factory defaults"
+                fi
+                
+                # Format with right-aligned status - use the VM header line for alignment
+                local header_line="   ${vm_type}:${vmid} ${vm_name}"
+                local header_length=${#header_line}
+                local status_length=${#vm_status}
+                local total_width=94
+                local padding=$((total_width - header_length - status_length))
+                
+                if [ $padding -lt 1 ]; then
+                    padding=1
+                fi
+                
+                log_info "DEBUG: Writing VM data to temp file: $temp_file"
+                
+                # Write the header with status, then the details
+                printf "%s%*s%s\n" "$header_line" $padding "" "$vm_status" >> "$temp_file"
+                printf "     Start-at-boot: %s\n" "$start_at_boot" >> "$temp_file"
+                printf "     Start/shutdown order: %s\n" "${order:-any}" >> "$temp_file"
+                printf "     Startup delay: %s seconds\n" "$up" >> "$temp_file"
+                printf "     Shutdown timeout: %s seconds\n" "$down" >> "$temp_file"
+                printf "\n" >> "$temp_file"
+            else
+                log_info "DEBUG: VM '$vm_name' does NOT match PRODUCT pattern '$PRODUCT'"
+            fi
+        done
+        
+        log_info "DEBUG: Processed $vm_count total VMs, $matched_count matched PRODUCT pattern"
+        
+        if [ -f "$temp_file" ]; then
+            local temp_content
+            temp_content=$(cat "$temp_file")
+            log_info "DEBUG: temp_file exists and contains: $temp_content"
+            summary="${summary}$(cat "$temp_file")\n"
+            rm -f "$temp_file"
+        else
+            log_info "DEBUG: temp_file does not exist or is empty"
+            summary="${summary}   No $PRODUCT VMs found or no startup configuration data available\n"
+        fi
+    else
+        log_info "DEBUG: storage_vms is empty - no VM data returned from get_storage_vms"
+        summary="${summary}   No VM data available from get_storage_vms function\n"
+    fi
+    
+    log_info "DEBUG: Point 3 checkup completed"
+    
+    summary="${summary}\n"
+    
+    # 4. NFS tuning STATUS
+    summary="${summary}5. NFS Tuning Status:\n"
+    
+    # Get NFS storages using existing function
+    local nfs_storages
+    nfs_storages=$(get_nfs_storages)
+    local nfs_overall_status="$PASSED"
+    
+    if [ -n "$nfs_storages" ]; then
+        echo "$nfs_storages" | while read -r storage; do
+            [ -z "$storage" ] && continue
+            
+            # Get current configuration using existing functions
+            local config_nconnect config_sync
+            config_nconnect=$(get_current_nconnect "$storage")
+            config_sync=$(get_current_sync "$storage")
+            
+            # Set defaults if empty
+            [ -z "$config_nconnect" ] && config_nconnect="1"
+            [ -z "$config_sync" ] && config_sync="sync"
+            
+            # Determine status for this storage
+            local storage_status="$PASSED"
+            local details=""
+            
+            # Check if nconnect is in valid range (1-16)
+            if [ "$config_nconnect" != "default" ] && [ "$config_nconnect" -gt 16 -o "$config_nconnect" -lt 1 ] 2>/dev/null; then
+                storage_status="$FAILED"
+                details="${details}nconnect out of range(1-16) "
+            fi
+            
+            # Check if sync option is async
+            if [ "$config_sync" = "async" ]; then
+                storage_status="$FAILED"
+                details="${details}async option "
+            fi
+            
+            # Format the line with right-aligned status (total width ~94 chars for 100-wide dialog)
+            local info_text="   ${storage}:  nconnect=${config_nconnect}  sync=${config_sync}"
+            if [ -n "$details" ]; then
+                info_text="${info_text} (${details})"
+            fi
+            
+            # Calculate padding for right alignment
+            local text_length=${#info_text}
+            local status_length=${#storage_status}
+            local total_width=94
+            local padding=$((total_width - text_length - status_length))
+            
+            if [ $padding -lt 1 ]; then
+                padding=1
+            fi
+            
+            printf "%s%*s%s\n" "$info_text" $padding "" "$storage_status" >> "$temp_file"
+        done
+        
+        if [ -f "$temp_file" ]; then
+            summary="${summary}$(cat "$temp_file")\n"
+            rm -f "$temp_file"
+        fi
+    fi
+    
+    summary="${summary}\n"
+    
+    # 5. Proxmox VE : ZFS import scan service STATUS
+    summary="${summary}6. Proxmox VE ZFS Import Scan Service Status:\n"
+    
+    local zfs_status="$PASSED"
+    local zfs_info="   disabled (as expected)"
+    
+    if check_zfs_import_scan_service; then
+        zfs_status="$FAILED"
+        zfs_info="   enabled (needs setup)"
+    fi
+    
+    # Format with right-aligned status
+    local info_text_length=${#zfs_info}
+    local status_length=${#zfs_status}
+    local total_width=94
+    local padding=$((total_width - info_text_length - status_length))
+    
+    if [ $padding -lt 1 ]; then
+        padding=1
+    fi
+    
+    printf "%s%*s%s\n" "$zfs_info" $padding "" "$zfs_status" >> "$temp_file"
+    
+    if [ -f "$temp_file" ]; then
+        summary="${summary}$(cat "$temp_file")\n"
+        rm -f "$temp_file"
+    fi
+    
+    summary="${summary}\n"
+    
+    # 6. Proxmox VE HA policy
+    summary="${summary}7. Proxmox VE HA Policy:\n"
+    
+    local ha_policy_status="$PASSED"
+    local ha_policy_info="   set to Migrate"
+    
+    if check_ha_policy_shutdown; then
+        ha_policy_status="$FAILED"
+        ha_policy_info="   not set to Migrate yet"
+    fi
+    
+    # Format with right-aligned status
+    local info_text_length=${#ha_policy_info}
+    local status_length=${#ha_policy_status}
+    local total_width=94
+    local padding=$((total_width - info_text_length - status_length))
+    
+    if [ $padding -lt 1 ]; then
+        padding=1
+    fi
+    
+    printf "%s%*s%s\n" "$ha_policy_info" $padding "" "$ha_policy_status" >> "$temp_file"
+    
+    if [ -f "$temp_file" ]; then
+        summary="${summary}$(cat "$temp_file")\n"
+        rm -f "$temp_file"
+    fi
+    
+    summary="${summary}\n"
+    
+    # 7. Proxmox VE Hardware watchdog
+    summary="${summary}8. Proxmox VE Hardware Watchdog:\n"
+    
+    local watchdog_status="$PASSED"
+    local watchdog_info="   configured"
+    
+    if check_watchdog_module; then
+        watchdog_status="$MISSING"
+        watchdog_info="   not configured yet"
+    fi
+    
+    # Format with right-aligned status
+    local info_text_length=${#watchdog_info}
+    local status_length=${#watchdog_status}
+    local total_width=94
+    local padding=$((total_width - info_text_length - status_length))
+    
+    if [ $padding -lt 1 ]; then
+        padding=1
+    fi
+    
+    printf "%s%*s%s\n" "$watchdog_info" $padding "" "$watchdog_status" >> "$temp_file"
+    
+    if [ -f "$temp_file" ]; then
+        summary="${summary}$(cat "$temp_file")\n"
+        rm -f "$temp_file"
+    fi
+    
+    # Display the summary
+    echo -e "$summary" > "$temp_file"
+    dialog --title "System Checkup Summary" \
+           --ok-label "Close" \
+           --textbox "$temp_file" 25 100
+    
+    rm -f "$temp_file"
+    log_info "System checkup summary completed"
+}
+
 # Display main menu and handle user selections
 main_menu() {
     local dialog_selected=$(mktemp)
@@ -2270,18 +3065,19 @@ main_menu() {
 
     cmd=(dialog --keep-tite --title "$menu_title"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
-         --menu "Choose an option:" 19 85 11)
-    options=("0" "Add Cloned NFS Storage from $PRODUCT Snapshot"
-             "1" "Restore VM/CT from Cloned NFS Storage"
-             "2" "Delete Cloned NFS Storage in PVE & cloned dataset in $PRODUCT     "
-             "3" "Cleanup inactive NFS storage"
-             "4" "Cleanup unused disks in VM/CT config"
-             "5" "Bulk VM/CT Operations – Start, Stop, Reboot, and More"
-             "6" "NFS tuning - set nconnect, sync options"
-             "7" "Add VM/CT to Proxmox VE HA Resources"
-             "8" "Setup Start-at-boot for $PRODUCT VMs"
-             "9" "Post known issues fixes and tuning"
-             "10" "Help & About pve-tools")
+         --menu "Choose an option:" 20 85 12)
+    options=("0" "Add cloned NFS storage from JovianDSS snapshot"
+             "1" "Restore VM/CT from cloned NFS storage"
+             "2" "Delete cloned NFS storage in PVE and the cloned dataset in JovianDSS"
+             "3" "Clean up inactive NFS storage"
+             "4" "Clean up unused disks in VM/CT configurations"
+             "5" "Bulk VM/CT operations – start, stop, reboot, and more"
+             "6" "NFS tuning – set nconnect, sync options"
+             "7" "Add VM/CT to Proxmox VE HA resources"
+             "8" "Set up auto-start at boot for JovianDSS VMs"
+             "9" "Apply known issue fixes and tuning"
+             "10" "System check-up"
+             "11" "Help & About pve-tools")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -2319,7 +3115,10 @@ main_menu() {
                 9)  # Post known issues fixes and tuning
                     post_known_issues_fixes
                     ;;
-                10)  # Help & About pve-tools
+                10)  # Check-up
+                    checkup_summary
+                    ;;
+                11)  # Help & About pve-tools
                     help_about_dialog
                     ;;
             esac
@@ -2386,7 +3185,8 @@ help_about_dialog() {
     help_text+="7. Add VM/CT to Proxmox VE HA Resources\n"
     help_text+="8. Setup Start-at-boot for $PRODUCT VMs - Configure automatic startup\n"
     help_text+="9. Apply known issue fixes and tuning\n"
-    help_text+="10. Help & About pve-tools\n"
+    help_text+="10. System check-up - Comprehensive system status and health check\n"
+    help_text+="11. Help & About pve-tools\n"
     help_text+="\n"
     help_text+="REQUIREMENTS:\n"
     help_text+="-------------\n"
@@ -2738,9 +3538,9 @@ config_file_type() {
     return 0
 }
 
-# List existing VM/LXC IDs from Proxmox configuration files
+# List existing VM/LXC IDs from Proxmox VE configuration files
 existing_id() {
-    log_debug "Getting existing VM/CT IDs from Proxmox configuration"
+    log_debug "Getting existing VM/CT IDs from Proxmox VE configuration"
     
     find /etc/pve/nodes/*/{qemu-server,lxc} -name '*.conf' \
         -printf '%f\n' 2>/dev/null | \
@@ -3251,7 +4051,7 @@ regenerate_mac_addresses() {
             local old_mac=""
             local mac_param=""
             
-            # Check for virtio=MAC pattern (Proxmox format)
+            # Check for virtio=MAC pattern (Proxmox VE format)
             if [[ "$line" =~ virtio=([0-9A-Fa-f:]+) ]]; then
                 old_mac="${BASH_REMATCH[1]}"
                 mac_param="virtio"
@@ -3271,7 +4071,7 @@ regenerate_mac_addresses() {
             
             if [[ -n "$old_mac" ]]; then
                 # Generate new random MAC address (using Proxmox's range)
-                # Proxmox uses prefix BC:24:11 for auto-generated MACs
+                # Proxmox VE uses prefix BC:24:11 for auto-generated MACs
                 local new_mac=$(printf "BC:24:11:%02X:%02X:%02X" $((RANDOM % 256)) $((RANDOM % 256)) $((RANDOM % 256)))
                 
                 # Replace the MAC address in the config file
@@ -4531,7 +5331,7 @@ refresh_storage_cache() {
     
     log_info "Refreshing storage cache for '$storage_name'..."
     
-    # Force Proxmox to refresh storage information
+    # Force Proxmox VE to refresh storage information
     pvesh set /nodes/$(hostname)/storage/"$storage_name" --enabled 1 2>/dev/null || true
     
     # Wait a moment for the refresh to take effect
@@ -4648,12 +5448,12 @@ perform_clone_and_setup() {
         return 1
     fi
 
-    dialog --title "Processing..." --infobox "Adding storage to Proxmox..." 6 50
+    dialog --title "Processing..." --infobox "Adding storage to Proxmox VE ..." 6 50
     sleep 1
 
     local nodes_csv=$(get_ha_nodes_csv)
     if ! add_nfs_storage_to_proxmox "$clone_name" "$selected_nfs_ip" "$nodes_csv"; then
-        dialog --msgbox "Failed to add storage to Proxmox!" 8 40
+        dialog --msgbox "Failed to add storage to Proxmox VE!" 8 40
         return 1
     fi
 
@@ -4679,7 +5479,7 @@ perform_clone_and_setup() {
 
     set_readonly_conf_files "$clone_name"
 
-    dialog --msgbox "Clone and NFS setup completed successfully!\n\nClone: $clone_name\nNFS Share: $clone_name\nProxmox Storage: $clone_name" 10 60
+    dialog --msgbox "Clone and NFS setup completed successfully!\n\nClone: $clone_name\nNFS Share: $clone_name\nProxmox VE Storage: $clone_name" 10 60
 }
 
 add_nfs_storage_wizard() {
@@ -5770,7 +6570,7 @@ vm_manager_get_vms_with_hostpci() {
         sed -nE 's#.*/([0-9]+)\.conf#\1#p' | sort -u
 }
 
-# Get all VMs and CTs from entire Proxmox cluster for VM/CT Manager
+# Get all VMs and CTs from entire Proxmox VE cluster for VM/CT Manager
 vm_manager_get_vm_ct_list() {
     local vm_list=()
     local hostpci_vms
@@ -6413,13 +7213,13 @@ vm_manager_show_summary() {
 
 # VM/CT Manager - Bulk Actions main function
 vm_ct_manager_bulk_actions() {
-    # Check if running as root (required for Proxmox commands)
+    # Check if running as root (required for Proxmox VE commands)
     if [[ $EUID -ne 0 ]]; then
         dialog --title "Error" --msgbox "VM/CT Manager must be run as root to access Proxmox VE commands." 8 60
         return 1
     fi
     
-    # Check if Proxmox commands are available
+    # Check if Proxmox VE commands are available
     if ! command -v qm >/dev/null 2>&1 || ! command -v pct >/dev/null 2>&1; then
         dialog --title "Error" --msgbox "Proxmox VE commands (qm/pct) not found. Please run on a Proxmox VE node." 10 60
         return 1
@@ -7030,14 +7830,14 @@ get_storage_vms() {
         if [[ -f "$conf_file" ]]; then
             local vmid=$(basename "$conf_file" .conf)
             local name=""
-            local boot=""
+            local onboot=""
             local startup=""
             
-            # Extract VM name, boot and startup settings
+            # Extract VM name, onboot and startup settings
             while IFS= read -r line; do
                 case "$line" in
                     name:*) name="${line#name: }" ;;
-                    boot:*) boot="${line#boot: }" ;;
+                    onboot:*) onboot="${line#onboot: }" ;;
                     startup:*) startup="${line#startup: }" ;;
                 esac
             done < "$conf_file"
@@ -7049,9 +7849,9 @@ get_storage_vms() {
                 local up=""
                 local down=""
                 
-                log_debug "get_storage_vms: Found VM $vmid ($name) - boot='$boot' startup='$startup'"
-                # Parse boot setting
-                if [[ "$boot" == *"1"* ]]; then
+                log_debug "get_storage_vms: Found VM $vmid ($name) - onboot='$onboot' startup='$startup'"
+                # Parse onboot setting: onboot: 1 = yes, missing onboot = no
+                if [[ "$onboot" == "1" ]]; then
                     start_at_boot="yes"
                 fi
                 
@@ -7081,14 +7881,14 @@ get_storage_vms() {
         if [[ -f "$conf_file" ]]; then
             local ctid=$(basename "$conf_file" .conf)
             local hostname=""
-            local boot=""
+            local onboot=""
             local startup=""
             
-            # Extract CT hostname, boot and startup settings
+            # Extract CT hostname, onboot and startup settings
             while IFS= read -r line; do
                 case "$line" in
                     hostname:*) hostname="${line#hostname: }" ;;
-                    boot:*) boot="${line#boot: }" ;;
+                    onboot:*) onboot="${line#onboot: }" ;;
                     startup:*) startup="${line#startup: }" ;;
                 esac
             done < "$conf_file"
@@ -7100,8 +7900,8 @@ get_storage_vms() {
                 local up=""
                 local down=""
                 
-                # Parse boot setting
-                if [[ "$boot" == *"1"* ]]; then
+                # Parse onboot setting: onboot: 1 = yes, missing onboot = no
+                if [[ "$onboot" == "1" ]]; then
                     start_at_boot="yes"
                 fi
                 
@@ -7194,8 +7994,8 @@ EOF
             if [[ -n "$vmid" ]]; then
                 # Format the display string with columns using calculated name width
                 local name_part=$(printf "(%s)" "$name")
-                local display_string=$(printf "%-*s [%s]  Start-at-boot: %-3s | order=%-2s | up=%-3s | down=%-3s" \
-                    $((max_name_len + 2)) "$name_part" "$type" "$boot" "${order:-N/A}" "${up:-N/A}" "${down:-N/A}")
+                local display_string=$(printf "%-*s [%s]  Start-at-boot: %-3s | order=%-3s | up=%-3s | down=%-3s" \
+                    $((max_name_len + 2)) "$name_part" "$type" "$boot" "${order:-any}" "${up:-N/A}" "${down:-N/A}")
                 
                 # Check if this VM/CT is selected
                 local selection_status="off"
@@ -7453,9 +8253,9 @@ apply_startup_settings() {
         log_debug "apply_startup_settings: storage_vm_shutdown_timeout='${storage_vm_shutdown_timeout}'"
         
         if [[ "$storage_vm_start_at_boot" == "yes" ]]; then
-            boot_line="boot: 1"
+            boot_line="onboot: 1"
         else
-            boot_line="boot: 0"
+            boot_line=""  # Missing onboot line means start at boot = no
         fi
         
         startup_line="startup: order=${storage_vm_start_shutdown_order},up=${storage_vm_startup_deleay},down=${storage_vm_shutdown_timeout}"
@@ -7469,8 +8269,11 @@ apply_startup_settings() {
         local startup_updated=false
         
         while IFS= read -r line; do
-            if [[ "$line" =~ ^boot: ]]; then
-                echo "$boot_line" >> "$temp_config"
+            if [[ "$line" =~ ^onboot: ]]; then
+                # Only add onboot line if we want start at boot = yes
+                if [[ -n "$boot_line" ]]; then
+                    echo "$boot_line" >> "$temp_config"
+                fi
                 boot_updated=true
             elif [[ "$line" =~ ^startup: ]]; then
                 echo "$startup_line" >> "$temp_config"
@@ -7481,7 +8284,7 @@ apply_startup_settings() {
         done < "$config_file"
         
         # Add missing lines if not updated
-        if ! $boot_updated; then
+        if ! $boot_updated && [[ -n "$boot_line" ]]; then
             echo "$boot_line" >> "$temp_config"
         fi
         if ! $startup_updated; then
@@ -7534,7 +8337,7 @@ configure_startup_settings_wizard() {
     local summary
     summary=$(cat <<EOF
 Note: Startup settings apply only to the JovianDSS VM. 
-All other VMs are managed by Proxmox HA, 
+All other VMs are managed by Proxmox VE HA, 
 which uses its own logic to control startup/shutdown based on HA settings, 
 not the VM's configuration.
 

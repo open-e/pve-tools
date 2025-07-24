@@ -25,14 +25,14 @@ export NCURSES_NO_UTF8_ACS=1
 # GLOBAL VARIABLES
 
 # Version information
-VERSION="0.26"
-RELEASE_DATE="2025-07-22"
+VERSION="0.27"
+RELEASE_DATE="2025-07-24"
 
 # Script mode flag
 VERSION_MODE=false
 
 # Debug mode flag
-DEBUG_MODE=true
+DEBUG_MODE=false
 
 # Product information
 VENDOR="Open-E"
@@ -3085,37 +3085,37 @@ main_menu() {
     case $dialog_exit_code in
         0)  # Select
             case "$selected_option" in
-                0)  # Add Cloned NFS Storage from JovianDSS Snapshot
+                0)  # Add cloned NFS storage from JovianDSS snapshot
                     add_nfs_storage_wizard
                     ;;
-                1)  # Restore VM/CT from Cloned NFS Storage
+                1)  # Restore VM/CT from cloned NFS storage
                     restore_from_clone_wizard
                     ;;
-                2)  # Delete Cloned NFS Storage
+                2)  # Delete cloned NFS storage in PVE and the cloned dataset in JovianDSS
                     delete_cloned_nfs_storage_wizard
                     ;;
-                3)  # Cleanup inactive NFS storage
+                3)  # Clean up inactive NFS storage
                     cleanup_inactive_nfs_storage
                     ;;
-                4)  # Cleanup unused disks in VM/CT config
+                4)  # Clean up unused disks in VM/CT configurations
                     cleanup_unused_disks_wizard
                     ;;
-                5)  # VM/CT Manager - Bulk Actions
+                5)  # Bulk VM/CT operations – start, stop, reboot, and more
                     vm_ct_manager_bulk_actions
                     ;;
-                6)  # NFS tuning - set nconnect, sync options
+                6)  # NFS tuning – set nconnect, sync options
                     nfs_tuning_wizard
                     ;;
-                7)  # Add VM/CT to Proxmox VE HA Resources
+                7)  # Add VM/CT to Proxmox VE HA resources
                     add_vmct_to_ha_resources
                     ;;
-                8)  # Setup Start-at-boot for storage VMs
+                8)  # Set up auto-start at boot for JovianDSS VMs
                     setup_storage_vm_startup_wizard
                     ;;
-                9)  # Post known issues fixes and tuning
+                9)  # Apply known issue fixes and tuning
                     post_known_issues_fixes
                     ;;
-                10)  # Check-up
+                10)  # System check-up
                     checkup_summary
                     ;;
                 11)  # Help & About pve-tools
@@ -3175,17 +3175,17 @@ help_about_dialog() {
     help_text+="\n"
     help_text+="MAIN FUNCTIONS:\n"
     help_text+="---------------\n"
-    help_text+="0. Add Cloned NFS Storage from $PRODUCT Snapshot\n"
-    help_text+="1. Restore VM/CT from Cloned NFS Storage\n"
-    help_text+="2. Delete Cloned NFS Storage in PVE & Cloned Dataset in $PRODUCT\n"
+    help_text+="0. Add cloned NFS storage from $PRODUCT snapshot\n"
+    help_text+="1. Restore VM/CT from cloned NFS storage\n"
+    help_text+="2. Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT\n"
     help_text+="3. Clean up inactive NFS storage\n"
-    help_text+="4. Clean up unused disks in VM/CT config\n"
-    help_text+="5. Bulk VM/CT Operations – Start, Stop, Reboot, and More\n"
-    help_text+="6. NFS tuning - Set nconnect, sync options\n"
-    help_text+="7. Add VM/CT to Proxmox VE HA Resources\n"
-    help_text+="8. Setup Start-at-boot for $PRODUCT VMs - Configure automatic startup\n"
+    help_text+="4. Clean up unused disks in VM/CT configurations\n"
+    help_text+="5. Bulk VM/CT operations – start, stop, reboot, and more\n"
+    help_text+="6. NFS tuning – set nconnect, sync options\n"
+    help_text+="7. Add VM/CT to Proxmox VE HA resources\n"
+    help_text+="8. Set up auto-start at boot for $PRODUCT VMs\n"
     help_text+="9. Apply known issue fixes and tuning\n"
-    help_text+="10. System check-up - Comprehensive system status and health check\n"
+    help_text+="10. System check-up\n"
     help_text+="11. Help & About pve-tools\n"
     help_text+="\n"
     help_text+="REQUIREMENTS:\n"
@@ -3193,7 +3193,7 @@ help_about_dialog() {
     help_text+="- Proxmox VE cluster environment\n"
     help_text+="- $VENDOR $PRODUCT storage system\n"
     help_text+="- Dialog package for TUI interface\n"
-    help_text+="- REST API access to $PRODUCT (default port 82)\n"
+    help_text+="- REST API access to $PRODUCT\n"
     help_text+="\n"
     help_text+="STARTUP FEATURES:\n"
     help_text+="-----------------\n"

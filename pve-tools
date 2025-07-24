@@ -23,16 +23,16 @@ export LC_ALL=en_US.UTF-8
 export NCURSES_NO_UTF8_ACS=1
 
 # GLOBAL VARIABLES
+# Debug mode flag
+DEBUG_MODE=false
 
 # Version information
-VERSION="0.27"
+VERSION="0.29"
 RELEASE_DATE="2025-07-24"
 
 # Script mode flag
 VERSION_MODE=false
 
-# Debug mode flag
-DEBUG_MODE=false
 
 # Product information
 VENDOR="Open-E"
@@ -78,7 +78,12 @@ selected_nfs_storages=""
 selected_nfs_nconnect=""
 selected_nfs_sync=""
 
-# Disk type constants
+# Define device type patterns (from pve-config-backup for comprehensive VM/CT disk detection)
+BUS_DEVS="(?:scsi|ide|sata|virtio|efidisk|tpmstate|nvme)"
+LXC_DEVS="(?:rootfs|mp[0-9]+)"
+DEVICE_PATTERN="(?:(?:rootfs|mp[0-9]+)|(?:scsi|ide|sata|virtio|efidisk|tpmstate|nvme)[0-9]+)"
+
+# Legacy patterns for backward compatibility
 DISK_TYPES="(scsi|ide|sata|virtio|efidisk|tpmstate|nvme)"
 DISK_PATTERN="^${DISK_TYPES}[0-9]+:[^:]+:[0-9]+/vm"
 
@@ -241,6 +246,63 @@ log_error() {
 log_debug() {
     if [[ "$DEBUG_MODE" == "true" && -f "$LOG_FILE" ]]; then
         log "DEBUG" "$1"
+    fi
+}
+
+# DEBUG-ONLY ERROR CAPTURE SYSTEM
+# Initialize error capture for debug mode only
+init_debug_error_capture() {
+    if [[ "$DEBUG_MODE" == "true" ]]; then
+        log_debug "Initializing debug error capture system"
+        
+        # Save original stderr for critical system errors
+        exec 3>&2
+        
+        # Redirect all stderr to logger function
+        exec 2> >(while read -r line; do
+            # Skip empty lines and dialog/terminal control sequences
+            if [[ -n "$line" && ! "$line" =~ ^[[:space:]]*$ && ! "$line" =~ $'\e' ]]; then
+                log_error "STDERR: $line"
+            fi
+        done)
+        
+        # Set up error trap for failed commands
+        error_trap() {
+            local exit_code=$?
+            local line_number=${BASH_LINENO[0]}
+            local command="$BASH_COMMAND"
+            
+            # Skip expected failures and benign operations
+            local skip_patterns=(
+                '^(test|\[|\[\[)'           # test commands
+                '^(grep|egrep|fgrep)'       # grep commands (no matches = exit 1)
+                '^dialog'                   # dialog commands (user cancel = exit 1)
+                '".*cmd.*options.*2>'       # dialog command arrays (user cancel = exit 1)
+                '^read.*-t.*discard'        # timeout reads for buffer clearing
+                '^\(\('                     # arithmetic expressions ((var++))
+                '^return [0-9]+'            # explicit return statements
+                '=[^=]*\$\('               # command substitutions (var=$(cmd))
+            )
+            
+            local should_skip=false
+            for pattern in "${skip_patterns[@]}"; do
+                if [[ "$command" =~ $pattern ]]; then
+                    should_skip=true
+                    break
+                fi
+            done
+            
+            # Only log non-zero exits that aren't in our skip list
+            if [[ $exit_code -ne 0 && "$should_skip" == "false" ]]; then
+                log_error "Command failed at line $line_number: '$command' (exit code: $exit_code)"
+            fi
+        }
+        
+        # Enable error trap
+        set -E  # Enable ERR trap inheritance
+        trap error_trap ERR
+        
+        log_debug "Debug error capture system initialized"
     fi
 }
 
@@ -460,9 +522,6 @@ parse_oodp_destinations() {
 cleanup_inactive_nfs_storage() {
     log_info "Starting NFS cleanup on all cluster nodes"
     
-    dialog --infobox "Cleaning up inactive NFS storage on all nodes..." 5 60
-    sleep 1
-
     # Get node list from corosync configuration
     local node_list
     node_list=$(awk '
@@ -476,27 +535,44 @@ cleanup_inactive_nfs_storage() {
         return 1
     fi
     
-    log_info "Found cluster nodes: $(echo "$node_list" | wc -l) nodes"
+    local total_nodes=$(echo "$node_list" | wc -l)
+    log_info "Found cluster nodes: $total_nodes nodes"
     
+    dialog --infobox "Initializing NFS cleanup on $total_nodes cluster nodes..." 5 60
+    sleep 1
+    
+    local current_node=0
     # Process each node
     while read -r node ip; do
+        ((current_node++))
+        local progress_msg="Processing node $current_node/$total_nodes: $node ($ip)\nChecking inactive NFS mounts and orphaned directories..."
+        dialog --infobox "$progress_msg" 7 70
+        
         log_info "Processing cleanup for node: $node ($ip)"
+        log_debug "Starting SSH connection to $node ($ip) with 60 second timeout"
         (
-        ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" < /dev/null << 'ENDSCRIPT'
-log_info() { true; }
-log_debug() { true; }
-log_error() { true; }
-log_info "Running cleanup on remote node"
+        timeout 60 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@"$ip" "bash -s" < /dev/null << 'ENDSCRIPT'
+log_info() { echo "[$(date '+%F %T')] INFO: $*"; }
+log_debug() { echo "[$(date '+%F %T')] DEBUG: $*"; }
+log_error() { echo "[$(date '+%F %T')] ERROR: $*"; }
+log_info "=== Starting NFS cleanup on remote node $(hostname) ==="
+log_debug "Getting all mounted NFS directories..."
 
 # Get all mounted NFS directories
 all_nfs_mounts=$(mount | grep -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:/\S+\s.+\snfs\s' | awk '{print $3}' | sort)
+log_debug "Found NFS mounts: $(echo "$all_nfs_mounts" | wc -l) entries"
 
 # Get active PVE storage mounts
+log_debug "Getting active PVE storage mounts..."
 active_pve_mounts=$(pvesm status | awk '$2 == "nfs" && $3 == "active" {print "/mnt/pve/" $1}' | sort)
+log_debug "Found active PVE mounts: $(echo "$active_pve_mounts" | wc -l) entries"
 
 # Calculate inactive mounts
+log_debug "Calculating inactive mounts..."
 inactive_mounts=$(comm -23 <(echo "$all_nfs_mounts") <(echo "$active_pve_mounts"))
-log_info "Inactive mounts to process: $(echo $inactive_mounts | wc -w) mounts"
+local inactive_count=$(echo $inactive_mounts | wc -w)
+log_info "Inactive mounts to process: $inactive_count mounts"
+log_debug "Inactive mounts list: $inactive_mounts"
 
 if [ -z "$inactive_mounts" ]; then
   log_info "No inactive mounts found to clean up"
@@ -535,7 +611,9 @@ done
 
 # Also check for orphaned clone directories in /mnt/pve/
 log_info "Checking for orphaned clone directories in /mnt/pve/"
+log_debug "Running find command for clone directories..."
 pve_directories=$(find /mnt/pve/ -maxdepth 1 -type d -name "*clone*" 2>/dev/null | sort)
+log_debug "Found clone directories: $(echo "$pve_directories" | wc -l) entries"
 
 echo "$pve_directories" | while read -r dir; do
   [ -z "$dir" ] || [ "$dir" = "/mnt/pve/" ] && continue
@@ -575,13 +653,51 @@ echo "$pve_directories" | while read -r dir; do
     log_error "Failed to remove orphaned directory: $dir"
   fi
 done
+
+log_info "=== NFS cleanup completed on remote node $(hostname) ==="
+log_info "Cleanup summary: Processed $inactive_count inactive mounts and $(echo "$pve_directories" | wc -l) clone directories"
+log_debug "Cleanup operations finished successfully"
 ENDSCRIPT
+        ssh_exit_code=$?
+        if [ $ssh_exit_code -ne 0 ]; then
+            echo "[$(date '+%F %T')] ERROR: SSH cleanup failed for node $node ($ip) with exit code: $ssh_exit_code"
+        fi
         ) >> "$LOGS_DIR/pve-nfs-cleanup-$node.log" 2>&1 &
+        local ssh_pid=$!
+        log_debug "Started SSH cleanup for $node ($ip) with PID: $ssh_pid"
     done < <(echo "$node_list")
 
-    wait
+    dialog --infobox "Waiting for cleanup operations to complete on all $total_nodes nodes...\nThis may take a few moments..." 6 65
     
-    log_info "NFS cleanup complete"
+    # Wait for all background processes with timeout
+    log_debug "Waiting for all $total_nodes cleanup processes to complete..."
+    local wait_count=0
+    local max_wait=120  # 2 minutes timeout
+    
+    while [ $(jobs -r | wc -l) -gt 0 ] && [ $wait_count -lt $max_wait ]; do
+        sleep 1
+        ((wait_count++))
+        if [ $((wait_count % 10)) -eq 0 ]; then
+            local remaining_jobs=$(jobs -r | wc -l)
+            log_debug "Still waiting... $remaining_jobs jobs remaining after ${wait_count}s"
+        fi
+    done
+    
+    local remaining_jobs=$(jobs -r | wc -l)
+    if [ $remaining_jobs -gt 0 ]; then
+        log_error "Timeout: $remaining_jobs cleanup jobs still running after ${max_wait}s"
+        log_error "Killing remaining background processes..."
+        jobs -p | xargs -r kill -9 2>/dev/null
+        dialog --msgbox "Warning: Some cleanup operations timed out and were terminated.\nCheck logs for details." 8 60
+        return 1
+    else
+        log_debug "All cleanup processes completed successfully"
+    fi
+    
+    dialog --infobox "NFS cleanup completed successfully on all $total_nodes nodes!\nCheck logs for detailed results." 6 60
+    sleep 2
+    
+    log_info "NFS cleanup complete on all $total_nodes nodes"
 }
 
 # Check pve-config-backup daemon status on all cluster nodes
@@ -3650,9 +3766,9 @@ get_storage_name_of_id() {
             echo "$storage_name"
             ;;
         vm)
-            # use the more specific pattern to find the first VM disk line
+            # use the comprehensive device pattern to find the first VM disk line
             storage_name=$(
-                grep -E "$DISK_PATTERN" "$etc_conf" \
+                grep -P "^(?:scsi|ide|sata|virtio|efidisk|tpmstate|nvme)[0-9]+:[^:]+:[0-9]+/vm" "$etc_conf" \
                 | head -n1 \
                 | awk -F: '{print $2}' \
                 | xargs
@@ -4115,12 +4231,12 @@ restore_vm() {
         return 1
     fi
 
-    # Update storage references in config
+    # Update storage references in config using comprehensive device pattern
     local current_storage_name
-    current_storage_name="$(grep -E "^${DISK_TYPES}[0-9]+:\s+[^:]+:[0-9]+/vm" "$dst_conf" | head -1 | awk -F':' '{print $2}' | awk '{$1=$1};1')"
+    current_storage_name="$(grep -P "^(?:scsi|ide|sata|virtio|efidisk|tpmstate|nvme)[0-9]+:\s+[^:]+:[0-9]+/vm" "$dst_conf" | head -1 | awk -F':' '{print $2}' | awk '{$1=$1};1')"
 
     if [[ -n "$current_storage_name" ]]; then
-        sed -i -E "s@^(${DISK_TYPES}[0-9]+:) *${current_storage_name}:@\1${storage_name}:@g" "$dst_conf"
+        sed -i -E "s@^((scsi|ide|sata|virtio|efidisk|tpmstate|nvme)[0-9]+:) *${current_storage_name}:@\1${storage_name}:@g" "$dst_conf"
         log_info "Updated storage reference from $current_storage_name to $storage_name in VM $vmid config"
     else
         log_error "Could not find storage reference in VM $vmid config"
@@ -4238,9 +4354,9 @@ perform_restore() {
 
     # Need to initiate fresh config files backup using pve-config-backup daemon
     log_info "Stopping pve-config-backup daemon"
-    pve-config-backup stop >> /var/log/pve-tools/pve-tools.log 2>&1
+    pve-config-backup stop >/dev/null 2>&1
     log_info "Starting pve-config-backup daemon"
-    pve-config-backup start >> /var/log/pve-tools/pve-tools.log 2>&1
+    pve-config-backup start >/dev/null 2>&1
 
     # Show final result
     local result_text="Restoration completed!\n\n"
@@ -5919,7 +6035,7 @@ is_clone() {
     local nfs_ip="$2"
 
     if [[ -z "$volume_name" ]]; then
-        echo "Error: volume_name is required" >&2
+        log_error "is_clone: volume_name is required"
         return 1
     fi
 
@@ -5933,7 +6049,7 @@ is_clone() {
     local dataset_name="${volume_name#*/}"
 
     if [[ -z "$pool_name" || -z "$dataset_name" || "$pool_name" == "$dataset_name" ]]; then
-        echo "Error: Invalid volume_name format. Expected: pool_name/dataset_name" >&2
+        log_error "is_clone: Invalid volume_name format. Expected: pool_name/dataset_name"
         return 1
     fi
 
@@ -5947,7 +6063,7 @@ is_clone() {
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
-        echo "is_clone: Error: Failed to connect to server" >&2
+        log_error "is_clone: Failed to connect to server"
         return 1
     fi
 
@@ -5974,12 +6090,12 @@ except Exception as e:
 
     local python_exit=$?
     if [[ $python_exit -ne 0 ]]; then
-        echo "is_clone: Error: Failed to parse JSON response" >&2
+        log_error "is_clone: Failed to parse JSON response"
         return 1
     fi
 
     if [[ "$origin" == "NOT_FOUND" ]]; then
-        echo "Error: Dataset '$dataset_name' not found in pool '$pool_name'" >&2
+        log_error "is_clone: Dataset '$dataset_name' not found in pool '$pool_name'"
         return 1
     fi
 
@@ -6117,7 +6233,7 @@ delete_pve_NFS_storage() {
     local pve_storage_name="$1"
 
     if [[ -z "$pve_storage_name" ]]; then
-        echo "Error: pve_storage_name is required" >&2
+        log_error "delete_pve_NFS_storage: pve_storage_name is required"
         return 1
     fi
 
@@ -6127,7 +6243,7 @@ delete_pve_NFS_storage() {
     local pve_nfs_storages
     pve_nfs_storages=$(get_pve_NFS_storage)
     if [[ $? -ne 0 ]]; then
-        echo "Error: Failed to get PVE NFS storages" >&2
+        log_error "delete_pve_NFS_storage: Failed to get PVE NFS storages"
         return 1
     fi
 
@@ -6150,7 +6266,7 @@ delete_pve_NFS_storage() {
     local storage_ip
     storage_ip=$(get_storage_ip "$pve_storage_name")
     if [[ $? -ne 0 ]]; then
-        echo "delete_pve_NFS_storage: Error: No IP mapping found for storage '$pve_storage_name'" >&2
+        log_error "delete_pve_NFS_storage: No IP mapping found for storage '$pve_storage_name'"
         return 1
     fi
 
@@ -6272,11 +6388,10 @@ check_vmct_using_storage() {
             
             # Check if this VM/CT uses the specified storage
             local storage_match=false
-            if grep -q "^rootfs:.*${storage_name}:" "$conf_file" 2>/dev/null; then
+            # Use comprehensive device pattern for both LXC and VM device detection
+            if grep -P -q "^${DEVICE_PATTERN}:.*${storage_name}:" "$conf_file" 2>/dev/null; then
                 storage_match=true
-                log_debug "check_vmct_using_storage: Found rootfs match in $conf_file"
-            elif grep -E -q "^${DISK_TYPES}[0-9]+:.*${storage_name}:" "$conf_file" 2>/dev/null; then
-                storage_match=true
+                log_debug "check_vmct_using_storage: Found device match in $conf_file"
                 log_debug "check_vmct_using_storage: Found disk match in $conf_file"
             fi
             
@@ -8442,6 +8557,9 @@ main() {
     fi
     
     log_info "Starting PVE Tools script"
+    
+    # Initialize debug error capture system if in debug mode
+    init_debug_error_capture
     
     # Check for dialog dependency and install if missing
     check_for_dialog_and_install_if_missing

@@ -24,11 +24,11 @@ export NCURSES_NO_UTF8_ACS=1
 
 # GLOBAL VARIABLES
 # Debug mode flag
-DEBUG_MODE=true
+DEBUG_MODE=false
 
 # Version information
-VERSION="0.29"
-RELEASE_DATE="2025-07-24"
+VERSION="0.30"
+RELEASE_DATE="2025-07-25"
 
 # Script mode flag
 VERSION_MODE=false

@@ -24,7 +24,7 @@ export NCURSES_NO_UTF8_ACS=1
 
 # GLOBAL VARIABLES
 # Debug mode flag
-DEBUG_MODE=false
+DEBUG_MODE=true
 
 # Version information
 VERSION="0.29"
@@ -44,6 +44,11 @@ FACTORY_DEFAULTS_FILE="$CONFIG_DIR/factory.defaults"
 CONNECTED_STORAGE_SERVERS_DIR="$CONFIG_DIR/connected"
 LOGS_DIR="/var/log/$(basename "$0" .sh)"
 LOG_FILE="$LOGS_DIR/$(basename "$0" .sh).log"
+
+# JovianDSS API response cache variables
+declare -A API_POOLS_CACHE
+declare -A API_NAS_VOLUMES_CACHE
+API_CACHE_INITIALIZED=false
 
 # Script state variables
 selected_confs=()  # Array of selected config files
@@ -303,6 +308,322 @@ init_debug_error_capture() {
         trap error_trap ERR
         
         log_debug "Debug error capture system initialized"
+    fi
+}
+
+# API RESPONSE CACHING FUNCTIONS
+
+# Initialize API cache for all connected storage servers  
+init_api_cache() {
+    if [[ "$API_CACHE_INITIALIZED" == "true" ]]; then
+        log_debug "API cache already initialized"
+        return 0
+    fi
+    
+    log_debug "Initializing API cache for JovianDSS servers"
+    
+    # Clear existing cache
+    API_POOLS_CACHE=()
+    API_NAS_VOLUMES_CACHE=()
+    
+    # Get all unique NFS IPs from storage configuration
+    local nfs_ips
+    nfs_ips=$(awk '/^nfs:[[:space:]]+/ {
+        in_block = 1
+        storage = $2
+    }
+    in_block && /^[[:space:]]*server[[:space:]]+/ {
+        print $2
+        in_block = 0
+    }' /etc/pve/storage.cfg | sort -u)
+    
+    # Cache pools and nas-volumes for each IP
+    while IFS= read -r nfs_ip; do
+        if [[ -n "$nfs_ip" ]]; then
+            log_debug "Caching API data for IP: $nfs_ip"
+            cache_pools_for_ip "$nfs_ip"
+            cache_nas_volumes_for_ip "$nfs_ip"
+        fi
+    done <<< "$nfs_ips"
+    
+    API_CACHE_INITIALIZED=true
+    log_debug "API cache initialization completed"
+}
+
+# Cache pools data for a specific IP
+cache_pools_for_ip() {
+    local nfs_ip="$1"
+    
+    if [[ -z "$nfs_ip" ]]; then
+        log_error "cache_pools_for_ip: nfs_ip is required"
+        return 1
+    fi
+    
+    local response
+    local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
+    
+    response=$(curl -k -s -X GET -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        "$url" 2>/dev/null)
+    
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "cache_pools_for_ip: Failed to cache pools for IP $nfs_ip"
+        return 1
+    fi
+    
+    # Store raw response in cache
+    API_POOLS_CACHE["$nfs_ip"]="$response"
+    log_debug "Cached pools data for IP: $nfs_ip"
+}
+
+# Cache nas-volumes data for all pools of a specific IP
+cache_nas_volumes_for_ip() {
+    local nfs_ip="$1"
+    
+    if [[ -z "$nfs_ip" ]]; then
+        log_error "cache_nas_volumes_for_ip: nfs_ip is required"
+        return 1
+    fi
+    
+    # Get pool names from cached pools data
+    local pools_response="${API_POOLS_CACHE[$nfs_ip]}"
+    if [[ -z "$pools_response" ]]; then
+        log_error "cache_nas_volumes_for_ip: No cached pools data for IP $nfs_ip"
+        return 1
+    fi
+    
+    # Parse pool names from cached response
+    local pool_names
+    pool_names=$(printf '%s' "$pools_response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    pools = data.get('data', [])
+    for pool in pools:
+        name = pool.get('name')
+        if name:
+            print(name)
+except:
+    pass
+" 2>/dev/null)
+    
+    # Cache nas-volumes for each pool
+    while IFS= read -r pool_name; do
+        if [[ -n "$pool_name" ]]; then
+            local response
+            local url="https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes"
+            
+            response=$(curl -k -s -X GET -u "${rest_api_user}:${rest_api_password}" \
+                -H 'Content-Type: application/json' \
+                "$url" 2>/dev/null)
+            
+            local curl_exit=$?
+            if [[ $curl_exit -eq 0 ]]; then
+                API_NAS_VOLUMES_CACHE["${nfs_ip}:${pool_name}"]="$response"
+                log_debug "Cached nas-volumes for IP: $nfs_ip, Pool: $pool_name"
+            fi
+        fi
+    done <<< "$pool_names"
+}
+
+# Get cached pools data for an IP
+get_cached_pools() {
+    local nfs_ip="$1"
+    
+    if [[ -z "$nfs_ip" ]]; then
+        log_error "get_cached_pools: nfs_ip is required"
+        return 1
+    fi
+    
+    local response="${API_POOLS_CACHE[$nfs_ip]}"
+    if [[ -z "$response" ]]; then
+        log_error "get_cached_pools: No cached data for IP $nfs_ip"
+        return 1
+    fi
+    
+    # Parse and return pool names
+    printf '%s' "$response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    pools = data.get('data', [])
+    for pool in pools:
+        name = pool.get('name')
+        if name:
+            print(name)
+except:
+    sys.exit(1)
+" 2>/dev/null
+}
+
+# Get cached nas-volumes data for an IP and pool
+get_cached_nas_volumes() {
+    local nfs_ip="$1"
+    local pool_name="$2"
+    
+    if [[ -z "$nfs_ip" || -z "$pool_name" ]]; then
+        log_error "get_cached_nas_volumes: nfs_ip and pool_name are required"
+        return 1
+    fi
+    
+    local response="${API_NAS_VOLUMES_CACHE[${nfs_ip}:${pool_name}]}"
+    if [[ -z "$response" ]]; then
+        log_error "get_cached_nas_volumes: No cached nas-volumes for IP $nfs_ip, Pool: $pool_name"
+        return 1
+    fi
+    
+    printf '%s' "$response"
+}
+
+# Clear API cache (call when storage configuration changes)
+clear_api_cache() {
+    log_debug "Clearing API cache"
+    API_POOLS_CACHE=()
+    API_NAS_VOLUMES_CACHE=()
+    API_CACHE_INITIALIZED=false
+}
+
+# OPTIMIZED CACHED VERSIONS OF API FUNCTIONS
+
+# Optimized version of get_dataset_pool_name using cached data
+get_dataset_pool_name_cached() {
+    local dataset_name="$1"
+    local nfs_ip="$2"
+
+    if [[ -z "$dataset_name" ]]; then
+        log_error "get_dataset_pool_name_cached: dataset_name is required"
+        return 1
+    fi
+
+    if [[ -z "$nfs_ip" ]]; then
+        log_error "get_dataset_pool_name_cached: nfs_ip is required"
+        return 1
+    fi
+
+    log_debug "get_dataset_pool_name_cached: Looking for dataset '$dataset_name' on IP '$nfs_ip'"
+
+    # Get cached pools
+    local pools
+    pools=$(get_cached_pools "$nfs_ip")
+    if [[ $? -ne 0 ]]; then
+        log_error "get_dataset_pool_name_cached: Failed to get cached pools list"
+        return 1
+    fi
+
+    # Loop through each pool and check if dataset exists
+    while IFS= read -r pool_name; do
+        if [[ -z "$pool_name" ]]; then
+            continue
+        fi
+
+        # Get cached nas-volumes for this pool
+        local response
+        response=$(get_cached_nas_volumes "$nfs_ip" "$pool_name")
+        if [[ $? -ne 0 ]]; then
+            continue  # Skip this pool if we can't get cached data
+        fi
+
+        # Check if dataset exists in this pool
+        local dataset_found
+        dataset_found=$(printf '%s' "$response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    entries = data.get('data', {}).get('entries', [])
+    for d in entries:
+        if d.get('name') == '$dataset_name':
+            print('FOUND')
+            sys.exit(0)
+    print('NOT_FOUND')
+except Exception as e:
+    print('ERROR', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null)
+
+        if [[ "$dataset_found" == "FOUND" ]]; then
+            printf '%s' "$pool_name"
+            return 0
+        fi
+    done <<< "$pools"
+
+    # Dataset not found in any pool
+    log_error "get_dataset_pool_name_cached: Dataset '$dataset_name' not found on IP '$nfs_ip'"
+    return 1
+}
+
+# Optimized version of is_clone using cached data
+is_clone_cached() {
+    local volume_name="$1"
+    local nfs_ip="$2"
+
+    if [[ -z "$volume_name" ]]; then
+        log_error "is_clone_cached: volume_name is required"
+        return 1
+    fi
+
+    if [[ -z "$nfs_ip" ]]; then
+        log_error "is_clone_cached: nfs_ip is required"
+        return 1
+    fi
+
+    # Parse pool and dataset from volume_name
+    local pool_name="${volume_name%%/*}"
+    local dataset_name="${volume_name#*/}"
+
+    if [[ -z "$pool_name" || -z "$dataset_name" || "$pool_name" == "$dataset_name" ]]; then
+        log_error "is_clone_cached: Invalid volume_name format. Expected: pool_name/dataset_name"
+        return 1
+    fi
+
+    log_debug "is_clone_cached: Checking if '$volume_name' is a clone on IP '$nfs_ip'"
+
+    # Get cached nas-volumes data for this pool
+    local response
+    response=$(get_cached_nas_volumes "$nfs_ip" "$pool_name")
+    if [[ $? -ne 0 ]]; then
+        log_error "is_clone_cached: Failed to get cached nas-volumes data"
+        return 1
+    fi
+
+    # Parse JSON response to find the dataset and check its origin
+    local origin
+    origin=$(printf '%s' "$response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    entries = data.get('data', {}).get('entries', [])
+    for d in entries:
+        if d.get('name') == '$dataset_name':
+            origin = d.get('origin')
+            if origin is None:
+                print('None')
+            else:
+                print(origin)
+            sys.exit(0)
+    print('NOT_FOUND')
+except Exception as e:
+    print('ERROR', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null)
+
+    local python_exit=$?
+    if [[ $python_exit -ne 0 ]]; then
+        log_error "is_clone_cached: Failed to parse cached JSON response"
+        return 1
+    fi
+
+    if [[ "$origin" == "NOT_FOUND" ]]; then
+        log_error "is_clone_cached: Dataset '$dataset_name' not found in pool '$pool_name'"
+        return 1
+    fi
+
+    if [[ "$origin" == "None" ]]; then
+        # origin is None, so it's a dataset (not a clone)
+        return 1
+    else
+        # origin is set, so it's a clone
+        return 0
     fi
 }
 
@@ -2568,6 +2889,449 @@ check_and_update_pve_config_backup() {
     esac
 }
 
+# OODP (ON- & OFF-SITE DATA PROTECTION) FUNCTIONS
+
+# Function to get OODP task details
+# Arguments: ip_addr pool_name dataset_name
+get_oodp_details() {
+    local ip_addr="$1"
+    local pool_name="$2"
+    local dataset_name="$3"
+    
+    # Validate required parameters
+    if [[ -z "$ip_addr" || -z "$pool_name" || -z "$dataset_name" ]]; then
+        log_error "get_oodp_details: Missing required parameters"
+        log_error "Usage: get_oodp_details <ip_addr> <pool_name> <dataset_name>"
+        return 1
+    fi
+    
+    log_info "Getting OODP details for $pool_name/$dataset_name from $ip_addr"
+    log_debug "get_oodp_details: ip_addr='$ip_addr'"
+    log_debug "get_oodp_details: pool_name='$pool_name'"
+    log_debug "get_oodp_details: dataset_name='$dataset_name'"
+    
+    # Make REST API call to get tasks
+    local url="https://$ip_addr:$rest_api_port/api/v4/odp/tasks"
+    log_debug "get_oodp_details: Making request to: $url"
+    
+    local response
+    response=$(curl -k -s -X GET -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        "$url" 2>&1)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "get_oodp_details: Failed to connect to OODP API at $ip_addr:$rest_api_port"
+        log_error "get_oodp_details: curl error: $response"
+        return 1
+    fi
+    
+    log_debug "get_oodp_details: Raw response: $response"
+    
+    # Check if response contains error (but not null)
+    if echo "$response" | grep -q '"error":[[:space:]]*"[^"]*"'; then
+        local error_msg=$(echo "$response" | grep -o '"error"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        log_error "get_oodp_details: API returned error: $error_msg"
+        return 1
+    fi
+    
+    # Store results in temporary file for processing
+    local temp_file
+    temp_file=$(mktemp)
+    echo "$response" > "$temp_file"
+    
+    # Search for matching task based on pool_name and dataset_name
+    local task_found=false
+    local task_name=""
+    local task_type=""
+    local task_enabled=""
+    local task_plan=""
+    local task_destinations=""
+    
+    local search_pattern="$pool_name/$dataset_name"
+    log_debug "get_oodp_details: Searching for pattern: '$search_pattern'"
+    
+    # Check if jq is available for JSON parsing
+    if command -v jq >/dev/null 2>&1; then
+        log_debug "get_oodp_details: Using jq for JSON parsing"
+        
+        # Extract task details using jq - looking for tasks that match our dataset
+        local task_data
+        task_data=$(jq -r --arg pattern "$search_pattern" '
+            .data.entries[] | 
+            select(.name | contains($pattern)) | 
+            "\(.name)|\(.type)|\(.enabled)|\(.plan)|\(.destinations | tostring)"
+        ' "$temp_file" 2>/dev/null)
+        
+        if [[ -n "$task_data" ]]; then
+            task_found=true
+            IFS='|' read -r task_name task_type task_enabled task_plan task_destinations <<< "$task_data"
+            log_debug "get_oodp_details: Found matching task via jq"
+        fi
+    else
+        log_debug "get_oodp_details: Using grep/sed fallback for JSON parsing"
+        
+        # Fallback parsing using grep and sed
+        if grep -q "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*$search_pattern" "$temp_file"; then
+            task_found=true
+            log_debug "get_oodp_details: Found matching task via grep/sed"
+            
+            # Extract task details using grep/sed
+            task_name=$(grep -A 20 "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*$search_pattern" "$temp_file" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
+            task_type=$(grep -A 20 "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*$search_pattern" "$temp_file" | grep -o '"type"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"type"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
+            task_enabled=$(grep -A 20 "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*$search_pattern" "$temp_file" | grep -o '"enabled"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"enabled"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
+            task_plan=$(grep -A 20 "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*$search_pattern" "$temp_file" | grep -o '"plan"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"plan"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
+        fi
+    fi
+    
+    # Clean up temporary file
+    rm -f "$temp_file"
+    
+    if [[ "$task_found" == "true" ]]; then
+        log_info "get_oodp_details: Successfully found OODP task details"
+        log_info "Task Name: $task_name"
+        log_info "Task Type: $task_type"
+        log_info "Task Enabled: $task_enabled"
+        log_info "Task Plan: $task_plan"
+        
+        # Store results in global variables for script use
+        OODP_TASK_NAME="$task_name"
+        OODP_TASK_TYPE="$task_type"
+        OODP_TASK_ENABLED="$task_enabled"
+        OODP_TASK_PLAN="$task_plan"
+        OODP_TASK_DESTINATIONS="$task_destinations"
+        
+        return 0
+    else
+        log_error "get_oodp_details: No matching OODP task found for $pool_name/$dataset_name"
+        return 1
+    fi
+}
+
+# Parse and format OODP Task Destinations
+parse_oodp_destinations() {
+    local destinations_raw="$1"
+    local formatted_output=""
+    
+    log_debug "parse_oodp_destinations: Input raw data: '$destinations_raw'"
+    
+    # Extract content between [ and ]
+    local json_content
+    json_content=$(echo "$destinations_raw" | sed 's/.*\[\(.*\)\].*/\1/')
+    log_debug "parse_oodp_destinations: Extracted JSON content: '$json_content'"
+    
+    # Extract dataset and plan using sed/grep
+    local dataset_full
+    local plan_content
+    
+    # Extract dataset value (everything between "dataset":" and "plan")
+    dataset_full=$(echo "$json_content" | sed 's/.*"dataset"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    log_debug "parse_oodp_destinations: Full dataset: '$dataset_full'"
+    
+    # Extract plan value (everything between "plan":" and the end)
+    plan_content=$(echo "$json_content" | sed 's/.*"plan"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    log_debug "parse_oodp_destinations: Plan content: '$plan_content'"
+    
+    # Parse dataset: split IP:port and dataset path
+    local ip_port
+    local dataset_path
+    
+    if [[ "$dataset_full" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+)/(.+)$ ]]; then
+        ip_port="${BASH_REMATCH[1]}"
+        dataset_path="${BASH_REMATCH[2]}"
+        log_debug "parse_oodp_destinations: IP:port='$ip_port', dataset path='$dataset_path'"
+    else
+        log_error "parse_oodp_destinations: Failed to parse dataset format: '$dataset_full'"
+        return 1
+    fi
+    
+    # Format output as requested
+    formatted_output="Task Destinations:\n"
+    formatted_output="${formatted_output}    DST:    ${dataset_path}    ${ip_port}\n"
+    formatted_output="${formatted_output}    plan:    ${plan_content}"
+    
+    log_debug "parse_oodp_destinations: Formatted output: '$formatted_output'"
+    echo -e "$formatted_output"
+    
+    return 0
+}
+
+# Get all NFS storage entries that are NOT cloned storage
+get_regular_nfs_storage() {
+    local regular_storage=""
+    
+    # Check if storage.cfg exists
+    if [[ ! -f "/etc/pve/storage.cfg" ]]; then
+        log_error "get_regular_nfs_storage: /etc/pve/storage.cfg not found"
+        return 1
+    fi
+    
+    # Read storage.cfg and find NFS entries
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^nfs:[[:space:]]*([^[:space:]]+) ]]; then
+            local storage_name="${BASH_REMATCH[1]}"
+            local storage_path=""
+            
+            # Read the configuration block for this storage
+            while IFS= read -r config_line; do
+                if [[ "$config_line" =~ ^[[:space:]]*export[[:space:]]+([^[:space:]]+) ]]; then
+                    storage_path="${BASH_REMATCH[1]}"
+                elif [[ "$config_line" =~ ^[[:space:]]*$ ]] || [[ "$config_line" =~ ^[a-zA-Z]+: ]]; then
+                    # Empty line or start of new section, stop looking
+                    break
+                fi
+            done
+            
+            # Check if this is NOT a cloned storage (cloned storage typically has "clone" in path or name)
+            if [[ ! "$storage_name" =~ clone ]] && [[ ! "$storage_path" =~ clone ]]; then
+                if [ -n "$regular_storage" ]; then
+                    regular_storage="${regular_storage}\n${storage_name}"
+                else
+                    regular_storage="$storage_name"
+                fi
+                log_debug "get_regular_nfs_storage: Found regular NFS storage: $storage_name (path: $storage_path)"
+            else
+                log_debug "get_regular_nfs_storage: Skipping cloned storage: $storage_name (path: $storage_path)"
+            fi
+        fi
+    done < /etc/pve/storage.cfg
+    
+    echo -e "$regular_storage"
+}
+
+# Validate OODP task requirements and format output
+validate_oodp_task() {
+    local storage_name="$1"
+    local task_enabled="$2"
+    local task_plan="$3"
+    local task_destinations="$4"
+    
+    local PASSED='PASSED'
+    local FAILED='FAILED !'
+    
+    local status="$PASSED"
+    local details=""
+    
+    log_debug "validate_oodp_task: Validating $storage_name - enabled=$task_enabled, plan=$task_plan"
+    
+    # Check 1: Task must be enabled
+    if [[ "$task_enabled" != "on" ]]; then
+        status="$FAILED"
+        details="${details}Task disabled; "
+        log_debug "validate_oodp_task: Task is disabled"
+    fi
+    
+    # Check 2: Must have SRC plan (Task Plan)
+    if [[ -z "$task_plan" ]] || [[ "$task_plan" == "null" ]]; then
+        status="$FAILED"
+        details="${details}No SRC plan; "
+        log_debug "validate_oodp_task: No SRC plan found"
+    fi
+    
+    # Check 3: Must have at least one DST plan (in destinations)
+    if [[ -z "$task_destinations" ]] || [[ "$task_destinations" == "null" ]] || [[ "$task_destinations" == "[]" ]]; then
+        status="$FAILED"
+        details="${details}No DST plan; "
+        log_debug "validate_oodp_task: No DST destinations found"
+    elif ! echo "$task_destinations" | grep -q "plan.*=>"; then
+        status="$FAILED"
+        details="${details}No DST plan; "
+        log_debug "validate_oodp_task: DST destinations exist but no plan found"
+    fi
+    
+    # Format output for checkup_summary
+    local header_line="    NFS Storage: ${storage_name}"
+    local status_length=${#status}
+    local total_width=94
+    local padding=$((total_width - ${#header_line} - status_length))
+    if [ $padding -lt 1 ]; then padding=1; fi
+    
+    local output
+    output=$(printf "%s%*s%s\n" "$header_line" $padding "" "$status")
+    
+    if [[ "$status" == "$FAILED" ]]; then
+        output="${output}\n    Issues: ${details%%; }"
+    else
+        # Show detailed breakdown for PASSED status with each item on separate lines
+        output="${output}\n    Task enabled"
+        output="${output}\n    SRC plan: ${task_plan}"
+        
+        # Count and show DST plans
+        local dst_count=1
+        if echo "$task_destinations" | grep -c "plan.*=>" >/dev/null 2>&1; then
+            dst_count=$(echo "$task_destinations" | grep -c "plan.*=>")
+        fi
+        output="${output}\n    DST plans: $dst_count destination(s)"
+        
+        # Parse and show destination details
+        if [[ -n "$task_destinations" ]] && [[ "$task_destinations" != "null" ]]; then
+            local destinations_formatted
+            destinations_formatted=$(parse_oodp_destinations "Task Destinations: $task_destinations" 2>/dev/null | tail -n +2)
+            if [[ -n "$destinations_formatted" ]]; then
+                # Add proper indentation to destination details
+                destinations_formatted=$(echo "$destinations_formatted" | sed 's/^/    /')
+                output="${output}\n${destinations_formatted}"
+            fi
+        fi
+    fi
+    
+    echo -e "$output"
+    log_info "validate_oodp_task: $storage_name - $status"
+    return 0
+}
+
+# Main OODP checkup function for system checkup integration
+perform_oodp_checkup() {
+    local temp_file="$1"
+    
+    log_info "perform_oodp_checkup: Starting OODP task status checkup"
+    
+    # Ensure we have REST API credentials
+    if [[ -z "${rest_api_user}" ]] || [[ -z "${rest_api_password}" ]]; then
+        echo "   Configuration error: REST API credentials not configured" >> "$temp_file"
+        echo "   Please run: pve-tools -> Setup -> REST API Configuration" >> "$temp_file"
+        echo "" >> "$temp_file"
+        return 1
+    fi
+    
+    # Build storage IP mapping if not already available
+    if [[ ${#storage_ip_map[@]} -eq 0 ]]; then
+        log_debug "perform_oodp_checkup: Building storage IP map"
+        # This would typically be called from pve-tools context where build_storage_ip_map is available
+        # For now, we'll need to build it locally
+        declare -A local_storage_ip_map
+        
+        while IFS= read -r line; do
+            if [[ "$line" =~ ^nfs:[[:space:]]*([^[:space:]]+) ]]; then
+                local storage_name="${BASH_REMATCH[1]}"
+                local server_ip=""
+                
+                # Read the next few lines to find the server IP
+                while IFS= read -r config_line; do
+                    if [[ "$config_line" =~ ^[[:space:]]*server[[:space:]]+([^[:space:]]+) ]]; then
+                        server_ip="${BASH_REMATCH[1]}"
+                        break
+                    elif [[ "$config_line" =~ ^[[:space:]]*$ ]] || [[ "$config_line" =~ ^[a-zA-Z]+: ]]; then
+                        break
+                    fi
+                done
+                
+                if [[ -n "$server_ip" ]]; then
+                    local_storage_ip_map["$storage_name"]="$server_ip"
+                    log_debug "perform_oodp_checkup: Mapped $storage_name to $server_ip"
+                fi
+            fi
+        done < /etc/pve/storage.cfg
+    fi
+    
+    # Get list of regular (non-cloned) NFS storage
+    local nfs_storage_list
+    nfs_storage_list=$(get_regular_nfs_storage)
+    
+    if [ -z "$nfs_storage_list" ]; then
+        echo "   No regular NFS storage found (excluding cloned storage)" >> "$temp_file"
+        echo "" >> "$temp_file"
+        return 0
+    fi
+    
+    # Process each NFS storage
+    echo -e "$nfs_storage_list" | while IFS= read -r storage_name; do
+        [ -z "$storage_name" ] && continue
+        
+        log_info "perform_oodp_checkup: Processing storage $storage_name"
+        
+        # Get storage IP
+        local storage_ip
+        if [[ -n "${storage_ip_map[$storage_name]}" ]]; then
+            storage_ip="${storage_ip_map[$storage_name]}"
+        elif [[ -n "${local_storage_ip_map[$storage_name]}" ]]; then
+            storage_ip="${local_storage_ip_map[$storage_name]}"
+        fi
+        
+        if [ -z "$storage_ip" ]; then
+            local header_line="    NFS Storage: ${storage_name}"
+            local status_length=9  # Length of "FAILED !"
+            local padding=$((94 - ${#header_line} - status_length))
+            if [ $padding -lt 1 ]; then padding=1; fi
+            
+            printf "%s%*s%s\n" "$header_line" $padding "" "FAILED !" >> "$temp_file"
+            printf "    Issues: Cannot determine storage IP address\n\n" >> "$temp_file"
+            continue
+        fi
+        
+        # Get dataset path from storage.cfg
+        local dataset_path
+        dataset_path=$(awk -v storage="$storage_name" '
+            $0 ~ "^nfs: " storage "$" { in_storage=1; next }
+            in_storage && /^[[:space:]]*export[[:space:]]/ { 
+                gsub(/^[[:space:]]*export[[:space:]]+/, ""); 
+                print; 
+                exit 
+            }
+            in_storage && (/^[[:space:]]*$/ || /^[a-zA-Z]+:/) { exit }
+        ' /etc/pve/storage.cfg)
+        
+        # Extract pool and dataset names from path
+        # Handle two formats: /Pool-0/datastore00 or /datastore00
+        local pool_name
+        local dataset_name
+        if [[ "$dataset_path" =~ ^/([^/]+)/([^/]+)$ ]]; then
+            # Format: /Pool-0/datastore00
+            pool_name="${BASH_REMATCH[1]}"
+            dataset_name="${BASH_REMATCH[2]}"
+        elif [[ "$dataset_path" =~ ^/([^/]+)$ ]]; then
+            # Format: /datastore00 - try to determine pool from dataset name
+            dataset_name="${BASH_REMATCH[1]}"
+            
+            # Try to determine pool name from dataset name pattern
+            if [[ "$dataset_name" =~ datastore([0-9]+) ]]; then
+                local dataset_num="${BASH_REMATCH[1]}"
+                # Remove leading zeros from the number
+                dataset_num=$((10#$dataset_num))
+                pool_name="Pool-${dataset_num}"
+                log_debug "perform_oodp_checkup: Determined pool '$pool_name' from dataset '$dataset_name'"
+            else
+                # Fallback to Pool-0 if we can't determine
+                pool_name="Pool-0"
+                log_debug "perform_oodp_checkup: Using default pool 'Pool-0' for dataset path '$dataset_path'"
+            fi
+        else
+            local header_line="    NFS Storage: ${storage_name}"
+            local status_length=9  # Length of "FAILED !"
+            local padding=$((94 - ${#header_line} - status_length))
+            if [ $padding -lt 1 ]; then padding=1; fi
+            
+            printf "%s%*s%s\n" "$header_line" $padding "" "FAILED !" >> "$temp_file"
+            printf "    Issues: Cannot parse dataset path: %s\n\n" "$dataset_path" >> "$temp_file"
+            continue
+        fi
+        
+        log_debug "perform_oodp_checkup: Parsed path $dataset_path -> pool=$pool_name, dataset=$dataset_name"
+        
+        # Get OODP task details using existing function
+        if get_oodp_details "$storage_ip" "$pool_name" "$dataset_name" >/dev/null 2>&1; then
+            # Validate task requirements and get formatted output
+            local validation_output
+            validation_output=$(validate_oodp_task "$storage_name" "$OODP_TASK_ENABLED" "$OODP_TASK_PLAN" "$OODP_TASK_DESTINATIONS")
+            
+            echo "$validation_output" >> "$temp_file"
+            echo "" >> "$temp_file"
+        else
+            # Format "no task found" error
+            local header_line="    NFS Storage: ${storage_name}"
+            local status_length=9  # Length of "FAILED !"
+            local padding=$((94 - ${#header_line} - status_length))
+            if [ $padding -lt 1 ]; then padding=1; fi
+            
+            printf "%s%*s%s\n" "$header_line" $padding "" "FAILED !" >> "$temp_file"
+            printf "    Issues: Cannot retrieve OODP task details from %s\n\n" "$storage_ip" >> "$temp_file"
+        fi
+    done
+    
+    log_info "perform_oodp_checkup: OODP checkup completed"
+    return 0
+}
+
 # MAIN MENU SYSTEM
 
 # Check background pve-config-backup status
@@ -2611,21 +3375,8 @@ checkup_summary() {
     # 1. VENDOR PRODUCT On- & Off-site Data Protection tasks status
     summary="${summary}1. $VENDOR $PRODUCT On- & Off-site Data Protection tasks status:\n"
     
-    # Source OODP checkup functions
-    if [[ -f "./oodp-checkup.sh" ]]; then
-        source "./oodp-checkup.sh"
-        log_debug "checkup_summary: Sourced oodp-checkup.sh successfully"
-    elif [[ -f "/usr/local/sbin/oodp-checkup.sh" ]]; then
-        source "/usr/local/sbin/oodp-checkup.sh"
-        log_debug "checkup_summary: Sourced /usr/local/sbin/oodp-checkup.sh successfully"
-    else
-        log_error "checkup_summary: oodp-checkup.sh not found"
-        summary="${summary}   ERROR: OODP checkup script not found\n"
-        summary="${summary}\n"
-    fi
-    
-    # Perform OODP checkup if functions are available
-    if declare -f perform_oodp_checkup >/dev/null; then
+    # Perform OODP checkup (functions are now integrated)
+    {
         local oodp_temp_file=$(mktemp)
         
         # Ensure storage IP mapping is available
@@ -2647,11 +3398,7 @@ checkup_summary() {
         fi
         
         rm -f "$oodp_temp_file"
-    else
-        summary="${summary}   ERROR: OODP checkup functions not available\n"
-        summary="${summary}\n"
-        log_error "checkup_summary: perform_oodp_checkup function not found"
-    fi
+    }
     
     summary="${summary}\n"
     
@@ -3184,16 +3931,17 @@ main_menu() {
          --menu "Choose an option:" 20 85 12)
     options=("0" "Add cloned NFS storage from JovianDSS snapshot"
              "1" "Restore VM/CT from cloned NFS storage"
-             "2" "Delete cloned NFS storage in PVE and the cloned dataset in JovianDSS"
-             "3" "Clean up inactive NFS storage"
-             "4" "Clean up unused disks in VM/CT configurations"
-             "5" "Bulk VM/CT operations – start, stop, reboot, and more"
-             "6" "NFS tuning – set nconnect, sync options"
-             "7" "Add VM/CT to Proxmox VE HA resources"
-             "8" "Set up auto-start at boot for JovianDSS VMs"
-             "9" "Apply known issue fixes and tuning"
-             "10" "System check-up"
-             "11" "Help & About pve-tools")
+             "2" "Move storage for VM/CT using cloned NFS storage"
+             "3" "Delete cloned NFS storage in PVE and the cloned dataset in JovianDSS"
+             "4" "Clean up inactive NFS storage"
+             "5" "Clean up unused disks in VM/CT configurations"
+             "6" "Bulk VM/CT operations – start, stop, reboot, and more"
+             "7" "NFS tuning – set nconnect, sync options"
+             "8" "Add VM/CT to Proxmox VE HA resources"
+             "9" "Set up auto-start at boot for JovianDSS VMs"
+             "10" "Apply known issue fixes and tuning"
+             "11" "System check-up"
+             "12" "Help & About pve-tools")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -3207,34 +3955,37 @@ main_menu() {
                 1)  # Restore VM/CT from cloned NFS storage
                     restore_from_clone_wizard
                     ;;
-                2)  # Delete cloned NFS storage in PVE and the cloned dataset in JovianDSS
+                2)  # Move storage for VM/CT using cloned NFS storage
+                    move_storage_cloned_nfs
+                    ;;
+                3)  # Delete cloned NFS storage in PVE and the cloned dataset in JovianDSS
                     delete_cloned_nfs_storage_wizard
                     ;;
-                3)  # Clean up inactive NFS storage
+                4)  # Clean up inactive NFS storage
                     cleanup_inactive_nfs_storage
                     ;;
-                4)  # Clean up unused disks in VM/CT configurations
+                5)  # Clean up unused disks in VM/CT configurations
                     cleanup_unused_disks_wizard
                     ;;
-                5)  # Bulk VM/CT operations – start, stop, reboot, and more
+                6)  # Bulk VM/CT operations – start, stop, reboot, and more
                     vm_ct_manager_bulk_actions
                     ;;
-                6)  # NFS tuning – set nconnect, sync options
+                7)  # NFS tuning – set nconnect, sync options
                     nfs_tuning_wizard
                     ;;
-                7)  # Add VM/CT to Proxmox VE HA resources
+                8)  # Add VM/CT to Proxmox VE HA resources
                     add_vmct_to_ha_resources
                     ;;
-                8)  # Set up auto-start at boot for JovianDSS VMs
+                9)  # Set up auto-start at boot for JovianDSS VMs
                     setup_storage_vm_startup_wizard
                     ;;
-                9)  # Apply known issue fixes and tuning
+                10)  # Apply known issue fixes and tuning
                     post_known_issues_fixes
                     ;;
-                10)  # System check-up
+                11)  # System check-up
                     checkup_summary
                     ;;
-                11)  # Help & About pve-tools
+                12)  # Help & About pve-tools
                     help_about_dialog
                     ;;
             esac
@@ -3845,6 +4596,120 @@ get_cloned_config_file_list() {
     printf '%s\n' "${config_files[@]}" | sort | uniq
 }
 
+
+# Function to get VM/CT IDs that are using cloned NFS storage
+get_vmid_ctid_using_cloned_nfs_storage_list() {
+    local vmct_list=()
+    local vmct_info
+    
+    # Get all VM/CT from cluster resources
+    local vm_list
+    vm_list=$(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
+        python3 -c "
+import sys, json
+try:
+    resources = json.load(sys.stdin)
+    for resource in resources:
+        vmid = resource.get('vmid', '')
+        name = resource.get('name', 'unnamed')
+        res_type = resource.get('type', '')
+        
+        # Map resource type to our format
+        if res_type == 'qemu':
+            vm_type = 'vm'
+        elif res_type == 'lxc':  
+            vm_type = 'ct'
+        else:
+            continue
+            
+        print(f'{vmid}|{name}|{vm_type}')
+except:
+    pass
+")
+    
+    # Process each VM/CT to check if it uses cloned NFS storage
+    while IFS='|' read -r vmid name vm_type; do
+        if [[ -n "$vmid" ]]; then
+            # Get storage name used by this VM/CT
+            local storage_name
+            storage_name=$(get_storage_name_of_id "$vmid" 2>/dev/null)
+            
+            if [[ -n "$storage_name" ]]; then
+                # Check if this storage is NFS
+                if grep -q "^nfs:[[:space:]]*$storage_name" /etc/pve/storage.cfg 2>/dev/null; then
+                    # Get NFS server IP for this storage
+                    local nfs_ip
+                    nfs_ip=$(get_nfs_server_ip_of_given_storage "$storage_name")
+                    
+                    if [[ -n "$nfs_ip" ]]; then
+                        # Get dataset pool name for is_clone check (using cached data)
+                        local pool_name
+                        pool_name=$(get_dataset_pool_name_cached "$storage_name" "$nfs_ip" 2>/dev/null)
+                        
+                        if [[ -n "$pool_name" ]]; then
+                            local volume_name="$pool_name/$storage_name"
+                            
+                            # Check if this storage is a clone (using cached data)
+                            if is_clone_cached "$volume_name" "$nfs_ip"; then
+                                vmct_list+=("$vmid|$vm_type|$name|$storage_name")
+                                log_debug "Found VM/CT $vmid ($vm_type) using cloned storage $storage_name"
+                            fi
+                        fi
+                    fi
+                fi
+            fi
+        fi
+    done <<< "$vm_list"
+    
+    # Output the list
+    printf '%s\n' "${vmct_list[@]}"
+}
+
+# Function to get non-cloned NFS storage list
+get_non_cloned_nfs_storage() {
+    local non_cloned_storages=()
+    
+    # Get all NFS storages
+    local nfs_storages
+    nfs_storages=$(get_nfs_storages)
+    
+    # First, get list of all cloned storages for comparison
+    local cloned_storages
+    cloned_storages=$(get_cloned_storage_list)
+    
+    # Check each NFS storage
+    while read -r storage_name; do
+        if [[ -n "$storage_name" ]]; then
+            # Get NFS server IP for this storage
+            local nfs_ip
+            nfs_ip=$(get_nfs_server_ip_of_given_storage "$storage_name")
+            
+            if [[ -n "$nfs_ip" ]]; then
+                # Check if this storage is in the cloned storage list
+                local is_in_cloned_list=false
+                while read -r cloned_storage; do
+                    if [[ "$cloned_storage" == "$storage_name" ]]; then
+                        is_in_cloned_list=true
+                        break
+                    fi
+                done <<< "$cloned_storages"
+                
+                if [[ "$is_in_cloned_list" == false ]]; then
+                    # This storage is not in the cloned list, so it's non-cloned
+                    non_cloned_storages+=("$storage_name")
+                    log_debug "Found non-cloned NFS storage: $storage_name"
+                else
+                    log_debug "Skipped cloned NFS storage: $storage_name"
+                fi
+            else
+                log_debug "Could not get NFS IP for storage: $storage_name"
+            fi
+        fi
+    done <<< "$nfs_storages"
+    
+    # Output the list
+    printf '%s\n' "${non_cloned_storages[@]}"
+}
 
 # Step 1: Select configuration files for restoration
 step1_select_config() {
@@ -4463,6 +5328,260 @@ restore_from_clone_wizard() {
                 ;;
         esac
     done
+}
+
+# MOVE STORAGE FOR VM/CT USING CLONED NFS STORAGE
+
+# Variables for move storage wizard
+selected_vmcts=()
+selected_target_storage=""
+move_storage_current_step=1
+move_select_all_mode=false
+
+# Main wizard function for moving storage
+move_storage_cloned_nfs() {
+    # Reset variables for move storage wizard
+    selected_vmcts=()
+    selected_target_storage=""
+    move_storage_current_step=1
+    move_select_all_mode=false
+    
+    while true; do
+        case $move_storage_current_step in
+            1)
+                move_storage_step1_select_vmct
+                case $? in
+                    0)  # Next
+                        move_storage_current_step=2
+                        ;;
+                    1)  # Back to Main
+                        return
+                        ;;
+                    2)  # Stay on same step (retry)
+                        ;;
+                esac
+                ;;
+            2)
+                move_storage_step2_select_target_storage
+                case $? in
+                    0)  # Next - execute migration
+                        move_storage_step3_execute_migration
+                        return
+                        ;;
+                    1)  # Back to Main
+                        return
+                        ;;
+                    2)  # Back
+                        move_storage_current_step=1
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+# Step 1: Select VM/CT using cloned NFS storage
+move_storage_step1_select_vmct() {
+    local vmct_data menu_items=() vmct_list=()
+    
+    # Initialize API cache for optimal performance
+    log_info "Initializing API cache for storage migration dialog"
+    if ! init_api_cache; then
+        dialog --msgbox "Failed to initialize API cache.\nStorage migration may be slower than expected." 10 60
+    fi
+    
+    # Get list of VM/CT using cloned NFS storage
+    local vmct_raw_list
+    vmct_raw_list=$(get_vmid_ctid_using_cloned_nfs_storage_list)
+    
+    if [[ -z "$vmct_raw_list" ]]; then
+        dialog --msgbox "No VM/CT found using cloned NFS storage.\nPlease ensure you have VM/CT running on cloned NFS storage." 10 60
+        return 1
+    fi
+    
+    # Process the list into arrays
+    while IFS='|' read -r vmid vm_type name storage_name; do
+        if [[ -n "$vmid" ]]; then
+            vmct_list+=("$vmid|$vm_type|$name|$storage_name")
+        fi
+    done <<< "$vmct_raw_list"
+    
+    # Calculate maximum field lengths for alignment (including parentheses for names)
+    local max_name_len=0 max_storage_len=0
+    for vmct_data in "${vmct_list[@]}"; do
+        IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
+        # Add 2 for parentheses around name: (name)
+        local name_with_parens_len=$((${#name} + 2))
+        if [[ $name_with_parens_len -gt $max_name_len ]]; then
+            max_name_len=$name_with_parens_len
+        fi
+        if [[ ${#storage_name} -gt $max_storage_len ]]; then
+            max_storage_len=${#storage_name}
+        fi
+    done
+    
+    # Build menu items
+    for vmct_data in "${vmct_list[@]}"; do
+        IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
+        
+        # Format the display string with proper alignment
+        local name_with_parens="($name)"
+        local formatted_name=$(printf "%-${max_name_len}s" "$name_with_parens")
+        local display_string=$(printf "%-2s %s  %s" "$vm_type" "$formatted_name" "$storage_name")
+        
+        # Check if this VM/CT was previously selected by checking if vmid is in selected list
+        local status="off"
+        for selected_vmct_data in "${selected_vmcts[@]}"; do
+            IFS='|' read -r selected_vmid _ _ _ <<< "$selected_vmct_data"
+            if [[ "$selected_vmid" == "$vmid" ]]; then
+                status="on"
+                break
+            fi
+        done
+        
+        menu_items+=("$vmid" "$display_string" "$status")
+    done
+    
+    local dialog_selected=$(mktemp)
+    local select_label="Select All"
+    if [[ "$move_select_all_mode" == true ]]; then
+        select_label="Deselect All"
+    fi
+    
+    # Display dialog
+    cmd=(dialog --keep-tite --title "Step 1/2: Select VM/CT for Storage Migration"
+         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "$select_label"
+         --checklist "Choose VM/CT to migrate storage (use SPACE to select/deselect):" 20 100 10)
+    options=("${menu_items[@]}")
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Next
+            if [[ -z "$selected_option" ]]; then
+                dialog --msgbox "Please select at least one VM/CT to migrate." 8 50
+                return 2  # Stay on same step
+            fi
+            
+            # Parse selected VM/CT data - convert vmids back to full data
+            selected_vmcts=()
+            IFS=' ' read -ra selected_vmids <<< "$selected_option" 
+            for selected_vmid in "${selected_vmids[@]}"; do
+                # Remove quotes if present
+                selected_vmid=$(echo "$selected_vmid" | tr -d '"')
+                # Find the corresponding full data for this vmid
+                for vmct_data in "${vmct_list[@]}"; do
+                    IFS='|' read -r vmid _ _ _ <<< "$vmct_data"
+                    if [[ "$vmid" == "$selected_vmid" ]]; then
+                        selected_vmcts+=("$vmct_data")
+                        break
+                    fi
+                done
+            done
+            
+            log_info "Selected ${#selected_vmcts[@]} VM/CT for storage migration"
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Select/Deselect All
+            if [[ "$move_select_all_mode" == false ]]; then
+                # Select all
+                selected_vmcts=("${vmct_list[@]}")
+                move_select_all_mode=true
+                log_info "Selected all VM/CT for migration"
+            else
+                # Deselect all
+                selected_vmcts=()
+                move_select_all_mode=false
+                log_info "Deselected all VM/CT"
+            fi
+            return 2  # Stay on same step
+            ;;
+    esac
+}
+
+# Step 2: Select target non-cloned NFS storage
+move_storage_step2_select_target_storage() {
+    local storage_list menu_items=()
+    
+    # Get list of non-cloned NFS storage
+    local non_cloned_storages
+    non_cloned_storages=$(get_non_cloned_nfs_storage)
+    
+    if [[ -z "$non_cloned_storages" ]]; then
+        dialog --msgbox "No non-cloned NFS storage found.\nPlease add non-cloned NFS storage first." 10 50
+        return 1
+    fi
+    
+    # Process the list
+    while read -r storage_name; do
+        if [[ -n "$storage_name" ]]; then
+            # Get NFS server IP for display
+            local nfs_ip
+            nfs_ip=$(get_nfs_server_ip_of_given_storage "$storage_name")
+            
+            local display_string="$storage_name (NFS Server: ${nfs_ip:-unknown})"
+            
+            # Check if this storage was previously selected
+            local status="off"
+            if [[ "$selected_target_storage" == "$storage_name" ]]; then
+                status="on"
+            fi
+            
+            menu_items+=("$storage_name" "$display_string" "$status")
+        fi
+    done <<< "$non_cloned_storages"
+    
+    local dialog_selected=$(mktemp)
+    
+    # Display dialog
+    cmd=(dialog --keep-tite --title "Step 2/2: Select Target Storage"
+         --ok-label "Migrate" --cancel-label "Back to Main" --extra-button --extra-label "Back"
+         --radiolist "Choose target non-cloned NFS storage:" 15 80 8)
+    options=("${menu_items[@]}")
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Migrate
+            if [[ -z "$selected_option" ]]; then
+                dialog --msgbox "Please select target storage." 8 40
+                return 2  # Stay on same step
+            fi
+            
+            selected_target_storage="$selected_option"
+            log_info "Selected target storage: $selected_target_storage"
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Back
+            return 2
+            ;;
+    esac
+}
+
+# Step 3: Execute migration (placeholder for now)
+move_storage_step3_execute_migration() {
+    local migration_summary=""
+    migration_summary="Migration Summary:\n\n"
+    migration_summary+="Target Storage: $selected_target_storage\n"
+    migration_summary+="VM/CT to migrate: ${#selected_vmcts[@]}\n\n"
+    
+    for vmct_data in "${selected_vmcts[@]}"; do
+        IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
+        migration_summary+="- $vm_type $vmid ($name) from $storage_name\n"
+    done
+    
+    migration_summary+="\nMigration functionality will be implemented here."
+    
+    dialog --msgbox "$migration_summary" 20 80
+    
+    # TODO: Implement actual migration logic
+    log_info "Storage migration completed for ${#selected_vmcts[@]} VM/CT"
 }
 
 # ADD NFS STORAGE WIZARD FUNCTIONS
@@ -6211,18 +7330,29 @@ get_cloned_storage_list() {
             continue
         fi
 
-        # Find which pool this storage belongs to
+        # Find which pool this storage belongs to (using cached data if available)
         local pool_name
-        pool_name=$(get_dataset_pool_name "$storage_name" "$storage_ip")
+        if [[ "$API_CACHE_INITIALIZED" == "true" ]]; then
+            pool_name=$(get_dataset_pool_name_cached "$storage_name" "$storage_ip" 2>/dev/null)
+        else
+            pool_name=$(get_dataset_pool_name "$storage_name" "$storage_ip")
+        fi
+        
         if [[ $? -ne 0 ]]; then
             # Storage not found in any pool, skip it
             continue
         fi
 
-        # Check if this storage is a clone
+        # Check if this storage is a clone (using cached data if available)
         local volume_name="$pool_name/$storage_name"
-        if is_clone "$volume_name" "$storage_ip"; then
-            echo "$storage_name"
+        if [[ "$API_CACHE_INITIALIZED" == "true" ]]; then
+            if is_clone_cached "$volume_name" "$storage_ip"; then
+                echo "$storage_name"
+            fi
+        else
+            if is_clone "$volume_name" "$storage_ip"; then
+                echo "$storage_name"
+            fi
         fi
 
     done <<< "$nfs_storages"

@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information
-VERSION="0.31"
+VERSION="0.32"
 RELEASE_DATE="2025-07-26"
 
 # Script mode flag
@@ -5101,8 +5101,15 @@ restore_vm() {
     current_storage_name="$(grep -P "^(?:scsi|ide|sata|virtio|efidisk|tpmstate|nvme)[0-9]+:\s+[^:]+:[0-9]+/vm" "$dst_conf" | head -1 | awk -F':' '{print $2}' | awk '{$1=$1};1')"
 
     if [[ -n "$current_storage_name" ]]; then
+        # Update storage references for disk devices
         sed -i -E "s@^((scsi|ide|sata|virtio|efidisk|tpmstate|nvme)[0-9]+:) *${current_storage_name}:@\1 ${storage_name}:@g" "$dst_conf"
         log_info "Updated storage reference from $current_storage_name to $storage_name in VM $vmid config"
+        
+        # Update storage references for vmstate files (snapshots)
+        if grep -q "vmstate: ${current_storage_name}:" "$dst_conf"; then
+            sed -i -E "s@^(vmstate:) *${current_storage_name}:@\1 ${storage_name}:@g" "$dst_conf"
+            log_info "Updated vmstate storage reference from $current_storage_name to $storage_name in VM $vmid config"
+        fi
     else
         log_error "Could not find storage reference in VM $vmid config"
         return 1

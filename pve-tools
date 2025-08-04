@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information
-VERSION="0.33"
-RELEASE_DATE="2025-07-28"
+VERSION="0.34"
+RELEASE_DATE="2025-08-04"
 
 # Script mode flag
 VERSION_MODE=false
@@ -82,6 +82,13 @@ nfs_total_steps=5
 selected_nfs_storages=""
 selected_nfs_nconnect=""
 selected_nfs_sync=""
+
+# PVE configuration paths
+ALL_PVE_VM_CONF="/etc/pve/nodes/*/qemu-server/*.conf"
+ALL_PVE_CT_CONF="/etc/pve/nodes/*/lxc/*.conf"
+
+PVE_VM_CONF_PATH="/etc/pve/nodes/*/qemu-server/"
+PVE_CT_CONF_PATH="/etc/pve/nodes/*/lxc/"
 
 # Define device type patterns (from pve-config-backup for comprehensive VM/CT disk detection)
 BUS_DEVS="(?:scsi|ide|sata|virtio|efidisk|tpmstate|nvme)"
@@ -692,6 +699,7 @@ storage_vm_start_at_boot=yes
 storage_vm_start_shutdown_order=1
 storage_vm_startup_deleay=300
 storage_vm_shutdown_timeout=180
+concurrent_vm_disk_move_count=2
 EOF
         log_info "Created default config file: $CONFIG_FILE"
     fi
@@ -709,6 +717,7 @@ storage_vm_start_at_boot=yes
 storage_vm_start_shutdown_order=1
 storage_vm_startup_deleay=300
 storage_vm_shutdown_timeout=180
+concurrent_vm_disk_move_count=2
 EOF
         log_info "Created factory defaults file: $FACTORY_DEFAULTS_FILE"
     fi
@@ -727,7 +736,8 @@ EOF
         log_debug "init_config: rest_api_password length=${#rest_api_password}"
         
         # Show masked password for debugging
-        local masked_pwd="${rest_api_password:0:4}$(printf '%*s' $((${#rest_api_password} - 4)) | tr ' ' '*')"
+        local masked_pwd
+        masked_pwd="${rest_api_password:0:4}$(printf '%*s' $((${#rest_api_password} - 4)) | tr ' ' '*')"
         log_debug "init_config: rest_api_password preview='$masked_pwd'"
         log_debug "init_config: rest_api_port='$rest_api_port'"
         
@@ -737,6 +747,7 @@ EOF
         storage_vm_start_shutdown_order="${storage_vm_start_shutdown_order:-1}"
         storage_vm_startup_deleay="${storage_vm_startup_deleay:-300}"
         storage_vm_shutdown_timeout="${storage_vm_shutdown_timeout:-180}"
+        concurrent_vm_disk_move_count="${concurrent_vm_disk_move_count:-2}"
         custom_ips="${custom_ips:-}"
         
         log_debug "init_config: storage_vm_name_contains='$storage_vm_name_contains'"
@@ -771,7 +782,8 @@ url_encode() {
             [a-zA-Z0-9.~_-]) 
                 encoded+="$char" ;;
             *)
-                local hex_val=$(printf '%%%02X' "'$char")
+                local hex_val
+                hex_val=$(printf '%%%02X' "'$char")
                 log_debug "url_encode: Encoding char '$char' as '$hex_val'"
                 encoded+="$hex_val" ;;
         esac
@@ -791,52 +803,46 @@ upper() {
     echo "${1}" | tr '[:lower:]' '[:upper:]'
 }
 
-# Parse and format OODP Task Destinations
-parse_oodp_destinations() {
-    local destinations_raw="$1"
-    local formatted_output=""
+# Get VM configuration file path for given VMID
+pve_vm_conf_file() {
+    local vmid="$1"
     
-    log_debug "parse_oodp_destinations: Input raw data: '$destinations_raw'"
-    
-    # Extract content between [ and ]
-    local json_content
-    json_content=$(echo "$destinations_raw" | sed 's/.*\[\(.*\)\].*/\1/')
-    log_debug "parse_oodp_destinations: Extracted JSON content: '$json_content'"
-    
-    # Extract dataset and plan using sed/grep
-    local dataset_full
-    local plan_content
-    
-    # Extract dataset value (everything between "dataset":" and "plan")
-    dataset_full=$(echo "$json_content" | sed 's/.*"dataset"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-    log_debug "parse_oodp_destinations: Full dataset: '$dataset_full'"
-    
-    # Extract plan value (everything between "plan":" and the end)
-    plan_content=$(echo "$json_content" | sed 's/.*"plan"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-    log_debug "parse_oodp_destinations: Plan content: '$plan_content'"
-    
-    # Parse dataset: split IP:port and dataset path
-    local ip_port
-    local dataset_path
-    
-    if [[ "$dataset_full" =~ ^([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+)/(.+)$ ]]; then
-        ip_port="${BASH_REMATCH[1]}"
-        dataset_path="${BASH_REMATCH[2]}"
-        log_debug "parse_oodp_destinations: IP:port='$ip_port', dataset path='$dataset_path'"
-    else
-        log_error "parse_oodp_destinations: Failed to parse dataset format: '$dataset_full'"
+    if [[ -z "$vmid" ]]; then
+        log_error "pve_vm_conf_file: VMID parameter is required"
         return 1
     fi
     
-    # Format output as requested
-    formatted_output="Task Destinations:\n"
-    formatted_output="${formatted_output}    DST:    ${dataset_path}    ${ip_port}\n"
-    formatted_output="${formatted_output}    plan:    ${plan_content}"
+    # Find the VM config file across all nodes
+    for conf_file in ${PVE_VM_CONF_PATH}${vmid}.conf; do
+        if [[ -f "$conf_file" ]]; then
+            echo "$conf_file"
+            return 0
+        fi
+    done
     
-    log_debug "parse_oodp_destinations: Formatted output: '$formatted_output'"
-    echo -e "$formatted_output"
+    # VM config file not found
+    return 1
+}
+
+# Get CT configuration file path for given CTID
+pve_ct_conf_file() {
+    local ctid="$1"
     
-    return 0
+    if [[ -z "$ctid" ]]; then
+        log_error "pve_ct_conf_file: CTID parameter is required"
+        return 1
+    fi
+    
+    # Find the CT config file across all nodes
+    for conf_file in ${PVE_CT_CONF_PATH}${ctid}.conf; do
+        if [[ -f "$conf_file" ]]; then
+            echo "$conf_file"
+            return 0
+        fi
+    done
+    
+    # CT config file not found
+    return 1
 }
 
 # Cleanup inactive NFS storage on all cluster nodes
@@ -856,7 +862,8 @@ cleanup_inactive_nfs_storage() {
         return 1
     fi
     
-    local total_nodes=$(echo "$node_list" | wc -l)
+    local total_nodes
+    total_nodes=$(echo "$node_list" | wc -l)
     log_info "Found cluster nodes: $total_nodes nodes"
     
     dialog --infobox "Initializing NFS cleanup on $total_nodes cluster nodes..." 5 60
@@ -872,7 +879,7 @@ cleanup_inactive_nfs_storage() {
         log_info "Processing cleanup for node: $node ($ip)"
         log_debug "Starting SSH connection to $node ($ip) with 60 second timeout"
         (
-        timeout 60 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@"$ip" "bash -s" < /dev/null << 'ENDSCRIPT'
+        timeout 60 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 root@"$ip" "bash -s" << 'ENDSCRIPT'
 log_info() { echo "[$(date '+%F %T')] INFO: $*"; }
 log_debug() { echo "[$(date '+%F %T')] DEBUG: $*"; }
 log_error() { echo "[$(date '+%F %T')] ERROR: $*"; }
@@ -1268,7 +1275,7 @@ ensure_pve_config_backup_running() {
 
         # Check and handle pve-config-backup on this node
         local result
-        result=$(ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" < /dev/null << ENDSCRIPT
+        result=$(ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << ENDSCRIPT
 # Check if pve-config-backup is installed
 if [ ! -f /usr/local/sbin/pve-config-backup ]; then
     # Install pve-config-backup
@@ -1359,7 +1366,7 @@ cleanup_unused_disks_wizard() {
     local unused_display=()
     
     # Scan all VM configs
-    for config_file in /etc/pve/nodes/*/qemu-server/*.conf; do
+    for config_file in $ALL_PVE_VM_CONF; do
         [ -f "$config_file" ] || continue
         
         local vmid=$(basename "$config_file" .conf)
@@ -1375,7 +1382,7 @@ cleanup_unused_disks_wizard() {
     done
     
     # Scan all CT configs
-    for config_file in /etc/pve/nodes/*/lxc/*.conf; do
+    for config_file in $ALL_PVE_CT_CONF; do
         [ -f "$config_file" ] || continue
         
         local ctid=$(basename "$config_file" .conf)
@@ -2779,7 +2786,7 @@ update_pve_config_backup() {
         log_debug "SSH connecting to $node ($ip) for pve-config-backup update"
         log_debug "Using update URL: $github_url"
         local result
-        result=$(ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" < /dev/null << ENDSCRIPT
+        result=$(ssh -o StrictHostKeyChecking=no root@"$ip" "bash -s" << ENDSCRIPT
 
 # Stop the daemon before update
 if [ -f /usr/local/sbin/pve-config-backup ]; then
@@ -2915,22 +2922,49 @@ get_oodp_details() {
     log_debug "get_oodp_details: Making request to: $url"
     
     local response
-    response=$(curl -k -s -X GET -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
-        "$url" 2>&1)
+        "$url" 2>/dev/null)
     local curl_exit=$?
     
     if [[ $curl_exit -ne 0 ]]; then
         log_error "get_oodp_details: Failed to connect to OODP API at $ip_addr:$rest_api_port"
-        log_error "get_oodp_details: curl error: $response"
         return 1
     fi
     
-    log_debug "get_oodp_details: Raw response: $response"
+    # Extract HTTP status code and response body
+    local http_status=$(echo "$response" | tail -n1)
+    local body=$(echo "$response" | sed '$d')
+    
+    log_debug "get_oodp_details: HTTP status: $http_status"
+    log_debug "get_oodp_details: Response body: ${body:0:200}..."
+    
+    # Check for authentication failure
+    check_rest_api_auth_failure "$http_status" "$body" "get_oodp_details"
+    local auth_check_result=$?
+    
+    if [[ $auth_check_result -eq 10 ]]; then
+        log_debug "get_oodp_details: Authentication failure (401), returning special code 10"
+        return 10
+    elif [[ $auth_check_result -eq 11 ]]; then
+        log_debug "get_oodp_details: Access forbidden (403), returning special code 11"
+        return 11
+    elif [[ $auth_check_result -ne 0 ]]; then
+        log_debug "get_oodp_details: Authentication check failed with code $auth_check_result"
+        return 1
+    fi
+    
+    # Check for successful response
+    if [[ "$http_status" != "200" ]]; then
+        log_error "get_oodp_details: REST API call failed with HTTP status $http_status"
+        return 1
+    fi
+    
+    log_debug "get_oodp_details: Raw response body: ${body:0:200}..."
     
     # Check if response contains error (but not null)
-    if echo "$response" | grep -q '"error":[[:space:]]*"[^"]*"'; then
-        local error_msg=$(echo "$response" | grep -o '"error"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    if echo "$body" | grep -q '"error":[[:space:]]*"[^"]*"'; then
+        local error_msg=$(echo "$body" | grep -o '"error"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"error"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
         log_error "get_oodp_details: API returned error: $error_msg"
         return 1
     fi
@@ -2938,7 +2972,7 @@ get_oodp_details() {
     # Store results in temporary file for processing
     local temp_file
     temp_file=$(mktemp)
-    echo "$response" > "$temp_file"
+    echo "$body" > "$temp_file"
     
     # Search for matching task based on pool_name and dataset_name
     local task_found=false
@@ -3047,8 +3081,8 @@ parse_oodp_destinations() {
     
     # Format output as requested
     formatted_output="Task Destinations:\n"
-    formatted_output="${formatted_output}    DST:    ${dataset_path}    ${ip_port}\n"
-    formatted_output="${formatted_output}    plan:    ${plan_content}"
+    formatted_output="${formatted_output}  DST:  ${dataset_path}    ${ip_port}\n"
+    formatted_output="${formatted_output}  plan: ${plan_content}"
     
     log_debug "parse_oodp_destinations: Formatted output: '$formatted_output'"
     echo -e "$formatted_output"
@@ -3108,6 +3142,8 @@ validate_oodp_task() {
     
     local PASSED='PASSED'
     local FAILED='FAILED !'
+    local MISSING_DST='MISSING DST'
+    local TASK_DISABLED='TASK DISABLED'
     
     local status="$PASSED"
     local details=""
@@ -3116,9 +3152,24 @@ validate_oodp_task() {
     
     # Check 1: Task must be enabled
     if [[ "$task_enabled" != "on" ]]; then
-        status="$FAILED"
-        details="${details}Task disabled; "
+        status="$TASK_DISABLED"
+        details="Task disabled"
         log_debug "validate_oodp_task: Task is disabled"
+        
+        # Format output and return early for disabled tasks
+        local header_line="    NFS Storage: ${storage_name}"
+        local status_length=${#status}
+        local total_width=94
+        local padding=$((total_width - ${#header_line} - status_length))
+        if [ $padding -lt 1 ]; then padding=1; fi
+        
+        local output
+        output=$(printf "%s%*s%s\n" "$header_line" $padding "" "$status")
+        output="${output}\n    ${details}"
+        
+        echo -e "$output"
+        log_info "validate_oodp_task: $storage_name - $status"
+        return 0
     fi
     
     # Check 2: Must have SRC plan (Task Plan)
@@ -3130,11 +3181,11 @@ validate_oodp_task() {
     
     # Check 3: Must have at least one DST plan (in destinations)
     if [[ -z "$task_destinations" ]] || [[ "$task_destinations" == "null" ]] || [[ "$task_destinations" == "[]" ]]; then
-        status="$FAILED"
+        status="$MISSING_DST"
         details="${details}No DST plan; "
         log_debug "validate_oodp_task: No DST destinations found"
     elif ! echo "$task_destinations" | grep -q "plan.*=>"; then
-        status="$FAILED"
+        status="$MISSING_DST"
         details="${details}No DST plan; "
         log_debug "validate_oodp_task: DST destinations exist but no plan found"
     fi
@@ -3149,7 +3200,7 @@ validate_oodp_task() {
     local output
     output=$(printf "%s%*s%s\n" "$header_line" $padding "" "$status")
     
-    if [[ "$status" == "$FAILED" ]]; then
+    if [[ "$status" == "$FAILED" ]] || [[ "$status" == "$MISSING_DST" ]]; then
         output="${output}\n    Issues: ${details%%; }"
     else
         # Show detailed breakdown for PASSED status with each item on separate lines
@@ -3192,6 +3243,110 @@ perform_oodp_checkup() {
         echo "   Please run: pve-tools -> Setup -> REST API Configuration" >> "$temp_file"
         echo "" >> "$temp_file"
         return 1
+    fi
+    
+    # Test REST API authentication before starting OODP tasks
+    log_debug "perform_oodp_checkup: Testing REST API authentication"
+    # We need to test with a known IP - let's use the first available storage IP
+    local test_ip=""
+    
+    # Try to get the first NFS storage IP for authentication test
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^nfs:[[:space:]]*([^[:space:]]+) ]]; then
+            local storage_name="${BASH_REMATCH[1]}"
+            # Read the next few lines to find the server IP
+            while IFS= read -r config_line; do
+                if [[ "$config_line" =~ ^[[:space:]]*server[[:space:]]+([^[:space:]]+) ]]; then
+                    test_ip="${BASH_REMATCH[1]}"
+                    log_debug "perform_oodp_checkup: Using IP $test_ip for authentication test"
+                    break 2  # Break out of both loops
+                elif [[ "$config_line" =~ ^[[:space:]]*$ ]] || [[ "$config_line" =~ ^[a-zA-Z]+: ]]; then
+                    break
+                fi
+            done
+        fi
+    done < /etc/pve/storage.cfg
+    
+    if [[ -n "$test_ip" ]]; then
+        # Test authentication with a simple API call
+        local auth_test_response
+        auth_test_response=$(curl -k -s -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+            -H 'Content-Type: application/json' \
+            "https://$test_ip:$rest_api_port/api/v4/conn_test" 2>/dev/null)
+        local auth_curl_exit=$?
+        
+        if [[ $auth_curl_exit -eq 0 ]]; then
+            local auth_http_status=$(echo "$auth_test_response" | tail -n1)
+            local auth_body=$(echo "$auth_test_response" | sed '$d')
+            
+            log_debug "perform_oodp_checkup: Authentication test status: $auth_http_status"
+            
+            if [[ "$auth_http_status" == "401" ]]; then
+                # Format with same style as other checkup statuses
+                local header_line="    OODP Tasks"
+                local status_text="Authentication FAILED"
+                local status_length=${#status_text}
+                local padding=$((104 - ${#header_line} - status_length))
+                if [ $padding -lt 1 ]; then padding=1; fi
+                
+                printf "%s%*s%s\n" "$header_line" $padding "" "$status_text" >> "$temp_file"
+                echo "    Issues: REST API credentials are incorrect" >> "$temp_file"
+                echo "            The username or password has been changed on the storage server." >> "$temp_file"
+                echo "            Please run: pve-tools -> Setup -> Configure REST API" >> "$temp_file"
+                echo "            Current user: $rest_api_user" >> "$temp_file"
+                echo "" >> "$temp_file"
+                log_error "perform_oodp_checkup: REST API authentication failed (401) - skipping OODP checkup"
+                return 1
+            elif [[ "$auth_http_status" == "403" ]]; then
+                # Format with same style as other checkup statuses
+                local header_line="    OODP Tasks"
+                local status_text="Authentication FAILED"
+                local status_length=${#status_text}
+                local padding=$((104 - ${#header_line} - status_length))
+                if [ $padding -lt 1 ]; then padding=1; fi
+                
+                printf "%s%*s%s\n" "$header_line" $padding "" "$status_text" >> "$temp_file"
+                echo "    Issues: Access forbidden" >> "$temp_file"
+                echo "            The user '$rest_api_user' does not have permission for this operation." >> "$temp_file"
+                echo "            Please check user permissions on the storage server." >> "$temp_file"
+                echo "" >> "$temp_file"
+                log_error "perform_oodp_checkup: REST API access forbidden (403) - skipping OODP checkup"
+                return 1
+            elif [[ "$auth_http_status" != "200" ]]; then
+                # Format with same style as other checkup statuses
+                local header_line="    OODP Tasks"
+                local status_text="Connection FAILED"
+                local status_length=${#status_text}
+                local padding=$((104 - ${#header_line} - status_length))
+                if [ $padding -lt 1 ]; then padding=1; fi
+                
+                printf "%s%*s%s\n" "$header_line" $padding "" "$status_text" >> "$temp_file"
+                echo "    Issues: Cannot connect to storage server ($test_ip)" >> "$temp_file"
+                echo "            HTTP status: $auth_http_status" >> "$temp_file"
+                echo "            Please check network connectivity and server configuration." >> "$temp_file"
+                echo "" >> "$temp_file"
+                log_error "perform_oodp_checkup: REST API connection failed (HTTP $auth_http_status) - skipping OODP checkup"
+                return 1
+            fi
+            
+            log_debug "perform_oodp_checkup: Authentication test successful"
+        else
+            # Format with same style as other checkup statuses
+            local header_line="    OODP Tasks"
+            local status_text="Connection FAILED"
+            local status_length=${#status_text}
+            local padding=$((104 - ${#header_line} - status_length))
+            if [ $padding -lt 1 ]; then padding=1; fi
+            
+            printf "%s%*s%s\n" "$header_line" $padding "" "$status_text" >> "$temp_file"
+            echo "    Issues: Cannot connect to storage server ($test_ip)" >> "$temp_file"
+            echo "            Please check network connectivity and server configuration." >> "$temp_file"
+            echo "" >> "$temp_file"
+            log_error "perform_oodp_checkup: Failed to connect for authentication test - skipping OODP checkup"
+            return 1
+        fi
+    else
+        log_debug "perform_oodp_checkup: No NFS storage IP found for authentication test, proceeding"
     fi
     
     # Build storage IP mapping if not already available
@@ -3251,7 +3406,7 @@ perform_oodp_checkup() {
         if [ -z "$storage_ip" ]; then
             local header_line="    NFS Storage: ${storage_name}"
             local status_length=9  # Length of "FAILED !"
-            local padding=$((94 - ${#header_line} - status_length))
+            local padding=$((104 - ${#header_line} - status_length))
             if [ $padding -lt 1 ]; then padding=1; fi
             
             printf "%s%*s%s\n" "$header_line" $padding "" "FAILED !" >> "$temp_file"
@@ -3298,7 +3453,7 @@ perform_oodp_checkup() {
         else
             local header_line="    NFS Storage: ${storage_name}"
             local status_length=9  # Length of "FAILED !"
-            local padding=$((94 - ${#header_line} - status_length))
+            local padding=$((104 - ${#header_line} - status_length))
             if [ $padding -lt 1 ]; then padding=1; fi
             
             printf "%s%*s%s\n" "$header_line" $padding "" "FAILED !" >> "$temp_file"
@@ -3309,18 +3464,39 @@ perform_oodp_checkup() {
         log_debug "perform_oodp_checkup: Parsed path $dataset_path -> pool=$pool_name, dataset=$dataset_name"
         
         # Get OODP task details using existing function
-        if get_oodp_details "$storage_ip" "$pool_name" "$dataset_name" >/dev/null 2>&1; then
+        get_oodp_details "$storage_ip" "$pool_name" "$dataset_name" >/dev/null 2>&1
+        local oodp_exit=$?
+        
+        if [[ $oodp_exit -eq 0 ]]; then
             # Validate task requirements and get formatted output
             local validation_output
             validation_output=$(validate_oodp_task "$storage_name" "$OODP_TASK_ENABLED" "$OODP_TASK_PLAN" "$OODP_TASK_DESTINATIONS")
             
             echo "$validation_output" >> "$temp_file"
             echo "" >> "$temp_file"
-        else
-            # Format "no task found" error
+        elif [[ $oodp_exit -eq 10 ]]; then
+            # Authentication failure - this should not happen here since we tested at the beginning
             local header_line="    NFS Storage: ${storage_name}"
             local status_length=9  # Length of "FAILED !"
-            local padding=$((94 - ${#header_line} - status_length))
+            local padding=$((104 - ${#header_line} - status_length))
+            if [ $padding -lt 1 ]; then padding=1; fi
+            
+            printf "%s%*s%s\n" "$header_line" $padding "" "FAILED !" >> "$temp_file"
+            printf "    Issues: REST API authentication failed for %s\n\n" "$storage_ip" >> "$temp_file"
+        elif [[ $oodp_exit -eq 11 ]]; then
+            # Access forbidden - this should not happen here since we tested at the beginning
+            local header_line="    NFS Storage: ${storage_name}"
+            local status_length=9  # Length of "FAILED !"
+            local padding=$((104 - ${#header_line} - status_length))
+            if [ $padding -lt 1 ]; then padding=1; fi
+            
+            printf "%s%*s%s\n" "$header_line" $padding "" "FAILED !" >> "$temp_file"
+            printf "    Issues: REST API access forbidden for %s\n\n" "$storage_ip" >> "$temp_file"
+        else
+            # Other error (no task found, connection error, etc.)
+            local header_line="    NFS Storage: ${storage_name}"
+            local status_length=9  # Length of "FAILED !"
+            local padding=$((104 - ${#header_line} - status_length))
             if [ $padding -lt 1 ]; then padding=1; fi
             
             printf "%s%*s%s\n" "$header_line" $padding "" "FAILED !" >> "$temp_file"
@@ -3665,28 +3841,28 @@ checkup_summary() {
     # 3. $PRODUCT VM Start-at-boot STATUS
     summary="${summary}4. $PRODUCT VM Start-at-boot Status:\n"
     
-    log_info "DEBUG: Starting point 3 checkup - $PRODUCT VM Start-at-boot Status"
+    log_debug " Starting point 3 checkup - $PRODUCT VM Start-at-boot Status"
     
     # Get storage VMs with their start-at-boot settings using existing function
     local storage_vms
     storage_vms=$(get_storage_vms)
     
-    log_info "DEBUG: get_storage_vms output: $storage_vms"
-    log_info "DEBUG: PRODUCT variable value: '$PRODUCT'"
+    log_debug " get_storage_vms output: $storage_vms"
+    log_debug " PRODUCT variable value: '$PRODUCT'"
     
     if [ -n "$storage_vms" ]; then
-        log_info "DEBUG: storage_vms is not empty, processing entries"
+        log_debug " storage_vms is not empty, processing entries"
         local vm_count=0
         local matched_count=0
         
         echo "$storage_vms" | while IFS='|' read -r vmid vm_name vm_type start_at_boot order up down conf_file; do
             vm_count=$((vm_count + 1))
-            log_info "DEBUG: Processing VM #$vm_count: vmid='$vmid' vm_name='$vm_name' vm_type='$vm_type' start_at_boot='$start_at_boot' order='$order' up='$up' down='$down'"
+            log_debug " Processing VM #$vm_count: vmid='$vmid' vm_name='$vm_name' vm_type='$vm_type' start_at_boot='$start_at_boot' order='$order' up='$up' down='$down'"
             
             # Case-insensitive pattern matching
             if [[ "${vm_name,,}" =~ ${PRODUCT,,} ]]; then
                 matched_count=$((matched_count + 1))
-                log_info "DEBUG: VM '$vm_name' matches PRODUCT pattern '$PRODUCT' (match #$matched_count)"
+                log_debug " VM '$vm_name' matches PRODUCT pattern '$PRODUCT' (match #$matched_count)"
                 
                 local vm_status="$PASSED"
                 
@@ -3694,18 +3870,18 @@ checkup_summary() {
                 [ -z "$up" ] && up="300"
                 [ -z "$down" ] && down="180"
                 
-                log_info "DEBUG: Final values - order='$order' up='$up' down='$down'"
+                log_debug " Final values - order='$order' up='$up' down='$down'"
                 
                 # Determine overall status - PASSED only if all settings match factory defaults
                 if [ "$start_at_boot" != "yes" ]; then
                     vm_status="$DISABLED"
-                    log_info "DEBUG: VM status set to DISABLED because start_at_boot='$start_at_boot' != 'yes'"
+                    log_debug " VM status set to DISABLED because start_at_boot='$start_at_boot' != 'yes'"
                 elif [ -z "$order" ] || [ "$order" != "$storage_vm_start_shutdown_order" ] || [ "$up" != "$storage_vm_startup_deleay" ] || [ "$down" != "$storage_vm_shutdown_timeout" ]; then
                     vm_status="$FAILED"
-                    log_info "DEBUG: VM status set to FAILED because settings don't match factory defaults - order='$order' (expected '$storage_vm_start_shutdown_order'), up='$up' (expected '$storage_vm_startup_deleay'), down='$down' (expected '$storage_vm_shutdown_timeout')"
+                    log_debug " VM status set to FAILED because settings don't match factory defaults - order='$order' (expected '$storage_vm_start_shutdown_order'), up='$up' (expected '$storage_vm_startup_deleay'), down='$down' (expected '$storage_vm_shutdown_timeout')"
                 else
                     vm_status="$PASSED"
-                    log_info "DEBUG: VM status set to PASSED because all settings match factory defaults"
+                    log_debug " VM status set to PASSED because all settings match factory defaults"
                 fi
                 
                 # Format with right-aligned status - use the VM header line for alignment
@@ -3719,7 +3895,7 @@ checkup_summary() {
                     padding=1
                 fi
                 
-                log_info "DEBUG: Writing VM data to temp file: $temp_file"
+                log_debug " Writing VM data to temp file: $temp_file"
                 
                 # Write the header with status, then the details
                 printf "%s%*s%s\n" "$header_line" $padding "" "$vm_status" >> "$temp_file"
@@ -3729,28 +3905,28 @@ checkup_summary() {
                 printf "     Shutdown timeout: %s seconds\n" "$down" >> "$temp_file"
                 printf "\n" >> "$temp_file"
             else
-                log_info "DEBUG: VM '$vm_name' does NOT match PRODUCT pattern '$PRODUCT'"
+                log_debug " VM '$vm_name' does NOT match PRODUCT pattern '$PRODUCT'"
             fi
         done
         
-        log_info "DEBUG: Processed $vm_count total VMs, $matched_count matched PRODUCT pattern"
+        log_debug " Processed $vm_count total VMs, $matched_count matched PRODUCT pattern"
         
         if [ -f "$temp_file" ]; then
             local temp_content
             temp_content=$(cat "$temp_file")
-            log_info "DEBUG: temp_file exists and contains: $temp_content"
+            log_debug " temp_file exists and contains: $temp_content"
             summary="${summary}$(cat "$temp_file")\n"
             rm -f "$temp_file"
         else
-            log_info "DEBUG: temp_file does not exist or is empty"
+            log_debug " temp_file does not exist or is empty"
             summary="${summary}   No $PRODUCT VMs found or no startup configuration data available\n"
         fi
     else
-        log_info "DEBUG: storage_vms is empty - no VM data returned from get_storage_vms"
+        log_debug " storage_vms is empty - no VM data returned from get_storage_vms"
         summary="${summary}   No VM data available from get_storage_vms function\n"
     fi
     
-    log_info "DEBUG: Point 3 checkup completed"
+    log_debug " Point 3 checkup completed"
     
     summary="${summary}\n"
     
@@ -3910,7 +4086,7 @@ checkup_summary() {
     echo -e "$summary" > "$temp_file"
     dialog --title "System Checkup Summary" \
            --ok-label "Close" \
-           --textbox "$temp_file" 25 100
+           --textbox "$temp_file" 40 110
     
     rm -f "$temp_file"
     log_info "System checkup summary completed"
@@ -4044,16 +4220,17 @@ help_about_dialog() {
     help_text+="---------------\n"
     help_text+="0. Add cloned NFS storage from $PRODUCT snapshot\n"
     help_text+="1. Restore VM/CT from cloned NFS storage\n"
-    help_text+="2. Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT\n"
-    help_text+="3. Clean up inactive NFS storage\n"
-    help_text+="4. Clean up unused disks in VM/CT configurations\n"
-    help_text+="5. Bulk VM/CT operations – start, stop, reboot, and more\n"
-    help_text+="6. NFS tuning – set nconnect, sync options\n"
-    help_text+="7. Add VM/CT to Proxmox VE HA resources\n"
-    help_text+="8. Set up auto-start at boot for $PRODUCT VMs\n"
-    help_text+="9. Apply known issue fixes and tuning\n"
-    help_text+="10. System check-up\n"
-    help_text+="11. Help & About pve-tools\n"
+    help_text+="2. Move storage for VM/CT using cloned NFS storage\n"
+    help_text+="3. Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT\n"
+    help_text+="4. Clean up inactive NFS storage\n"
+    help_text+="5. Clean up unused disks in VM/CT configurations\n"
+    help_text+="6. Bulk VM/CT operations – start, stop, reboot, and more\n"
+    help_text+="7. NFS tuning – set nconnect, sync options\n"
+    help_text+="8. Add VM/CT to Proxmox VE HA resources\n"
+    help_text+="9. Set up auto-start at boot for $PRODUCT VMs\n"
+    help_text+="10. Apply known issue fixes and tuning\n"
+    help_text+="11. System check-up\n"
+    help_text+="12. Help & About pve-tools\n"
     help_text+="\n"
     help_text+="REQUIREMENTS:\n"
     help_text+="-------------\n"
@@ -4082,9 +4259,10 @@ setup_dialog() {
     
     cmd=(dialog --keep-tite --title "Setup Configuration"
          --ok-label "Select" --cancel-label "Back" 
-         --menu "Choose setup option:" 12 70 2)
+         --menu "Choose setup option:" 14 70 3)
     options=("1" "REST API Configuration"
-             "2" "Storage VM Startup Settings")
+             "2" "Storage VM Startup Settings"
+             "3" "Move Storage: Concurrent VM Disk Move Count")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -4097,6 +4275,9 @@ setup_dialog() {
                     ;;
                 2)  # Storage VM Startup Settings
                     setup_storage_vm_dialog
+                    ;;
+                3)  # Move Storage: Concurrent VM Disk Move Count
+                    setup_disk_move_dialog
                     ;;
             esac
             ;;
@@ -4248,6 +4429,39 @@ setup_storage_vm_dialog() {
     return 0
 }
 
+# Display setup dialog for disk move configuration
+setup_disk_move_dialog() {
+    local dialog_selected=$(mktemp)
+    local form_data=$(mktemp)
+    local temp_count="$concurrent_vm_disk_move_count"
+    
+    # Create dialog with inputbox
+    dialog --keep-tite --title "Move Storage: Concurrent VM Disk Move Count" \
+           --ok-label "Save" --cancel-label "Back" \
+           --inputbox "This setting controls how many VMs can be migrated simultaneously during storage move operations.\n\nHigher values allow faster migration but consume more system resources.\nRecommended values: 1-4 (default: 2)\n\nEnter concurrent VM disk move count:" 14 70 "$temp_count" \
+           2> "$form_data"
+    
+    local exit_code=$?
+    
+    if [ $exit_code -eq 0 ]; then
+        temp_count=$(cat "$form_data")
+        
+        # Validate input (must be a positive integer)
+        if [[ "$temp_count" =~ ^[1-9][0-9]*$ ]]; then
+            concurrent_vm_disk_move_count="$temp_count"
+            log_info "User saved concurrent VM disk move count: $concurrent_vm_disk_move_count"
+            save_config_file
+            dialog --msgbox "Concurrent VM disk move count saved successfully!\n\nSet to: $concurrent_vm_disk_move_count VMs" 8 60
+        else
+            dialog --msgbox "Invalid input. Please enter a positive integer (1 or greater)." 8 60
+        fi
+    fi
+    
+    rm -f "$form_data"
+    rm -f "$dialog_selected"
+    return 0
+}
+
 # Display setup dialog for custom IPs configuration
 setup_custom_ips_dialog() {
     local dialog_selected=$(mktemp)
@@ -4360,6 +4574,7 @@ storage_vm_start_at_boot=${storage_vm_start_at_boot:-yes}
 storage_vm_start_shutdown_order=${storage_vm_start_shutdown_order:-1}
 storage_vm_startup_deleay=${storage_vm_startup_deleay:-300}
 storage_vm_shutdown_timeout=${storage_vm_shutdown_timeout:-180}
+concurrent_vm_disk_move_count=${concurrent_vm_disk_move_count:-2}
 EOF
     log_info "Configuration saved to $CONFIG_FILE"
 }
@@ -5342,27 +5557,42 @@ restore_from_clone_wizard() {
 # Variables for move storage wizard
 selected_vmcts=()
 selected_target_storage=""
-move_storage_current_step=1
+move_storage_current_step=0
 move_select_all_mode=false
+move_storage_mode=""
 
 # Main wizard function for moving storage
 move_storage_cloned_nfs() {
     # Reset variables for move storage wizard
     selected_vmcts=()
     selected_target_storage=""
-    move_storage_current_step=1
+    move_storage_current_step=0
     move_select_all_mode=false
+    move_storage_mode=""
     
     while true; do
         case $move_storage_current_step in
+            0)
+                move_storage_step0_select_mode
+                case $? in
+                    0)  # Next
+                        move_storage_current_step=1
+                        ;;
+                    1)  # Back to Main
+                        return
+                        ;;
+                    2)  # Stay on same step (retry)
+                        ;;
+                esac
+                ;;
             1)
                 move_storage_step1_select_vmct
                 case $? in
                     0)  # Next
                         move_storage_current_step=2
                         ;;
-                    1)  # Back to Main
-                        return
+                    1)  # Back
+                        move_storage_current_step=0
                         ;;
                     2)  # Stay on same step (retry)
                         ;;
@@ -5381,10 +5611,101 @@ move_storage_cloned_nfs() {
                     2)  # Back
                         move_storage_current_step=1
                         ;;
+                    3)  # Stay on same step (retry)
+                        ;;
                 esac
                 ;;
         esac
     done
+}
+
+# Step 0: Select migration mode
+move_storage_step0_select_mode() {
+    local dialog_selected=$(mktemp)
+    
+    cmd=(dialog --keep-tite --title "Storage Migration Mode Selection - Step 1/3"
+         --ok-label "Next" --cancel-label "Back" 
+         --menu "Select storage migration mode:\n\nIMPORTANT: The mode selection affects which VMs can be migrated:" 16 85 2)
+    
+    options=("preserve" "Preserve VM snapshots (VMs must be powered OFF)"
+             "standard" "Do not preserve VM snapshots (VMs can be powered ON or OFF)")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Next
+            case "$selected_option" in
+                preserve)
+                    move_storage_mode="preserve-snapshots"
+                    log_info "User selected preserve snapshots mode"
+                    ;;
+                standard)
+                    move_storage_mode="standard"
+                    log_info "User selected standard mode (no snapshot preservation)"
+                    
+                    # Warning dialog - user must type "delete" to confirm
+                    local confirm_input=$(mktemp)
+                    dialog --inputbox "WARNING: Standard migration mode will DELETE all VM local snapshots (qcow2 based) before the Disk Move is started.\n\nThis operation is irreversible!\n\nTo confirm and proceed with standard migration mode, type 'delete':" 16 80 2> "$confirm_input"
+                    local exit_code=$?
+                    local confirmation=$(trimq "$(cat "$confirm_input")")
+                    rm -f "$confirm_input"
+                    
+                    if [[ $exit_code -ne 0 || "$confirmation" != "delete" ]]; then
+                        dialog --msgbox "Standard migration mode cancelled." 8 40
+                        return 1
+                    fi
+                    
+                    log_info "User confirmed standard mode with snapshot deletion"
+                    ;;
+            esac
+            return 0
+            ;;
+        1)  # Back
+            return 1
+            ;;
+    esac
+}
+
+# VM/CT power state checking functions for disk migration
+vm_type() {
+    local vmid="$1"
+
+    # Check if LXC config exists and contains container-specific entries
+    if [[ -d "/etc/pve/nodes" ]] && grep -Eq '(rootfs|mp[0-9]+)' /etc/pve/nodes/*/lxc/${vmid}.conf 2>/dev/null; then
+        echo "ct"
+    else
+        echo "vm"
+    fi
+}
+
+is_power_on() {
+    local vmid="$1"
+    local type status
+
+    # Determine if this is a VM or CT
+    type=$(vm_type "$vmid")
+
+    # Get status using appropriate command
+    if command -v qm >/dev/null 2>&1 && command -v pct >/dev/null 2>&1; then
+        if [[ "$type" == "ct" ]]; then
+            status=$(pct status "$vmid" 2>/dev/null | awk '{print $2}')
+        else
+            status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}')
+        fi
+    else
+        log_error "Required commands (qm/pct) not available for VM/CT status check"
+        return 1
+    fi
+
+    # Check power status
+    if [[ "$status" == "running" ]]; then
+        log_debug "VM/CT $vmid is running"
+        return 0
+    else
+        log_debug "VM/CT $vmid is not running (status: $status)"
+        return 1
+    fi
 }
 
 # Step 1: Select VM/CT using cloned NFS storage
@@ -5406,12 +5727,36 @@ move_storage_step1_select_vmct() {
         return 1
     fi
     
-    # Process the list into arrays
+    # Process the list into arrays with power state filtering based on mode
     while IFS='|' read -r vmid vm_type name storage_name; do
         if [[ -n "$vmid" ]]; then
+            # Check power state for filtering based on mode
+            if [[ "$move_storage_mode" == "preserve-snapshots" ]]; then
+                # In preserve mode, only include powered off VMs
+                if is_power_on "$vmid"; then
+                    log_debug "Excluding VM/CT $vmid (running) - preserve mode requires powered off VMs"
+                    continue
+                else
+                    log_debug "Including VM/CT $vmid (powered off) - compatible with preserve mode"
+                fi
+            else
+                # In standard mode, include all VMs regardless of power state
+                log_debug "Including VM/CT $vmid - standard mode accepts any power state"
+            fi
+            
             vmct_list+=("$vmid|$vm_type|$name|$storage_name")
         fi
     done <<< "$vmct_raw_list"
+    
+    # Check if filtering resulted in an empty list
+    if [[ ${#vmct_list[@]} -eq 0 ]]; then
+        if [[ "$move_storage_mode" == "preserve-snapshots" ]]; then
+            dialog --msgbox "No powered-off VM/CT found using cloned NFS storage.\n\nFor snapshot preservation mode, VMs must be powered OFF.\nPlease power off your VMs or use standard mode." 12 70
+        else
+            dialog --msgbox "No VM/CT found using cloned NFS storage after filtering.\nPlease ensure you have VM/CT using cloned NFS storage." 10 60
+        fi
+        return 1
+    fi
     
     # Calculate maximum field lengths for alignment (including parentheses for names)
     local max_name_len=0 max_storage_len=0
@@ -5457,7 +5802,7 @@ move_storage_step1_select_vmct() {
     
     # Display dialog
     cmd=(dialog --keep-tite --title "Step 1/2: Select VM/CT for Storage Migration"
-         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "$select_label"
+         --ok-label "Next" --cancel-label "Back" --extra-button --extra-label "$select_label"
          --checklist "Choose VM/CT to migrate storage (use SPACE to select/deselect):" 20 100 10)
     options=("${menu_items[@]}")
     dialog_menu
@@ -5555,7 +5900,7 @@ move_storage_step2_select_target_storage() {
         0)  # Migrate
             if [[ -z "$selected_option" ]]; then
                 dialog --msgbox "Please select target storage." 8 40
-                return 2  # Stay on same step
+                return 3  # Stay on same step
             fi
             
             selected_target_storage="$selected_option"
@@ -5571,24 +5916,528 @@ move_storage_step2_select_target_storage() {
     esac
 }
 
-# Step 3: Execute migration (placeholder for now)
+# Disk migration helper functions (from disk-move)
+gather_disks() {
+    local vmid="$1"
+    local SRC="$2"
+
+    log_debug "Gathering disks on $SRC for VM $vmid"
+
+    # Parse VM config to find disks on source storage
+    # Format: "device: storage:vm-ID-disk-N,options..."
+    # Extract device name (before first colon)
+    if command -v qm >/dev/null 2>&1; then
+        log_debug "Querying VM config for disks..."
+        if ! mapfile -t disks < <(timeout 10s qm config "$vmid" | grep "$SRC" | awk -F: '{print $1}'); then
+            log_error "Failed to query VM config for VM $vmid"
+            return 1
+        fi
+    else
+        log_error "qm command not available"
+        return 1
+    fi
+
+    # Check if any disks were found
+    if [[ ${#disks[@]} -eq 0 ]]; then
+        log_debug "No disks found on source storage $SRC for VM $vmid"
+        return 1
+    else
+        log_debug "Found disks for VM $vmid: ${disks[*]}"
+        return 0
+    fi
+}
+
+launch_disk_move() {
+    local vmid="$1"
+    local SRC="$2"
+    local DST="$3"
+    local CONFIG_DIR="/etc/pve/nodes/$(hostname)/qemu-server"
+
+    log_info "Launching disk move operations for VM $vmid from $SRC to $DST"
+    log_info "Using nohup pattern - processes will survive shell exit"
+    
+    # Initialize disk move PIDs array for this VM
+    disk_move_pids=()
+
+    # Process each disk found by gather_disks
+    for disk in "${disks[@]}"; do
+        log_info "Moving disk $disk for VM $vmid from $SRC to $DST"
+
+        # Construct the move command
+        local move_cmd="qm move_disk '$vmid' '$disk' '$DST' --delete 0"
+        local cleanup_cmd="sed -i '/^unused[0-9]\\+:/d' '$CONFIG_DIR/$vmid.conf'"
+
+        # Launch disk move in background with nohup (survives shell exit)
+        # Use the pattern from user's research: nohup + PID capture + wait monitoring
+        nohup bash -c "
+            if $move_cmd >> '$LOG_FILE' 2>&1; then
+                echo \"[\$(date '+%F %T')] INFO: Successfully moved disk $disk for VM $vmid\" >> '$LOG_FILE'
+
+                # Clean up unused entries that may be created during move
+                $cleanup_cmd >> '$LOG_FILE' 2>&1
+                echo \"[\$(date '+%F %T')] INFO: Cleaned unused entries for VM $vmid\" >> '$LOG_FILE'
+            else
+                echo \"[\$(date '+%F %T')] ERROR: Failed to move disk $disk for VM $vmid\" >> '$LOG_FILE'
+                exit 1
+            fi
+        " >> "$LOG_FILE" 2>&1 &
+
+        # Capture PID right after launch (user's research pattern)
+        local pid=$!
+        disk_move_pids+=("$pid")
+        log_info "Started nohup disk move process for $disk with PID: $pid (survives shell exit)"
+    done
+}
+
+wait_for_disk_migration_completion() {
+    local vmid="$1"
+
+    log_info "Waiting for disk migration to complete for VM $vmid"
+    log_info "Waiting for ${#disk_move_pids[@]} nohup disk move processes: ${disk_move_pids[*]}"
+    log_info "These processes will survive shell exit and continue running"
+
+    # Use polling pattern from user's research for nohup processes
+    local completed=0
+    local failed=0
+    
+    for pid in "${disk_move_pids[@]}"; do
+        log_info "Monitoring nohup process PID: $pid using kill -0 polling"
+        
+        # Polling loop (from user's research)
+        while kill -0 "$pid" 2>/dev/null; do
+            log_info "PID $pid still running... ($(date '+%F %T'))"
+            sleep 5
+        done
+        
+        # Reap it and fetch the real exit status (from user's research)
+        if wait "$pid" 2>/dev/null; then
+            log_info "Nohup disk move process $pid completed successfully"
+            ((completed++))
+        else
+            local exit_code=$?
+            log_error "Nohup disk move process $pid failed with exit code: $exit_code"
+            ((failed++))
+        fi
+    done
+
+    log_info "Disk migration completed for VM $vmid: $completed successful, $failed failed"
+    log_info "All nohup processes monitored and reaped successfully"
+    
+    # Reset the PIDs array for next VM
+    disk_move_pids=()
+    
+    # Return failure if any disk moves failed
+    if [[ $failed -gt 0 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+delete_snapshots() {
+    local vmid="$1"
+
+    log_info "Deleting snapshots for VM $vmid (standard mode)"
+
+    # Get array of snapshot names
+    local snaps=()
+    mapfile -t snaps < <(qm listsnapshot "$vmid" | awk '/`->/ {print $2}' | grep -v '^current$' || true)
+
+    # Process each snapshot
+    for snapshot in "${snaps[@]}"; do
+        log_info "Deleting snapshot: $snapshot for VM $vmid"
+
+        # Delete snapshot with force flag (ignores locks)
+        qm delsnapshot "$vmid" "$snapshot" --force &>> "$LOG_FILE"
+
+        # Wait for deletion to complete by polling until snapshot is gone
+        until ! qm listsnapshot "$vmid" | grep -q "^$snapshot"; do
+            sleep 2
+        done
+    done
+}
+
+# Step 3: Execute migration
 move_storage_step3_execute_migration() {
     local migration_summary=""
     migration_summary="Migration Summary:\n\n"
+    migration_summary+="Migration Mode: $move_storage_mode\n"
     migration_summary+="Target Storage: $selected_target_storage\n"
-    migration_summary+="VM/CT to migrate: ${#selected_vmcts[@]}\n\n"
+    migration_summary+="VM/CT to migrate: ${#selected_vmcts[@]}\n"
+    migration_summary+="Concurrent VM count: $concurrent_vm_disk_move_count\n\n"
     
     for vmct_data in "${selected_vmcts[@]}"; do
         IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
         migration_summary+="- $vm_type $vmid ($name) from $storage_name\n"
     done
     
-    migration_summary+="\nMigration functionality will be implemented here."
+    migration_summary+="\nProceed with migration?"
     
-    dialog --msgbox "$migration_summary" 20 80
+    # Confirm migration
+    if ! dialog --yesno "$migration_summary" 20 80; then
+        log_info "User cancelled storage migration"
+        return 1
+    fi
     
-    # TODO: Implement actual migration logic
-    log_info "Storage migration completed for ${#selected_vmcts[@]} VM/CT"
+    log_info "Starting storage migration for ${#selected_vmcts[@]} VM/CT in $move_storage_mode mode"
+    
+    # Initialize progress tracking
+    local completed_vms=0
+    local failed_vms=0
+    local total_vms=${#selected_vmcts[@]}
+    local processing_vms=()
+    local pids=()
+    
+    # Show initial progress
+    dialog --infobox "Starting migration of $total_vms VM/CT...\nMode: $move_storage_mode\nConcurrent limit: $concurrent_vm_disk_move_count" 8 60
+    sleep 2
+    
+    # Process VMs in batches based on concurrent limit
+    local batch_start=0
+    while [[ $batch_start -lt $total_vms ]]; do
+        local batch_end=$((batch_start + concurrent_vm_disk_move_count))
+        if [[ $batch_end -gt $total_vms ]]; then
+            batch_end=$total_vms
+        fi
+        
+        local batch_size=$((batch_end - batch_start))
+        local batch_num=$((batch_start / concurrent_vm_disk_move_count + 1))
+        log_info "=== BATCH $batch_num DEBUG START ==="
+        log_info "Processing batch $batch_num: VMs $((batch_start + 1))-$batch_end of $total_vms (batch size: $batch_size)"
+        log_info "Concurrent limit: $concurrent_vm_disk_move_count"
+        log_info "Mode: $move_storage_mode"
+        
+        # Reset batch tracking arrays
+        pids=()
+        processing_vms=()
+        log_info "Reset pids and processing_vms arrays for batch $batch_num"
+        
+        # Start migrations for current batch
+        for ((i = batch_start; i < batch_end; i++)); do
+            local vmct_data="${selected_vmcts[$i]}"
+            IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
+            
+            log_info "--- Starting VM $((i + 1))/$total_vms in batch $batch_num ---"
+            log_info "Starting migration for $vm_type $vmid ($name) from $storage_name to $selected_target_storage"
+            
+            # Process single VM migration in background
+            (
+                # Ignore SIGHUP to survive shell exit
+                trap '' HUP
+                local vm_success=true
+                
+                if [[ "$move_storage_mode" == "preserve-snapshots" ]]; then
+                    # Preserve snapshots mode - use disk-move functionality
+                    log_info "Using preserve-snapshots mode for VM $vmid"
+                    
+                    # Call the actual disk-move script with preserve-snapshots mode
+                    # First, check if VM is powered off (required for this mode)
+                    if is_power_on "$vmid"; then
+                        log_error "VM $vmid is powered on - preserve-snapshots mode requires powered off VMs"
+                        vm_success=false
+                    else
+                        # Use PVE Perl module for preserve-snapshots migration (shows in GUI)
+                        log_info "VM $vmid is powered off - starting preserve-snapshots migration using PVE API"
+                        log_info "Migration: $storage_name -> $selected_target_storage (preserving snapshots)"
+                        
+                        # Call PVE API module for migration (creates GUI-visible task)
+                        # Use nohup to ensure task survives shell exit (same as disk-move script)
+                        local api_result upid
+                        log_info "Starting background migration task (survives shell exit)..."
+                        # Call the Perl module directly since pvesh might not recognize our custom endpoint
+                        log_info "Calling PveToolsDiskMigration module directly"
+                        
+                        # Create a temporary Perl script to call our module
+                        local perl_script=$(mktemp /tmp/pve_migrate_XXXXXX.pl)
+                        cat > "$perl_script" << 'EOF'
+#!/usr/bin/perl
+use strict;
+use warnings;
+use lib '/usr/share/perl5';
+use PVE::API2::PveToolsDiskMigration;
+use PVE::RPCEnvironment;
+use PVE::INotify;
+
+# Initialize PVE environment
+PVE::INotify::inotify_init();
+my $rpcenv = PVE::RPCEnvironment->init('cli');
+$rpcenv->init_request();
+$rpcenv->set_language($ENV{LANG});
+$rpcenv->set_user('root@pam');
+
+# Create migration instance and execute workflow
+my $log_dir = '/var/log/pve-disk-migration';
+make_path($log_dir) unless -d $log_dir;
+my $debug_logfile = "$log_dir/migration-" . time() . ".log";
+
+my $migration = PVE::API2::PveToolsDiskMigration->new(
+    vmid          => $ARGV[0],
+    src_storage   => $ARGV[1], 
+    dst_storage   => $ARGV[2],
+    mode          => $ARGV[3],
+    debug_level   => $ARGV[4],
+    debug_logfile => $debug_logfile,
+    authuser      => 'root@pam'
+);
+
+# Execute the migration workflow
+my $result = $migration->execute_migration_workflow();
+
+print "Migration completed successfully\n" if $result;
+EOF
+                        chmod +x "$perl_script"
+                        
+                        # Execute the Perl script
+                        api_result=$(perl "$perl_script" "$vmid" "$storage_name" "$selected_target_storage" "preserve-snapshots" "2" 2>&1)
+                        local api_success=false
+                        
+                        if [[ "$api_result" =~ ^UPID: ]] || [[ "$api_result" =~ "Migration completed successfully" ]]; then
+                            api_success=true
+                            if [[ "$api_result" =~ ^UPID: ]]; then
+                                local upid="$api_result"
+                                log_info "Migration task started successfully with UPID: $upid"
+                            else
+                                log_info "Direct migration completed successfully"
+                            fi
+                        else
+                            log_error "Failed to start migration task: $api_result"
+                        fi
+                        
+                        # Clean up temporary script
+                        rm -f "$perl_script"
+                        
+                        if [[ "$api_success" == true ]]; then
+                            if [[ "$api_result" =~ ^UPID: ]]; then
+                                log_info "Migration task started successfully"
+                                log_info "Task UPID: $upid"
+                                
+                                # Wait for the PVE task to complete
+                                log_info "Waiting for migration task to complete for VM $vmid..."
+                            else
+                                # Direct execution - migration is already complete
+                                log_info "Direct migration execution completed for VM $vmid"
+                                vm_success=true
+                                # Skip task monitoring since migration is already done
+                            fi
+                            
+                            # Only do task monitoring if we have a UPID (API-based task)
+                            if [[ "$api_result" =~ ^UPID: ]]; then
+                                local task_status=""
+                                local task_wait_count=0
+                                local max_wait_time=7200  # 2 hours max
+                                local check_interval=5    # Check every 5 seconds
+                                
+                                while [[ $task_wait_count -lt $max_wait_time ]]; do
+                                # Check task status using pvesh
+                                # Try to get the full task status JSON
+                                local task_json=$(pvesh get /nodes/$(hostname)/tasks/$upid/status --output-format json 2>/dev/null)
+                                
+                                if [[ -n "$task_json" ]]; then
+                                    # Extract status from JSON
+                                    task_status=$(echo "$task_json" | grep -Po '"status"\s*:\s*"\K[^"]+' | head -1)
+                                    log_debug "Task monitoring for VM $vmid: status=$task_status, JSON=$task_json"
+                                    
+                                    case "$task_status" in
+                                        "stopped")
+                                            # Task completed, check exit status
+                                            local exit_status=$(echo "$task_json" | grep -Po '"exitstatus"\s*:\s*"\K[^"]+' | head -1)
+                                            if [[ "$exit_status" == "OK" ]]; then
+                                                log_info "Migration task completed successfully for VM $vmid (waited ${task_wait_count}s)"
+                                                vm_success=true
+                                            else
+                                                log_error "Migration task failed for VM $vmid with status: $exit_status (waited ${task_wait_count}s)"
+                                                vm_success=false
+                                            fi
+                                            break
+                                            ;;
+                                        "running")
+                                            # Task still running - log progress occasionally
+                                            if [[ $((task_wait_count % 30)) -eq 0 ]]; then
+                                                log_info "Migration still in progress for VM $vmid (${task_wait_count}s elapsed)..."
+                                            fi
+                                            ;;
+                                        *)
+                                            # Unknown status
+                                            log_debug "Task status for VM $vmid: $task_status"
+                                            ;;
+                                    esac
+                                else
+                                    # Couldn't get task status - may have completed very quickly
+                                    # Try alternate method using pvenode
+                                    if pvenode task status $upid 2>&1 | grep -q "no such task"; then
+                                        # Task no longer exists - likely completed
+                                        log_info "Task no longer exists - checking if migration completed for VM $vmid"
+                                        # Check if disks exist in destination storage
+                                        if pvesm list "$selected_target_storage" 2>/dev/null | grep -q "vm-$vmid-disk"; then
+                                            log_info "Migration appears successful - disks found in destination storage"
+                                            vm_success=true
+                                        else
+                                            log_error "Migration may have failed - no disks found in destination storage"
+                                            vm_success=false
+                                        fi
+                                        break
+                                    fi
+                                fi
+                                
+                                # Wait before next check
+                                sleep $check_interval
+                                ((task_wait_count += check_interval))
+                            done
+                            
+                                if [[ $task_wait_count -ge $max_wait_time ]]; then
+                                    log_error "Migration task timeout for VM $vmid after 2 hours"
+                                    vm_success=false
+                                fi
+                            fi  # End of UPID-based task monitoring
+                        else
+                            log_error "Failed to start migration task via PVE API"
+                            log_error "Check logs for details: tail -f $LOG_FILE"
+                            vm_success=false
+                        fi
+                    fi
+                else
+                    # Standard mode - delete snapshots and use qm move_disk
+                    log_info "Using standard mode for VM $vmid"
+                    log_info "*** STANDARD MODE: This will actually wait for completion ***"
+                    
+                    # Step 1: Delete snapshots
+                    log_info "Step 1: Deleting snapshots for VM $vmid"
+                    delete_snapshots "$vmid"
+                    
+                    # Step 2: Gather disks
+                    log_info "Step 2: Gathering disks for VM $vmid"
+                    if gather_disks "$vmid" "$storage_name"; then
+                        # Step 3: Launch disk moves
+                        log_info "Step 3: Launching disk move for VM $vmid"
+                        launch_disk_move "$vmid" "$storage_name" "$selected_target_storage"
+                        
+                        # Step 4: Wait for completion
+                        log_info "Step 4: Waiting for disk migration completion for VM $vmid"
+                        if wait_for_disk_migration_completion "$vmid"; then
+                            log_info "Step 4 completed: VM $vmid migration finished successfully"
+                        else
+                            log_error "Step 4 failed: VM $vmid migration had errors"
+                            vm_success=false
+                        fi
+                    else
+                        log_error "No disks found for VM $vmid on storage $storage_name"
+                        vm_success=false
+                    fi
+                fi
+                
+                # Write result to file for parent process to check
+                local result_file="/tmp/pve_migrate_result_${vmid}.tmp"
+                if [[ "$vm_success" == "true" ]]; then
+                    log_info "*** SUBSHELL EXITING: Migration completed successfully for VM $vmid ***"
+                    log_info "*** MODE: $move_storage_mode - If preserve-snapshots, actual migration is still running! ***"
+                    echo "SUCCESS:$vmid" > "$result_file"
+                else
+                    log_error "*** SUBSHELL EXITING: Migration failed for VM $vmid ***"
+                    echo "FAILED:$vmid" > "$result_file"
+                fi
+                
+                log_info "*** VM $vmid subshell PID $$ is about to exit ***"
+            ) < /dev/null > /dev/null 2>&1 &
+            
+            local current_pid=$!
+            pids+=("$current_pid")
+            processing_vms+=("$vmid")
+            log_info "Started background process for VM $vmid with PID: $current_pid (disowned for shell exit survival)"
+            log_info "Current pids array: ${pids[*]}"
+            log_info "Current processing_vms array: ${processing_vms[*]}"
+        done
+        
+        # Show progress for current batch
+        log_info "All VMs in batch $batch_num started. Total PIDs to wait for: ${#pids[@]}"
+        log_info "PIDs: ${pids[*]}"
+        log_info "VMs: ${processing_vms[*]}"
+        dialog --infobox "Processing batch $batch_num...\nMigrating VMs: ${processing_vms[*]}\nMode: $move_storage_mode\nWaiting for ${#pids[@]} processes..." 12 70
+        
+        # Wait for current batch to complete
+        local batch_completed=0
+        local batch_failed=0
+        
+        log_info "=== WAITING FOR BATCH $batch_num COMPLETION ==="
+        log_info "Starting wait loop for ${#pids[@]} processes"
+        
+        # Disown all processes in this batch so they survive shell exit
+        for pid in "${pids[@]}"; do
+            disown $pid 2>/dev/null
+        done
+        log_info "Disowned all ${#pids[@]} processes for shell exit survival"
+        
+        local wait_count=0
+        for i in "${!pids[@]}"; do
+            local pid="${pids[$i]}"
+            local vmid="${processing_vms[$i]}"
+            ((wait_count++))
+            log_info "Monitoring process $wait_count/${#pids[@]} (PID: $pid, VM: $vmid)..."
+            local wait_start_time=$(date +%s)
+            
+            # Use polling approach for disowned processes
+            while kill -0 "$pid" 2>/dev/null; do
+                sleep 2
+            done
+            
+            local wait_end_time=$(date +%s)
+            local wait_duration=$((wait_end_time - wait_start_time))
+            
+            # Since we can't get exit status from disowned process, check result file
+            local result_file="/tmp/pve_migrate_result_${vmid}.tmp"
+            if [[ -f "$result_file" ]]; then
+                local result=$(cat "$result_file" 2>/dev/null)
+                rm -f "$result_file"
+                
+                if [[ "$result" == "SUCCESS:"* ]]; then
+                    log_info "Process $pid (VM $vmid) completed successfully (waited ${wait_duration}s)"
+                    ((batch_completed++))
+                else
+                    log_info "Process $pid (VM $vmid) failed (waited ${wait_duration}s)"
+                    ((batch_failed++))
+                fi
+            else
+                # If no result file, assume success (process exited normally)
+                log_info "Process $pid completed (waited ${wait_duration}s) - assuming success"
+                ((batch_completed++))
+            fi
+        done
+        
+        log_info "=== BATCH $batch_num WAIT COMPLETE ==="
+        log_info "Batch results: $batch_completed successful, $batch_failed failed"
+        
+        # Update totals
+        completed_vms=$((completed_vms + batch_completed))
+        failed_vms=$((failed_vms + batch_failed))
+        
+        # Move to next batch
+        batch_start=$batch_end
+        
+        # Show batch completion
+        log_info "Batch $batch_num completed: $batch_completed successful, $batch_failed failed"
+        log_info "Updated totals: $completed_vms successful, $failed_vms failed out of $total_vms"
+        log_info "=== BATCH $batch_num DEBUG END ==="
+        
+        dialog --infobox "Batch $batch_num completed: $batch_completed successful, $batch_failed failed\nTotal progress: $completed_vms/$total_vms completed\nMoving to next batch..." 10 60
+        sleep 3
+    done
+    
+    # Final summary
+    local success_rate=$(( (completed_vms * 100) / total_vms ))
+    local summary_msg="Storage Migration Complete!\n\n"
+    summary_msg+="Mode: $move_storage_mode\n"
+    summary_msg+="Total VMs processed: $total_vms\n"
+    summary_msg+="Successful: $completed_vms\n"
+    summary_msg+="Failed: $failed_vms\n"
+    summary_msg+="Success rate: $success_rate%"
+    
+    if [[ $failed_vms -gt 0 ]]; then
+        summary_msg+="\n\nPlease check logs for details on failed migrations."
+        dialog --msgbox "$summary_msg" 16 60
+    else
+        summary_msg+="\n\nAll migrations completed successfully!"
+        dialog --msgbox "$summary_msg" 14 60
+    fi
+    
+    log_info "Storage migration completed: $completed_vms successful, $failed_vms failed out of $total_vms total"
 }
 
 # ADD NFS STORAGE WIZARD FUNCTIONS
@@ -5604,6 +6453,36 @@ selected_dataset_index=""
 selected_snapshot_index=""
 nfs_current_step=1
 nfs_total_steps=5
+
+# Helper function to check for REST API authentication failures
+# Returns: 0 if authenticated successfully, 1 if authentication failed, 2 for other errors
+check_rest_api_auth_failure() {
+    local http_status="$1"
+    local response_body="$2"
+    local function_name="$3"
+    
+    log_debug "check_rest_api_auth_failure: Called by '$function_name' with status '$http_status'"
+    log_debug "check_rest_api_auth_failure: Response body preview: '${response_body:0:50}...'"
+    
+    if [[ "$http_status" == "401" ]]; then
+        log_error "$function_name: REST API authentication failed (HTTP 401)"
+        log_debug "check_rest_api_auth_failure: Authentication failure detected, returning special code 10"
+        # Return special code 10 for authentication failure (to be handled at top level)
+        return 10
+    elif [[ "$http_status" == "403" ]]; then
+        log_error "$function_name: REST API access forbidden (HTTP 403)"
+        log_debug "check_rest_api_auth_failure: Access forbidden detected, returning special code 11"
+        # Return special code 11 for access forbidden (to be handled at top level)
+        return 11
+    elif [[ ! "$http_status" =~ ^[0-9]+$ ]]; then
+        log_error "$function_name: Invalid or missing HTTP status code"
+        log_debug "check_rest_api_auth_failure: Invalid status code, returning 2"
+        return 2
+    fi
+    
+    log_debug "check_rest_api_auth_failure: Authentication successful, returning 0"
+    return 0
+}
 
 rest_api_connection_test() {
     local response status
@@ -5636,7 +6515,20 @@ rest_api_connection_test() {
     else
         log_error "REST API connection test failed (HTTP $status)"
         log_error "REST API response body: $body"
-        return 1
+        
+        # Use the same authentication failure detection as other functions
+        check_rest_api_auth_failure "$status" "$body" "rest_api_connection_test"
+        local auth_check_result=$?
+        
+        if [[ $auth_check_result -eq 10 ]]; then
+            log_debug "rest_api_connection_test: Authentication failure (401), returning special code 10"
+            return 10
+        elif [[ $auth_check_result -eq 11 ]]; then
+            log_debug "rest_api_connection_test: Access forbidden (403), returning special code 11"
+            return 11
+        else
+            return 1
+        fi
     fi
 }
 
@@ -6220,8 +7112,20 @@ nfs_step1_select_ip() {
 
 nfs_step2_select_pool() {
     # Test API connection first
-    if ! rest_api_connection_test; then
-        dialog --msgbox "API connection test failed for $selected_nfs_ip" 8 50
+    rest_api_connection_test
+    local conn_test_exit=$?
+    
+    if [[ $conn_test_exit -eq 10 ]]; then
+        # Authentication failure (401)
+        dialog --msgbox "REST API Authentication Failed!\n\nThe REST API credentials are incorrect or have been changed on the storage server.\n\nPlease go to Setup → Configure REST API and update your credentials.\n\nCurrent user: $rest_api_user" 12 70
+        return 2  # Go back
+    elif [[ $conn_test_exit -eq 11 ]]; then
+        # Access forbidden (403)
+        dialog --msgbox "REST API Access Forbidden!\n\nThe user '$rest_api_user' does not have permission to perform this operation.\n\nPlease check user permissions on the storage server." 10 70
+        return 2  # Go back
+    elif [[ $conn_test_exit -ne 0 ]]; then
+        # Other connection error
+        dialog --msgbox "API connection test failed for $selected_nfs_ip\n\nPlease check your network connection and server configuration." 10 60
         return 2  # Go back
     fi
 
@@ -7018,7 +7922,7 @@ get_pools() {
     local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
     log_debug "get_pools: Making request to: $url"
     
-    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "$url" 2>/dev/null)
 
@@ -7036,18 +7940,41 @@ get_pools() {
         log_error "get_pools: Empty response from server"
         return 1
     fi
-
-    # Log the raw response for debugging
-    log_debug "get_pools: Raw response: ${response:0:200}..."
     
-    # Check for HTTP error responses
-    if [[ "$response" =~ ^[0-9]{3}[[:space:]] ]]; then
-        log_error "get_pools: HTTP error response: $response"
+    # Extract HTTP status code and response body
+    local http_status=$(echo "$response" | tail -n1)
+    local body=$(echo "$response" | sed '$d')
+    
+    log_debug "get_pools: HTTP status: $http_status"
+    log_debug "get_pools: Response body: ${body:0:200}..."
+    
+    # Check for authentication failure
+    log_debug "get_pools: About to check authentication failure with status '$http_status'"
+    check_rest_api_auth_failure "$http_status" "$body" "get_pools"
+    local auth_check_result=$?
+    log_debug "get_pools: check_rest_api_auth_failure returned: $auth_check_result"
+    
+    if [[ $auth_check_result -eq 10 ]]; then
+        log_debug "get_pools: Authentication failure (401), returning special code 10"
+        return 10
+    elif [[ $auth_check_result -eq 11 ]]; then
+        log_debug "get_pools: Access forbidden (403), returning special code 11"
+        return 11
+    elif [[ $auth_check_result -ne 0 ]]; then
+        log_debug "get_pools: Authentication check failed with code $auth_check_result, returning error"
+        return 1
+    fi
+    
+    log_debug "get_pools: Authentication check passed, continuing"
+    
+    # Check for successful response
+    if [[ "$http_status" != "200" ]]; then
+        log_error "get_pools: REST API call failed with HTTP status $http_status"
         return 1
     fi
     
     # Parse JSON response to extract pool names
-    printf '%s' "$response" | python3 -c "
+    printf '%s' "$body" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -7105,12 +8032,25 @@ get_dataset_pool_name() {
     log_debug "get_dataset_pool_name: Looking for dataset '$dataset_name' on IP '$nfs_ip'"
 
     # Get all pools
+    log_debug "get_dataset_pool_name: About to call get_pools for IP '$nfs_ip'"
     local pools
     pools=$(get_pools "$nfs_ip")
-    if [[ $? -ne 0 ]]; then
-        log_error "get_dataset_pool_name: Failed to get pools list"
+    local get_pools_exit=$?
+    log_debug "get_dataset_pool_name: get_pools returned exit code: $get_pools_exit"
+    
+    if [[ $get_pools_exit -eq 10 ]]; then
+        log_debug "get_dataset_pool_name: get_pools returned authentication failure (401), propagating code 10"
+        return 10
+    elif [[ $get_pools_exit -eq 11 ]]; then
+        log_debug "get_dataset_pool_name: get_pools returned access forbidden (403), propagating code 11"
+        return 11
+    elif [[ $get_pools_exit -ne 0 ]]; then
+        log_error "get_dataset_pool_name: Failed to get pools list (exit code: $get_pools_exit)"
+        log_debug "get_dataset_pool_name: get_pools failed, returning error immediately"
         return 1
     fi
+    
+    log_debug "get_dataset_pool_name: get_pools succeeded, pools data: '${pools:0:100}...'"
 
     # Loop through each pool and check if dataset exists
     while IFS= read -r pool_name; do
@@ -7120,7 +8060,7 @@ get_dataset_pool_name() {
 
         # Get nas-volumes for this pool
         local response
-        response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" \
+        response=$(curl -k -s -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
             -H 'Content-Type: application/json' \
             "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
 
@@ -7128,10 +8068,23 @@ get_dataset_pool_name() {
         if [[ $curl_exit -ne 0 ]]; then
             continue  # Skip this pool if we can't access it
         fi
+        
+        # Extract HTTP status code and response body
+        local http_status=$(echo "$response" | tail -n1)
+        local body=$(echo "$response" | sed '$d')
+        
+        # Check for authentication failure (but don't show dialog for each pool)
+        if [[ "$http_status" == "401" ]]; then
+            log_error "get_dataset_pool_name: REST API authentication failed (HTTP 401)"
+            # For this function, we'll return error without showing dialog to avoid multiple popups
+            return 1
+        elif [[ "$http_status" != "200" ]]; then
+            continue  # Skip this pool if request failed
+        fi
 
         # Check if dataset exists in this pool
         local dataset_found
-        dataset_found=$(printf '%s' "$response" | python3 -c "
+        dataset_found=$(printf '%s' "$body" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -7185,7 +8138,7 @@ is_clone() {
 
     # Make REST API call to get nas-volumes for the pool
     local response
-    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
 
@@ -7194,10 +8147,27 @@ is_clone() {
         log_error "is_clone: Failed to connect to server"
         return 1
     fi
+    
+    # Extract HTTP status code and response body
+    local http_status=$(echo "$response" | tail -n1)
+    local body=$(echo "$response" | sed '$d')
+    
+    # Check for authentication failure
+    check_rest_api_auth_failure "$http_status" "$body" "is_clone"
+    local auth_check_result=$?
+    if [[ $auth_check_result -ne 0 ]]; then
+        return 1
+    fi
+    
+    # Check for successful response
+    if [[ "$http_status" != "200" ]]; then
+        log_error "is_clone: REST API call failed with HTTP status $http_status"
+        return 1
+    fi
 
     # Parse JSON response to find the dataset and check its origin
     local origin
-    origin=$(printf '%s' "$response" | python3 -c "
+    origin=$(printf '%s' "$body" | python3 -c "
 import sys, json
 try:
     data = json.load(sys.stdin)
@@ -7295,6 +8265,13 @@ delete_cloned_dataset() {
     local response_body="${response_lines[0]}"
     local http_code="${response_lines[1]}"
     local redirect_url="${response_lines[2]}"
+    
+    # Check for authentication failure
+    check_rest_api_auth_failure "$http_code" "$response_body" "delete_cloned_dataset"
+    local auth_check_result=$?
+    if [[ $auth_check_result -ne 0 ]]; then
+        return 1
+    fi
 
     if [[ "$http_code" == "204" ]]; then
         log_info "Success: Dataset '$dataset_name' has been deleted"
@@ -7462,54 +8439,93 @@ delete_pve_NFS_storage() {
 
 # Function: get_cloned_storage_list_with_ips
 get_cloned_storage_list_with_ips() {
+    log_debug "get_cloned_storage_list_with_ips: Function started"
+    
     # Get all NFS storages from PVE
+    log_debug "get_cloned_storage_list_with_ips: About to call get_pve_NFS_storage"
     local nfs_storages
     nfs_storages=$(get_pve_NFS_storage)
-    if [[ $? -ne 0 ]]; then
-        log_error "Failed to get NFS storages from PVE"
+    local get_pve_exit=$?
+    log_debug "get_cloned_storage_list_with_ips: get_pve_NFS_storage returned with exit code: $get_pve_exit"
+    
+    if [[ $get_pve_exit -ne 0 ]]; then
+        log_error "get_cloned_storage_list_with_ips: Failed to get NFS storages from PVE"
         return 1
     fi
 
     if [[ -z "$nfs_storages" ]]; then
+        log_debug "get_cloned_storage_list_with_ips: No NFS storages found, returning successfully"
         # No NFS storages found, return successfully but with no output
         return 0
     fi
+    
+    log_debug "get_cloned_storage_list_with_ips: Found NFS storages: $nfs_storages"
 
     # Check each storage and build list with IPs
+    log_debug "get_cloned_storage_list_with_ips: Starting storage processing loop"
     local cloned_storages_with_ips=()
+    local storage_count=0
     while IFS= read -r storage_name; do
+        ((storage_count++))
+        log_debug "get_cloned_storage_list_with_ips: Processing storage #$storage_count: '$storage_name'"
+        
         if [[ -z "$storage_name" ]]; then
+            log_debug "get_cloned_storage_list_with_ips: Skipping empty storage name"
             continue
         fi
 
         # Get NFS IP for this storage
+        log_debug "get_cloned_storage_list_with_ips: Getting IP for storage '$storage_name'"
         local nfs_ip
         nfs_ip=$(get_storage_ip "$storage_name")
-        if [[ $? -ne 0 ]]; then
+        local get_ip_exit=$?
+        log_debug "get_cloned_storage_list_with_ips: get_storage_ip returned exit code: $get_ip_exit, IP: '$nfs_ip'"
+        
+        if [[ $get_ip_exit -ne 0 ]]; then
             log_error "get_cloned_storage_list_with_ips: No IP mapping found for storage '$storage_name'"
             continue
         fi
 
         # Find which pool this storage belongs to
+        log_debug "get_cloned_storage_list_with_ips: About to call get_dataset_pool_name for '$storage_name' on IP '$nfs_ip'"
         local pool_name
-        pool_name=$(get_dataset_pool_name "$storage_name" "$nfs_ip")
-        if [[ $? -ne 0 ]]; then
+        pool_name=$(get_dataset_pool_name "$storage_name" "$nfs_ip" 2>&1)
+        local get_pool_exit=$?
+        log_debug "get_cloned_storage_list_with_ips: get_dataset_pool_name returned exit code: $get_pool_exit, pool: '$pool_name'"
+        
+        if [[ $get_pool_exit -eq 10 ]]; then
+            log_debug "get_cloned_storage_list_with_ips: get_dataset_pool_name returned authentication failure (401), propagating code 10"
+            return 10
+        elif [[ $get_pool_exit -eq 11 ]]; then
+            log_debug "get_cloned_storage_list_with_ips: get_dataset_pool_name returned access forbidden (403), propagating code 11"
+            return 11
+        elif [[ $get_pool_exit -ne 0 ]]; then
+            log_debug "get_cloned_storage_list_with_ips: get_dataset_pool_name failed with code $get_pool_exit, skipping storage '$storage_name'"
             # Storage not found in any pool, skip it
             continue
         fi
 
         # Check if this storage is a clone
+        log_debug "get_cloned_storage_list_with_ips: Checking if '$storage_name' is a clone (volume: '$pool_name/$storage_name')"
         local volume_name="$pool_name/$storage_name"
         if is_clone "$volume_name" "$nfs_ip"; then
+            log_debug "get_cloned_storage_list_with_ips: '$storage_name' is a clone, adding to list"
             cloned_storages_with_ips+=("$storage_name:$nfs_ip")
+        else
+            log_debug "get_cloned_storage_list_with_ips: '$storage_name' is not a clone, skipping"
         fi
 
     done <<< "$nfs_storages"
+    
+    log_debug "get_cloned_storage_list_with_ips: Finished processing all storages, found ${#cloned_storages_with_ips[@]} cloned storages"
 
     # Output results
     for item in "${cloned_storages_with_ips[@]}"; do
+        log_debug "get_cloned_storage_list_with_ips: Outputting: '$item'"
         echo "$item"
     done
+    
+    log_debug "get_cloned_storage_list_with_ips: Function completed successfully"
 }
 
 # Function: check_vmct_using_storage
@@ -7520,7 +8536,7 @@ check_vmct_using_storage() {
     log_debug "check_vmct_using_storage: Checking if VMs/CTs are using storage '$storage_name'"
     
     # Check all VM and CT configuration files
-    for conf_file in /etc/pve/nodes/*/qemu-server/*.conf /etc/pve/nodes/*/lxc/*.conf; do
+    for conf_file in $ALL_PVE_VM_CONF $ALL_PVE_CT_CONF; do
         if [[ -f "$conf_file" ]]; then
             # Get VM/CT ID from filename
             local vmct_id=$(basename "$conf_file" .conf)
@@ -7682,12 +8698,32 @@ delete_cloned_nfs_storage_wizard() {
     fi
 
     # Show progress message while fetching data
+    log_debug "delete_cloned_nfs_storage_wizard: Showing fetching dialog"
     dialog --infobox "Fetching Cloned Volumes ..." 5 35
 
     # Get list of cloned storages with their IPs
+    log_debug "delete_cloned_nfs_storage_wizard: About to call get_cloned_storage_list_with_ips"
     local cloned_storages_with_ips
-    cloned_storages_with_ips=$(get_cloned_storage_list_with_ips)
-    if [[ $? -ne 0 ]]; then
+    cloned_storages_with_ips=$(get_cloned_storage_list_with_ips 2>&1)
+    local get_list_exit=$?
+    log_debug "delete_cloned_nfs_storage_wizard: get_cloned_storage_list_with_ips returned with exit code: $get_list_exit"
+    log_debug "delete_cloned_nfs_storage_wizard: get_cloned_storage_list_with_ips output length: ${#cloned_storages_with_ips}"
+    
+    # Clear the fetching dialog in case of any error
+    dialog --clear >/dev/null 2>&1
+    
+    # Check for specific error types
+    if [[ $get_list_exit -eq 10 ]]; then
+        log_debug "delete_cloned_nfs_storage_wizard: Authentication failure detected, showing dialog"
+        # Now we can safely show the dialog since we're at the top level
+        dialog --msgbox "REST API Authentication Failed!\n\nThe REST API credentials are incorrect or have been changed on the storage server.\n\nPlease go to Setup → Configure REST API and update your credentials.\n\nCurrent user: $rest_api_user" 15 70
+        return 1
+    elif [[ $get_list_exit -eq 11 ]]; then
+        log_debug "delete_cloned_nfs_storage_wizard: Access forbidden detected, showing dialog"
+        dialog --msgbox "REST API Access Forbidden!\n\nThe user '$rest_api_user' does not have permission to perform this operation.\n\nPlease check user permissions on the storage server." 10 70
+        return 1
+    elif [[ $get_list_exit -ne 0 ]]; then
+        log_debug "delete_cloned_nfs_storage_wizard: Other error occurred (code: $get_list_exit)"
         dialog --msgbox "Failed to get cloned storage list. Please check your NFS server connection and configuration." 8 60
         return 1
     fi
@@ -7820,7 +8856,7 @@ vm_manager_action_counts=()
 
 # Get VMs with hostpci (passthrough) for VM/CT Manager
 vm_manager_get_vms_with_hostpci() {
-    grep -Rl hostpci /etc/pve/nodes/*/qemu-server/*.conf 2>/dev/null | \
+    grep -Rl hostpci $ALL_PVE_VM_CONF 2>/dev/null | \
         sed -nE 's#.*/([0-9]+)\.conf#\1#p' | sort -u
 }
 
@@ -8515,7 +9551,7 @@ get_groups() {
 
 # Function: get_vms_with_hostpci
 get_vms_with_hostpci() {
-  grep -Rl hostpci /etc/pve/nodes/*/qemu-server/*.conf 2>/dev/null | \
+  grep -Rl hostpci $ALL_PVE_VM_CONF 2>/dev/null | \
     sed -nE 's#.*/([0-9]+)\.conf#\1#p' | sort -u
 }
 
@@ -9080,7 +10116,7 @@ get_storage_vms() {
     
     # Get all VMs
     {
-        for conf_file in /etc/pve/nodes/*/qemu-server/*.conf; do
+        for conf_file in $ALL_PVE_VM_CONF; do
         if [[ -f "$conf_file" ]]; then
             local vmid=$(basename "$conf_file" .conf)
             local name=""
@@ -9131,7 +10167,7 @@ get_storage_vms() {
     
     # Get all CTs
     {
-        for conf_file in /etc/pve/nodes/*/lxc/*.conf; do
+        for conf_file in $ALL_PVE_CT_CONF; do
         if [[ -f "$conf_file" ]]; then
             local ctid=$(basename "$conf_file" .conf)
             local hostname=""
@@ -9687,6 +10723,538 @@ cleanup_background_processes() {
     rm -f /tmp/pve-config-backup-status /tmp/pve-config-backup-check.log
 }
 
+# Install/update PveToolsDiskMigration Perl module
+install_disk_migration_module() {
+    log_info "Checking PveToolsDiskMigration module installation"
+    
+    local module_path="/usr/share/perl5/PVE/API2/PveToolsDiskMigration.pm"
+    local module_changed=false
+    
+    # Create the embedded module content
+    local module_content
+    module_content=$(cat << 'EOF_PERL_MODULE'
+package PVE::API2::PveToolsDiskMigration;
+
+use strict;
+use warnings;
+
+use POSIX qw(strftime);
+use JSON;
+use File::Path qw(make_path);
+use File::Basename;
+
+use PVE::SafeSyslog;
+use PVE::Tools;
+use PVE::Cluster;
+# No REST handler needed for direct function calls
+use PVE::RPCEnvironment;
+use PVE::API2::Qemu;
+use PVE::Storage;
+use PVE::QemuServer;
+use PVE::QemuConfig;
+use PVE::INotify;
+use Try::Tiny;
+
+# Direct function call interface - no REST handler needed
+
+# --------------------------------------------------------------------------
+# Constructor
+# --------------------------------------------------------------------------
+
+sub new {
+    my ($class, %p) = @_;
+
+    my $self = {
+        vmid          => $p{vmid},
+        src_storage   => $p{src_storage},
+        dst_storage   => $p{dst_storage},
+        mode          => $p{mode},
+        debug_level   => $p{debug_level},
+        debug_logfile => $p{debug_logfile},
+        authuser      => $p{authuser},
+        state         => {
+            phase        => 'INIT',
+            completed    => 0,
+            failed       => 0,
+            current_file => undef,
+            errors       => [],
+        },
+        start_time => time(),
+    };
+
+    bless $self, $class;
+    return $self;
+}
+
+# --------------------------------------------------------------------------
+# High‑level workflow
+# --------------------------------------------------------------------------
+
+sub execute_migration_workflow {
+    my ($self) = @_;
+
+    try {
+        $self->debug_log(2, 'INIT', "Starting migration for VM $self->{vmid}");
+        $self->phase_initialize();
+        $self->phase_migrate_vm();
+        $self->phase_verify_migration();
+        $self->phase_cleanup();
+        $self->debug_log(1, 'COMPLETE', 'Migration finished');
+        print "### PVE::Worker::update_progress 100 Migration completed\n";
+    } catch {
+        my $err = $_;
+        $self->debug_log(1, 'ERROR', "Migration failed: $err");
+        $self->{state}->{phase} = 'ERROR';
+        $self->save_state();
+        die $err;
+    };
+}
+
+# --------------------------------------------------------------------------
+# Phase 1 – Initialise
+# --------------------------------------------------------------------------
+
+sub phase_initialize {
+    my ($self) = @_;
+
+    $self->{state}->{phase} = 'INIT';
+    print "### PVE::Worker::update_progress 5 Initialising\n";
+
+    my $src_path = $self->get_storage_path($self->{src_storage});
+    my $dst_path = $self->get_storage_path($self->{dst_storage});
+    die "Cannot resolve storage paths\n" unless $src_path && $dst_path;
+
+    my $vmid = $self->{vmid};
+    if (   $self->{mode} eq 'preserve-snapshots'
+        && $self->get_vm_status($vmid) eq 'running')
+    {
+        die "VM $vmid is running – cannot preserve snapshots\n";
+    }
+
+    $self->{state}->{files} =
+      $self->discover_vm_files( $vmid, $src_path );
+    $self->debug_log(3, 'INIT',
+        "Found " . @{ $self->{state}->{files} } . " files to migrate");
+    $self->save_state();
+}
+
+# --------------------------------------------------------------------------
+# Phase 2 – Migrate
+# --------------------------------------------------------------------------
+
+sub phase_migrate_vm {
+    my ($self) = @_;
+
+    $self->{state}->{phase} = 'MIGRATE';
+    print "### PVE::Worker::update_progress 10 Migrating disks\n";
+
+    my $vmid = $self->{vmid};
+
+    try {
+        if ( $self->{mode} eq 'preserve-snapshots' ) {
+            $self->migrate_vm_preserve_snapshots($vmid);
+        }
+        else {
+            $self->migrate_vm_standard($vmid);
+        }
+        $self->{state}->{completed} = 1;
+        print "### PVE::Worker::update_progress 80 VM $vmid migrated\n";
+    }
+    catch {
+        $self->{state}->{failed} = 1;
+        die $_;
+    };
+
+    $self->save_state();
+}
+
+# --------------------------------------------------------------------------
+# Phase 3 – Verify
+# --------------------------------------------------------------------------
+
+sub phase_verify_migration {
+    my ($self) = @_;
+
+    $self->{state}->{phase} = 'VERIFY';
+    print "### PVE::Worker::update_progress 85 Verifying\n";
+
+    my $cfg = $self->find_vm_config( $self->{vmid} ) or return;
+    my $txt = $self->read_file($cfg);
+    if ( $txt =~ /$self->{dst_storage}:/ ) {
+        $self->debug_log(3, 'VERIFY', 'Configuration looks OK');
+    }
+    else {
+        $self->debug_log(2, 'VERIFY', 'Configuration check failed');
+    }
+}
+
+# --------------------------------------------------------------------------
+# Phase 4 – Cleanup
+# --------------------------------------------------------------------------
+
+sub phase_cleanup {
+    my ($self) = @_;
+
+    $self->{state}->{phase} = 'CLEANUP';
+    print "### PVE::Worker::update_progress 95 Finalising\n";
+
+    my $dur = time() - $self->{start_time};
+    $self->debug_log(2, 'CLEANUP', "Duration ${dur}s");
+}
+
+# --------------------------------------------------------------------------
+# Preserve‑snapshot migration of a single VM
+# --------------------------------------------------------------------------
+
+sub migrate_vm_preserve_snapshots {
+    my ( $self, $vmid ) = @_;
+
+    # Lock VM configuration to prevent user from starting/modifying VM during migration
+    my $lock_acquired = 0;
+    my $lock_timeout = 300; # 5 minutes timeout for acquiring lock
+    
+    eval {
+        # Try to acquire VM config lock with timeout
+        PVE::QemuConfig->lock_config_full($vmid, $lock_timeout, sub {
+            $lock_acquired = 1;
+            $self->debug_log(1, 'LOCK', "VM $vmid configuration locked for migration");
+            
+            # Verify VM is still powered off after acquiring lock
+            if ( $self->get_vm_status($vmid) eq 'running' ) {
+                die "VM $vmid was started after lock acquisition - aborting migration for safety\n";
+            }
+            
+            # Perform the actual migration with VM locked
+            for my $fi ( @{ $self->{state}->{files} } ) {
+                $self->copy_vm_file( $vmid, $fi );
+            }
+            $self->update_vm_configuration($vmid);
+            
+            $self->debug_log(1, 'LOCK', "VM $vmid migration completed, releasing lock");
+        });
+    };
+    
+    if ($@) {
+        my $error = $@;
+        $self->debug_log(1, 'ERROR', "Migration failed for VM $vmid: $error");
+        
+        # Provide user-friendly error messages
+        if ($error =~ /timeout/i) {
+            die "Failed to acquire VM $vmid configuration lock (timeout after ${lock_timeout}s). VM may be in use by another operation.\n";
+        } elsif ($error =~ /was started after lock/i) {
+            die "VM $vmid was started during migration setup. Migration aborted for data safety.\n";
+        } else {
+            die "Migration failed: $error\n";
+        }
+    }
+    
+    unless ($lock_acquired) {
+        die "Failed to acquire VM $vmid configuration lock. VM may be locked by another operation.\n";
+    }
+}
+
+# --------------------------------------------------------------------------
+# Standard migration (delete snapshots, use qm move_disk)
+# --------------------------------------------------------------------------
+
+sub migrate_vm_standard {
+    my ( $self, $vmid ) = @_;
+
+    $self->delete_vm_snapshots($vmid);
+    my $disks = $self->get_vm_disks($vmid);
+    for my $d ( @$disks ) {
+        $self->move_disk_standard( $vmid, $d );
+    }
+}
+
+# --------------------------------------------------------------------------
+# Copy a single file with its own worker (GUI description set)
+# --------------------------------------------------------------------------
+
+sub copy_vm_file {
+    my ( $self, $vmid, $fi ) = @_;
+
+    my $dst_root = $self->get_storage_path( $self->{dst_storage} );
+    my $dst_dir  = "$dst_root/images/$vmid";
+    make_path($dst_dir) unless -d $dst_dir;
+
+    my $name = $fi->{filename};
+
+    $name =~ s/^vm-\d+/vm-$vmid/ if $name =~ /^vm-\d+/;
+    $name = "$vmid.conf" if $name =~ /^\d+\.conf$/;
+
+    my $dst_file = "$dst_dir/$name";
+
+    my $rpcenv     = PVE::RPCEnvironment::get();
+    my $disk_descr = "VM $vmid - Disk migrate";
+
+    my $upid = $rpcenv->fork_worker(
+        'vm-disk-migrate',
+        $vmid,
+        $self->{authuser},
+        sub {
+            my $cmd = [
+                'rsync', '-rlptv', '-P', '--timeout=300', '--partial',
+                '--partial-dir=.rsync-partial', '--no-owner', '--no-group', 
+                $fi->{src_path}, $dst_file
+            ];
+            my $exit_code = system(@$cmd);
+            die "rsync failed with exit code: " . ($exit_code >> 8) if $exit_code != 0;
+            die "size mismatch\n" unless -s $fi->{src_path} == -s $dst_file;
+        },
+        undef,
+        $disk_descr,
+    );
+
+    $self->wait_for_task($upid);
+}
+
+# --------------------------------------------------------------------------
+# Generic helpers (mostly unchanged)
+# --------------------------------------------------------------------------
+
+sub debug_log {
+    my ( $self, $lvl, $phase, $msg, $ctx ) = @_;
+    return if $lvl > $self->{debug_level};
+    my $ts = strftime "%F %T", localtime;
+    my $f  = $ctx && $ctx->{file} ? $ctx->{file} : '';
+    my $ln = "[$ts] [L$lvl] [$phase] [VM$self->{vmid}] [$f] $msg\n";
+    print $ln;
+    if ( open my $fh, '>>', $self->{debug_logfile} ) {
+        print $fh $ln;
+        close $fh;
+    }
+}
+
+sub save_state {
+    my ($self) = @_;
+    my $file = "/tmp/pve-migration-state-$self->{vmid}.json";
+    if ( open my $fh, '>', $file ) {
+        print $fh encode_json( $self->{state} );
+        close $fh;
+    }
+}
+
+sub get_storage_path {
+    my ( $self, $sid ) = @_;
+    my $path;
+    eval {
+        my $cfg  = PVE::Storage::config();
+        my $scfg = PVE::Storage::storage_config( $cfg, $sid );
+        $path = $scfg->{path} if $scfg && $scfg->{path};
+    };
+    return $path;
+}
+
+sub find_vm_config {
+    my ( $self, $vmid ) = @_;
+    for my $p (
+        "/etc/pve/qemu-server/$vmid.conf",
+        "/etc/pve/nodes/" . PVE::INotify::nodename() . "/qemu-server/$vmid.conf"
+      )
+    {
+        return $p if -f $p;
+    }
+    return undef;
+}
+
+sub get_vm_status {
+    my ( $self, $vmid ) = @_;
+    eval { ( PVE::QemuServer::vmstatus($vmid) )->{$vmid}->{status} }
+      || 'unknown';
+}
+
+sub discover_vm_files {
+    my ( $self, $vmid, $src_root ) = @_;
+    my @list;
+    my $cfgfile = $self->find_vm_config($vmid) or return \@list;
+    my $cfg     = $self->read_file($cfgfile);
+
+    my %folders;
+    for my $l ( split /\n/, $cfg ) {
+        next unless $l =~ /^(virtio|sata|scsi|ide)\d+:\s*(.+)$/;
+        my $ds = $2;
+        if ( $ds =~ /^$self->{src_storage}:(\d+)\/(.+)$/ ) {
+            $folders{$1} = 1;
+        }
+    }
+
+    for my $f ( keys %folders ) {
+        my $dir = "$src_root/images/$f";
+        next unless -d $dir;
+        opendir my $dh, $dir or next;
+        while ( my $file = readdir $dh ) {
+            next if $file =~ /^\./;
+            next if $file =~ /\.conf$/;
+            next unless -f "$dir/$file";
+            push @list,
+              {
+                filename   => $file,
+                src_path   => "$dir/$file",
+                size       => -s "$dir/$file",
+              };
+        }
+        closedir $dh;
+    }
+    return \@list;
+}
+
+sub wait_for_task {
+    my ( $self, $upid ) = @_;
+    my $timeout = 1800;
+    my $int     = 5;
+    my $cnt     = $timeout / $int;
+    while ( $cnt-- ) {
+        my $st = PVE::Tools::upid_read_status($upid);
+        return if defined $st && $st eq 'OK';
+        die "task failed\n" if defined $st && $st ne 'OK';
+        sleep $int;
+    }
+    die "task timeout\n";
+}
+
+sub update_vm_configuration {
+    my ( $self, $vmid ) = @_;
+    my $file = $self->find_vm_config($vmid) or return;
+    my $bak  = "$file.bak." . time();
+    system( 'cp', $file, $bak ) == 0 or die "backup failed\n";
+
+    my $txt   = $self->read_file($file);
+    my $out   = '';
+    my $chg   = 0;
+    my $src   = $self->{src_storage};
+    my $dst   = $self->{dst_storage};
+
+    for my $l ( split /\n/, $txt ) {
+        if ( $l =~ /^((?:virtio|sata|scsi|ide)\d+):\s*$src:(\d+)\/([^,]+)(.*)$/ )
+        {
+            my ( $dev, undef, $fn, $rest ) = ( $1, $2, $3, $4 );
+            $fn =~ s/^vm-\d+/vm-$vmid/;
+            $l = "$dev: $dst:$vmid/$fn$rest";
+            $chg++;
+        }
+        elsif ( $l =~ /^vmstate:\s*$src:(\d+)\/(.+)$/ ) {
+            my $fn = $2;
+            $fn =~ s/^vm-\d+/vm-$vmid/;
+            $l = "vmstate: $dst:$vmid/$fn";
+            $chg++;
+        }
+        $out .= "$l\n";
+    }
+
+    $self->write_file( $file, $out ) if $chg;
+}
+
+sub delete_vm_snapshots {
+    my ( $self, $vmid ) = @_;
+    my $conf  = PVE::QemuConfig->load_config($vmid);
+    my $snaps = $conf->{snapshots} || {};
+    for my $sn ( keys %$snaps ) {
+        next if $sn eq 'current';
+        PVE::QemuServer::snapshot_delete( $vmid, $sn, 1 );
+    }
+}
+
+sub get_vm_disks {
+    my ( $self, $vmid ) = @_;
+    my @d;
+    my $c = PVE::QemuConfig->load_config($vmid);
+    for my $k ( keys %$c ) {
+        next unless $k =~ /^(virtio|sata|scsi|ide)\d+$/;
+        push @d, $k if $c->{$k} =~ /^$self->{src_storage}:/;
+    }
+    return \@d;
+}
+
+sub move_disk_standard {
+    my ( $self, $vmid, $disk ) = @_;
+    my $rpc = PVE::RPCEnvironment::get();
+    my $upid =
+      $rpc->fork_worker(
+        'qmmove', $vmid, $self->{authuser},
+        sub {
+            PVE::QemuServer::vm_move_disk( $vmid, $disk, $self->{dst_storage},
+                undef, { delete => 0 } );
+        }
+      );
+    $self->wait_for_task($upid);
+}
+
+# --------------------------------------------------------------------------
+# file helpers
+# --------------------------------------------------------------------------
+
+sub read_file {
+    my ( undef, $f ) = @_;
+    open my $fh, '<', $f or die "cannot read $f: $!";
+    local $/;
+    my $txt = <$fh>;
+    close $fh;
+    return $txt;
+}
+
+sub write_file {
+    my ( undef, $f, $txt ) = @_;
+    open my $fh, '>', $f or die "cannot write $f: $!";
+    print $fh $txt;
+    close $fh;
+}
+
+1;
+EOF_PERL_MODULE
+)
+    
+    # Check if module exists and compare content
+    if [ -f "$module_path" ]; then
+        local current_content
+        current_content=$(cat "$module_path" 2>/dev/null)
+        
+        if [ "$current_content" != "$module_content" ]; then
+            log_info "PveToolsDiskMigration module needs update"
+            module_changed=true
+        else
+            log_debug "PveToolsDiskMigration module is up to date"
+        fi
+    else
+        log_info "PveToolsDiskMigration module not found, will install"
+        module_changed=true
+    fi
+    
+    # Install/update module if needed
+    if [ "$module_changed" = true ]; then
+        log_info "Installing/updating PveToolsDiskMigration module"
+        
+        # Create backup of existing module if present
+        if [ -f "$module_path" ]; then
+            local backup_path="${module_path}.bak.$(date +%Y%m%d-%H%M%S)"
+            cp "$module_path" "$backup_path" 2>/dev/null
+            log_info "Created backup: $backup_path"
+        fi
+        
+        # Write the new module
+        echo "$module_content" > "$module_path"
+        if [ $? -eq 0 ]; then
+            log_info "PveToolsDiskMigration module installed successfully"
+        else
+            log_error "Failed to install PveToolsDiskMigration module"
+            return 1
+        fi
+    fi
+    
+    # Module installed successfully - ready for direct function calls (no API registration needed)
+    log_info "PveToolsDiskMigration module ready for direct function calls"
+    
+    # Verify module is loadable
+    if perl -e "use lib '/usr/share/perl5'; use PVE::API2::PveToolsDiskMigration;" 2>/dev/null; then
+        log_info "PveToolsDiskMigration module verified successfully"
+    else
+        log_error "PveToolsDiskMigration module failed verification"
+        return 1
+    fi
+    
+    return 0
+}
+
 # Main script entry point
 main() {
     # Initialize logging system first
@@ -9708,6 +11276,9 @@ main() {
         log_error "Failed to initialize configuration"
         exit 1
     fi
+    
+    # Install/update PveToolsDiskMigration Perl module
+    install_disk_migration_module
     
     # Check if any NFS storage exists
     if ! check_nfs_storage_exists; then

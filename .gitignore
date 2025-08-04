@@ -1,4 +1,7 @@
 CLAUDE.md
+CLAUDE.local.md
+BATCH_WAIT_FIX.md
+BACKGROUND_PROCESS_SURVIVAL_SOLUTION.md
 .claude/
 .vscode/
 *.sh

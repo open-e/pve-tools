@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information
-VERSION="0.34"
-RELEASE_DATE="2025-08-04"
+VERSION="0.40"
+RELEASE_DATE="2025-08-05"
 
 # Script mode flag
 VERSION_MODE=false
@@ -45,7 +45,7 @@ CONNECTED_STORAGE_SERVERS_DIR="$CONFIG_DIR/connected"
 LOGS_DIR="/var/log/$(basename "$0" .sh)"
 LOG_FILE="$LOGS_DIR/$(basename "$0" .sh).log"
 
-# JovianDSS API response cache variables
+# Storage system API response cache variables
 declare -A API_POOLS_CACHE
 declare -A API_NAS_VOLUMES_CACHE
 API_CACHE_INITIALIZED=false
@@ -159,32 +159,57 @@ check_nfs_storage_exists() {
 build_storage_ip_map() {
     log_debug "build_storage_ip_map: Building storage to IP mapping table"
     
+    # Cache file for storage mapping
+    local cache_file="/tmp/pve-tools-storage-map.cache"
+    local storage_cfg="/etc/pve/storage.cfg"
+    
+    # Check if cache is valid (storage.cfg not modified since cache creation)
+    if [[ -f "$cache_file" ]] && [[ -f "$storage_cfg" ]]; then
+        if [[ "$cache_file" -nt "$storage_cfg" ]]; then
+            log_debug "build_storage_ip_map: Using cached storage mapping"
+            # Load from cache
+            storage_ip_map=()
+            while IFS='|' read -r storage_name server_ip; do
+                storage_ip_map["$storage_name"]="$server_ip"
+            done < "$cache_file"
+            log_info "build_storage_ip_map: Loaded ${#storage_ip_map[@]} entries from cache"
+            return 0
+        fi
+    fi
+    
     # Clear existing mapping
     storage_ip_map=()
     
-    # Read storage.cfg and extract NFS storage entries
+    # Read entire file at once for better performance
+    local storage_config=$(<"$storage_cfg")
+    local current_storage=""
+    local in_nfs_section=false
+    
     while IFS= read -r line; do
         if [[ "$line" =~ ^nfs:[[:space:]]*([^[:space:]]+) ]]; then
-            local storage_name="${BASH_REMATCH[1]}"
-            local server_ip=""
-            
-            # Read the next few lines to find the server IP
-            while IFS= read -r config_line; do
-                if [[ "$config_line" =~ ^[[:space:]]*server[[:space:]]+([^[:space:]]+) ]]; then
-                    server_ip="${BASH_REMATCH[1]}"
-                    break
-                elif [[ "$config_line" =~ ^[[:space:]]*$ ]] || [[ "$config_line" =~ ^[a-zA-Z]+: ]]; then
-                    # Empty line or start of new section, stop looking
-                    break
-                fi
-            done
-            
-            if [[ -n "$server_ip" ]]; then
-                storage_ip_map["$storage_name"]="$server_ip"
-                log_debug "build_storage_ip_map: Mapped storage '$storage_name' to IP '$server_ip'"
+            current_storage="${BASH_REMATCH[1]}"
+            in_nfs_section=true
+        elif [[ "$in_nfs_section" == true ]]; then
+            if [[ "$line" =~ ^[[:space:]]*server[[:space:]]+([^[:space:]]+) ]]; then
+                local server_ip="${BASH_REMATCH[1]}"
+                storage_ip_map["$current_storage"]="$server_ip"
+                log_debug "build_storage_ip_map: Mapped storage '$current_storage' to IP '$server_ip'"
+                in_nfs_section=false
+            elif [[ "$line" =~ ^[[:space:]]*$ ]] || [[ "$line" =~ ^[a-zA-Z]+: ]]; then
+                # Empty line or start of new section
+                in_nfs_section=false
             fi
         fi
-    done < /etc/pve/storage.cfg
+    done <<< "$storage_config"
+    
+    # Save to cache
+    if [[ ${#storage_ip_map[@]} -gt 0 ]]; then
+        > "$cache_file"  # Clear cache file
+        for storage_name in "${!storage_ip_map[@]}"; do
+            echo "${storage_name}|${storage_ip_map[$storage_name]}" >> "$cache_file"
+        done
+        log_debug "build_storage_ip_map: Saved ${#storage_ip_map[@]} entries to cache"
+    fi
     
     log_info "build_storage_ip_map: Built mapping for ${#storage_ip_map[@]} storage entries"
 }
@@ -327,7 +352,7 @@ init_api_cache() {
         return 0
     fi
     
-    log_debug "Initializing API cache for JovianDSS servers"
+    log_debug "Initializing API cache for $PRODUCT servers"
     
     # Clear existing cache
     API_POOLS_CACHE=()
@@ -727,7 +752,26 @@ EOF
         log_debug "init_config: Config file exists, reading content"
         log_debug "init_config: Config file content:"
         while IFS= read -r line; do
-            log_debug "init_config: $line"
+            # Mask password in debug output
+            if [[ "$line" =~ ^rest_api_password= ]]; then
+                # Extract the password value (handling quotes)
+                local pwd_value="${line#rest_api_password=}"
+                pwd_value="${pwd_value//\'/}"  # Remove single quotes
+                pwd_value="${pwd_value//\"/}"  # Remove double quotes
+                
+                # Create masked version
+                local masked_pwd
+                if [[ ${#pwd_value} -le 3 ]]; then
+                    masked_pwd=$(printf '%*s' ${#pwd_value} | tr ' ' '*')
+                else
+                    masked_pwd="${pwd_value:0:3}$(printf '%*s' $((${#pwd_value} - 3)) | tr ' ' '*')"
+                fi
+                
+                # Log the masked version
+                log_debug "init_config: rest_api_password='$masked_pwd'"
+            else
+                log_debug "init_config: $line"
+            fi
         done < "$CONFIG_FILE"
         
         source "$CONFIG_FILE"
@@ -737,7 +781,13 @@ EOF
         
         # Show masked password for debugging
         local masked_pwd
-        masked_pwd="${rest_api_password:0:4}$(printf '%*s' $((${#rest_api_password} - 4)) | tr ' ' '*')"
+        if [[ ${#rest_api_password} -le 3 ]]; then
+            # For very short passwords, mask all characters
+            masked_pwd=$(printf '%*s' ${#rest_api_password} | tr ' ' '*')
+        else
+            # Show first 3 characters and mask the rest
+            masked_pwd="${rest_api_password:0:3}$(printf '%*s' $((${#rest_api_password} - 3)) | tr ' ' '*')"
+        fi
         log_debug "init_config: rest_api_password preview='$masked_pwd'"
         log_debug "init_config: rest_api_port='$rest_api_port'"
         
@@ -843,6 +893,42 @@ pve_ct_conf_file() {
     
     # CT config file not found
     return 1
+}
+
+# Get VM/CT configuration output (replacement for qm config/pct config)
+# This function uses direct file reading for better performance
+pve_vm_ct_conf_file() {
+    local vmid="$1"
+    
+    if [[ -z "$vmid" ]]; then
+        log_error "pve_vm_ct_conf_file: VMID parameter is required"
+        return 1
+    fi
+    
+    # Determine if it's a VM or CT
+    local type=$(vm_type "$vmid")
+    
+    if [[ "$type" == "ct" ]]; then
+        # Use pve_ct_conf_file for containers
+        local conf_file=$(pve_ct_conf_file "$vmid")
+        if [[ -n "$conf_file" ]]; then
+            cat "$conf_file"
+            return 0
+        else
+            log_error "CT config file not found for CTID: $vmid"
+            return 1
+        fi
+    else
+        # Use pve_vm_conf_file for VMs
+        local conf_file=$(pve_vm_conf_file "$vmid")
+        if [[ -n "$conf_file" ]]; then
+            cat "$conf_file"
+            return 0
+        else
+            log_error "VM config file not found for VMID: $vmid"
+            return 1
+        fi
+    fi
 }
 
 # Cleanup inactive NFS storage on all cluster nodes
@@ -2351,7 +2437,7 @@ post_known_issues_fixes() {
         dialog --title "ZFS Import Scan Service Fix" \
                --yes-label "Confirm" \
                --no-label "Skip" \
-               --yesno "Proxmox VE Host Attempts to Import Open-E JovianDSS ZFS Pool After Reboot\n\nDescription:\nWhen running Open-E JovianDSS as a virtual machine on a Proxmox VE host, the host system may attempt to import a ZFS pool that belongs to the Open-E JovianDSS VM. This typically occurs if the Open-E JovianDSS VM accesses its data disks via PCI passthrough.\n\nObserved Behavior:\nAfter rebooting the Proxmox VE host, the system tries to auto-import the ZFS pool from the passthrough disks, which may lead to errors.\n\nWorkaround:\nDisable the zfs-import-scan.service on the Proxmox VE host to prevent automatic import of ZFS pools that belong to the Open-E JovianDSS VM.\n\nDo you want to apply this fix?" 22 80
+               --yesno "Proxmox VE Host Attempts to Import $VENDOR $PRODUCT ZFS Pool After Reboot\n\nDescription:\nWhen running $VENDOR $PRODUCT as a virtual machine on a Proxmox VE host, the host system may attempt to import a ZFS pool that belongs to the $VENDOR $PRODUCT VM. This typically occurs if the $VENDOR $PRODUCT VM accesses its data disks via PCI passthrough.\n\nObserved Behavior:\nAfter rebooting the Proxmox VE host, the system tries to auto-import the ZFS pool from the passthrough disks, which may lead to errors.\n\nWorkaround:\nDisable the zfs-import-scan.service on the Proxmox VE host to prevent automatic import of ZFS pools that belong to the $VENDOR $PRODUCT VM.\n\nDo you want to apply this fix?" 22 80
         
         if [ $? -eq 0 ]; then
             if fix_zfs_import_scan_service; then
@@ -3291,7 +3377,7 @@ perform_oodp_checkup() {
                 
                 printf "%s%*s%s\n" "$header_line" $padding "" "$status_text" >> "$temp_file"
                 echo "    Issues: REST API credentials are incorrect" >> "$temp_file"
-                echo "            The username or password has been changed on the storage server." >> "$temp_file"
+                echo "            The username or password has been changed on the $PRODUCT." >> "$temp_file"
                 echo "            Please run: pve-tools -> Setup -> Configure REST API" >> "$temp_file"
                 echo "            Current user: $rest_api_user" >> "$temp_file"
                 echo "" >> "$temp_file"
@@ -3308,7 +3394,7 @@ perform_oodp_checkup() {
                 printf "%s%*s%s\n" "$header_line" $padding "" "$status_text" >> "$temp_file"
                 echo "    Issues: Access forbidden" >> "$temp_file"
                 echo "            The user '$rest_api_user' does not have permission for this operation." >> "$temp_file"
-                echo "            Please check user permissions on the storage server." >> "$temp_file"
+                echo "            Please check user permissions on the $PRODUCT." >> "$temp_file"
                 echo "" >> "$temp_file"
                 log_error "perform_oodp_checkup: REST API access forbidden (403) - skipping OODP checkup"
                 return 1
@@ -4105,16 +4191,16 @@ main_menu() {
     cmd=(dialog --keep-tite --title "$menu_title"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
          --menu "Choose an option:" 20 85 12)
-    options=("0" "Add cloned NFS storage from JovianDSS snapshot"
+    options=("0" "Add cloned NFS storage from $PRODUCT snapshot"
              "1" "Restore VM/CT from cloned NFS storage"
              "2" "Move storage for VM/CT using cloned NFS storage"
-             "3" "Delete cloned NFS storage in PVE and the cloned dataset in JovianDSS"
+             "3" "Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT"
              "4" "Clean up inactive NFS storage"
              "5" "Clean up unused disks in VM/CT configurations"
              "6" "Bulk VM/CT operations – start, stop, reboot, and more"
              "7" "NFS tuning – set nconnect, sync options"
              "8" "Add VM/CT to Proxmox VE HA resources"
-             "9" "Set up auto-start at boot for JovianDSS VMs"
+             "9" "Set up auto-start at boot for $PRODUCT VMs"
              "10" "Apply known issue fixes and tuning"
              "11" "System check-up"
              "12" "Help & About pve-tools")
@@ -4125,7 +4211,7 @@ main_menu() {
     case $dialog_exit_code in
         0)  # Select
             case "$selected_option" in
-                0)  # Add cloned NFS storage from JovianDSS snapshot
+                0)  # Add cloned NFS storage from $PRODUCT snapshot
                     add_nfs_storage_wizard
                     ;;
                 1)  # Restore VM/CT from cloned NFS storage
@@ -4134,7 +4220,7 @@ main_menu() {
                 2)  # Move storage for VM/CT using cloned NFS storage
                     move_storage_cloned_nfs
                     ;;
-                3)  # Delete cloned NFS storage in PVE and the cloned dataset in JovianDSS
+                3)  # Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT
                     delete_cloned_nfs_storage_wizard
                     ;;
                 4)  # Clean up inactive NFS storage
@@ -4152,7 +4238,7 @@ main_menu() {
                 8)  # Add VM/CT to Proxmox VE HA resources
                     add_vmct_to_ha_resources
                     ;;
-                9)  # Set up auto-start at boot for JovianDSS VMs
+                9)  # Set up auto-start at boot for $PRODUCT VMs
                     setup_storage_vm_startup_wizard
                     ;;
                 10)  # Apply known issue fixes and tuning
@@ -4817,30 +4903,9 @@ get_vmid_ctid_using_cloned_nfs_storage_list() {
     local vmct_list=()
     local vmct_info
     
-    # Get all VM/CT from cluster resources
+    # Get all VM/CT from cluster resources using optimized function
     local vm_list
-    vm_list=$(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
-        python3 -c "
-import sys, json
-try:
-    resources = json.load(sys.stdin)
-    for resource in resources:
-        vmid = resource.get('vmid', '')
-        name = resource.get('name', 'unnamed')
-        res_type = resource.get('type', '')
-        
-        # Map resource type to our format
-        if res_type == 'qemu':
-            vm_type = 'vm'
-        elif res_type == 'lxc':  
-            vm_type = 'ct'
-        else:
-            continue
-            
-        print(f'{vmid}|{name}|{vm_type}')
-except:
-    pass
-")
+    vm_list=$(get_all_vm_ct_info | awk -F'|' '{print $1"|"$2"|"$3}')
     
     # Process each VM/CT to check if it uses cloned NFS storage
     while IFS='|' read -r vmid name vm_type; do
@@ -4955,7 +5020,13 @@ step1_select_config() {
         storage_names+=("$storage_name")
         
         # Get VM/CT name from config file
-        local vmct_name=$(grep -E "^name[[:space:]]*[:=]" "${confs[i]}" 2>/dev/null | sed -E 's/^name[[:space:]]*[:=][[:space:]]*//' | head -1)
+        # For VMs (QEMU), use 'name:' field; for containers (LXC), use 'hostname:' field
+        local vmct_name
+        vmct_name=$(grep -E "^name[[:space:]]*[:=]" "${confs[i]}" 2>/dev/null | sed -E 's/^name[[:space:]]*[:=][[:space:]]*//' | head -1)
+        if [[ -z "$vmct_name" ]]; then
+            # Try hostname field for LXC containers
+            vmct_name=$(grep -E "^hostname[[:space:]]*[:=]" "${confs[i]}" 2>/dev/null | sed -E 's/^hostname[[:space:]]*[:=][[:space:]]*//' | head -1)
+        fi
         if [[ -z "$vmct_name" ]]; then
             vmct_name="(no name)"
         fi
@@ -5513,7 +5584,7 @@ restore_from_clone_wizard() {
                         current_step=2
                         ;;
                     1)  # Back to Main
-                        return
+                        return 0
                         ;;
                     2)  # Stay on same step (retry)
                         ;;
@@ -5526,7 +5597,7 @@ restore_from_clone_wizard() {
                         current_step=3
                         ;;
                     1)  # Back to Main
-                        return
+                        return 0
                         ;;
                     2)  # Back
                         current_step=1
@@ -5538,10 +5609,10 @@ restore_from_clone_wizard() {
                 case $? in
                     0)  # Apply
                         perform_restore
-                        return
+                        return 0
                         ;;
                     1)  # Back to Main
-                        return
+                        return 0
                         ;;
                     2)  # Back
                         current_step=2
@@ -5560,75 +5631,89 @@ selected_target_storage=""
 move_storage_current_step=0
 move_select_all_mode=false
 move_storage_mode=""
+selected_migration_type=""  # "vm", "ct", or "" for single-type systems
 
-# Main wizard function for moving storage
-move_storage_cloned_nfs() {
-    # Reset variables for move storage wizard
-    selected_vmcts=()
-    selected_target_storage=""
-    move_storage_current_step=0
-    move_select_all_mode=false
-    move_storage_mode=""
+# Detect available VM/CT types in the system
+detect_available_vm_ct_types() {
+    local has_vms=false has_cts=false
+    local vmct_raw_list
     
-    while true; do
-        case $move_storage_current_step in
-            0)
-                move_storage_step0_select_mode
-                case $? in
-                    0)  # Next
-                        move_storage_current_step=1
-                        ;;
-                    1)  # Back to Main
-                        return
-                        ;;
-                    2)  # Stay on same step (retry)
-                        ;;
-                esac
-                ;;
-            1)
-                move_storage_step1_select_vmct
-                case $? in
-                    0)  # Next
-                        move_storage_current_step=2
-                        ;;
-                    1)  # Back
-                        move_storage_current_step=0
-                        ;;
-                    2)  # Stay on same step (retry)
-                        ;;
-                esac
-                ;;
-            2)
-                move_storage_step2_select_target_storage
-                case $? in
-                    0)  # Next - execute migration
-                        move_storage_step3_execute_migration
-                        return
-                        ;;
-                    1)  # Back to Main
-                        return
-                        ;;
-                    2)  # Back
-                        move_storage_current_step=1
-                        ;;
-                    3)  # Stay on same step (retry)
-                        ;;
-                esac
-                ;;
-        esac
-    done
+    # Get list of VM/CT using cloned NFS storage
+    vmct_raw_list=$(get_vmid_ctid_using_cloned_nfs_storage_list)
+    
+    log_debug "detect_available_vm_ct_types: Raw list result: '$vmct_raw_list'"
+    
+    if [[ -z "$vmct_raw_list" ]]; then
+        log_debug "detect_available_vm_ct_types: No VM/CT found via get_vmid_ctid_using_cloned_nfs_storage_list, trying fallback method"
+        
+        # Fallback: Check VM/CT configs directly for cloned storage patterns
+        local fallback_found=false
+        
+        # Check VMs
+        for conf_file in /etc/pve/nodes/*/qemu-server/*.conf; do
+            [[ -f "$conf_file" ]] || continue
+            if grep -q "clone.*2025-08" "$conf_file" 2>/dev/null; then
+                has_vms=true
+                fallback_found=true
+                log_debug "detect_available_vm_ct_types: Found VM with cloned storage via fallback: $conf_file"
+            fi
+        done
+        
+        # Check CTs  
+        for conf_file in /etc/pve/nodes/*/lxc/*.conf; do
+            [[ -f "$conf_file" ]] || continue
+            if grep -q "clone.*2025-08" "$conf_file" 2>/dev/null; then
+                has_cts=true
+                fallback_found=true
+                log_debug "detect_available_vm_ct_types: Found CT with cloned storage via fallback: $conf_file"
+            fi
+        done
+        
+        if [[ "$fallback_found" == false ]]; then
+            log_debug "detect_available_vm_ct_types: No cloned storage found in VM/CT configs"
+            echo "none"
+            return 0
+        fi
+    else
+        # Analyze what types are available from the function result
+        while IFS='|' read -r vmid vm_type name storage_name; do
+            if [[ -n "$vmid" ]]; then
+                log_debug "detect_available_vm_ct_types: Found $vm_type $vmid on storage $storage_name"
+                if [[ "$vm_type" == "vm" ]]; then
+                    has_vms=true
+                elif [[ "$vm_type" == "ct" ]]; then
+                    has_cts=true
+                fi
+            fi
+        done <<< "$vmct_raw_list"
+    fi
+    
+    # Return the result
+    if [[ "$has_vms" == true && "$has_cts" == true ]]; then
+        log_debug "detect_available_vm_ct_types: Result = mixed (VMs and CTs found)"
+        echo "mixed"
+    elif [[ "$has_vms" == true ]]; then
+        log_debug "detect_available_vm_ct_types: Result = vm-only"
+        echo "vm-only"
+    elif [[ "$has_cts" == true ]]; then
+        log_debug "detect_available_vm_ct_types: Result = ct-only"
+        echo "ct-only"
+    else
+        log_debug "detect_available_vm_ct_types: Result = none"
+        echo "none"
+    fi
 }
 
-# Step 0: Select migration mode
-move_storage_step0_select_mode() {
+# Step 0: Select migration type (only for mixed environments)
+move_storage_step0_select_type() {
     local dialog_selected=$(mktemp)
     
-    cmd=(dialog --keep-tite --title "Storage Migration Mode Selection - Step 1/3"
-         --ok-label "Next" --cancel-label "Back" 
-         --menu "Select storage migration mode:\n\nIMPORTANT: The mode selection affects which VMs can be migrated:" 16 85 2)
+    cmd=(dialog --keep-tite --title "Step 1/5: Select Migration Type"
+         --ok-label "Next" --cancel-label "Back"
+         --menu "Both Virtual Machines and Containers use cloned storage.\n\nChoose which type to migrate in this session:" 14 75 2)
     
-    options=("preserve" "Preserve VM snapshots (VMs must be powered OFF)"
-             "standard" "Do not preserve VM snapshots (VMs can be powered ON or OFF)")
+    options=("vm" "Migrate Virtual Machines (VMs)"
+             "ct" "Migrate Containers (CTs)")
     
     dialog_menu
     rm -f "$dialog_selected"
@@ -5636,27 +5721,13 @@ move_storage_step0_select_mode() {
     case $dialog_exit_code in
         0)  # Next
             case "$selected_option" in
-                preserve)
-                    move_storage_mode="preserve-snapshots"
-                    log_info "User selected preserve snapshots mode"
+                vm)
+                    selected_migration_type="vm"
+                    log_info "User selected VM migration type"
                     ;;
-                standard)
-                    move_storage_mode="standard"
-                    log_info "User selected standard mode (no snapshot preservation)"
-                    
-                    # Warning dialog - user must type "delete" to confirm
-                    local confirm_input=$(mktemp)
-                    dialog --inputbox "WARNING: Standard migration mode will DELETE all VM local snapshots (qcow2 based) before the Disk Move is started.\n\nThis operation is irreversible!\n\nTo confirm and proceed with standard migration mode, type 'delete':" 16 80 2> "$confirm_input"
-                    local exit_code=$?
-                    local confirmation=$(trimq "$(cat "$confirm_input")")
-                    rm -f "$confirm_input"
-                    
-                    if [[ $exit_code -ne 0 || "$confirmation" != "delete" ]]; then
-                        dialog --msgbox "Standard migration mode cancelled." 8 40
-                        return 1
-                    fi
-                    
-                    log_info "User confirmed standard mode with snapshot deletion"
+                ct)
+                    selected_migration_type="ct"
+                    log_info "User selected CT migration type"
                     ;;
             esac
             return 0
@@ -5666,6 +5737,303 @@ move_storage_step0_select_mode() {
             ;;
     esac
 }
+
+# Main wizard function for moving storage
+move_storage_cloned_nfs() {
+    # Reset variables for move storage wizard
+    selected_vmcts=()
+    selected_target_storage=""
+    move_storage_current_step=0
+    move_select_all_mode=false
+    move_storage_mode=""
+    selected_migration_type=""
+    
+    # Step -1: Detect available types and set initial step
+    local available_types=$(detect_available_vm_ct_types)
+    log_info "Detected available types: $available_types"
+    
+    case "$available_types" in
+        "none")
+            dialog --msgbox "No VM/CT found using cloned NFS storage.\nPlease ensure you have VM/CT using cloned NFS storage." 10 60
+            return 0
+            ;;
+        "vm-only")
+            selected_migration_type="vm"
+            move_storage_current_step=1  # Skip type selection, go to VM selection
+            ;;
+        "ct-only")
+            selected_migration_type="ct"
+            move_storage_mode="standard"  # Auto-select standard mode for CTs
+            move_storage_current_step=1  # Skip type selection, go to CT selection
+            log_info "Auto-selected standard mode for CT-only environment"
+            ;;
+        "mixed")
+            move_storage_current_step=0  # Start with type selection
+            ;;
+    esac
+    
+    while true; do
+        case $move_storage_current_step in
+            0)
+                # Step 0: Select migration type (only for mixed environments)
+                move_storage_step0_select_type
+                case $? in
+                    0)  # Next
+                        move_storage_current_step=1
+                        ;;
+                    1)  # Back to Main
+                        return 0
+                        ;;
+                esac
+                ;;
+            1)
+                # Step 1: Select VM/CT based on type
+                move_storage_step1_select_vmct "$available_types"
+                case $? in
+                    0)  # Next
+                        if [[ "$selected_migration_type" == "ct" ]]; then
+                            # Skip mode selection for CT migrations (auto-select standard mode)
+                            move_storage_mode="standard"
+                            log_info "Auto-selected standard mode for CT migration"
+                            move_storage_current_step=3
+                        else
+                            # VM migration - proceed to mode selection
+                            move_storage_current_step=2
+                        fi
+                        ;;
+                    1)  # Back
+                        if [[ "$available_types" == "mixed" ]]; then
+                            move_storage_current_step=0  # Back to type selection
+                        else
+                            return 0  # Back to main (single-type systems)
+                        fi
+                        ;;
+                    2)  # Stay on same step (retry)
+                        ;;
+                esac
+                ;;
+            2)
+                # Step 2: Select mode based on type
+                move_storage_step2_select_mode "$available_types"
+                case $? in
+                    0)  # Next
+                        move_storage_current_step=3
+                        ;;
+                    1)  # Back
+                        move_storage_current_step=1
+                        ;;
+                    2)  # Stay on same step (retry)
+                        ;;
+                esac
+                ;;
+            3)
+                # Step 3: Select target storage
+                move_storage_step3_select_target_storage
+                case $? in
+                    0)  # Next - execute migration
+                        move_storage_step4_execute_migration
+                        return 0
+                        ;;
+                    1)  # Back to Main
+                        return 0
+                        ;;
+                    2)  # Back
+                        if [[ "$selected_migration_type" == "ct" ]]; then
+                            # For CT migrations, go back to VM/CT selection (step 1)
+                            move_storage_current_step=1
+                        else
+                            # For VM migrations, go back to mode selection (step 2)
+                            move_storage_current_step=2
+                        fi
+                        ;;
+                    3)  # Stay on same step (retry)
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+# Helper functions for mode-specific confirmations
+
+# Confirm VM snapshot deletion for standard mode
+confirm_vm_snapshot_deletion() {
+    local vm_list=""
+    local vm_count=0
+    
+    # Build list of VMs that will lose snapshots
+    for vmct_data in "${selected_vmcts[@]}"; do
+        IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
+        if [[ "$vm_type" == "vm" ]]; then
+            vm_list+="- VM $vmid ($name)\n"
+            ((vm_count++))
+        fi
+    done
+    
+    local confirm_input=$(mktemp)
+    dialog --inputbox "WARNING: VM Standard mode will DELETE all local snapshots (qcow2 based) for the following VMs before Disk Move:\n\n$vm_list\nThis operation is irreversible!\n\nTo confirm and proceed with VM standard migration mode, type 'delete snapshots':" 18 85 2> "$confirm_input"
+    local exit_code=$?
+    local confirmation=$(trimq "$(cat "$confirm_input")")
+    rm -f "$confirm_input"
+    
+    # Check if user input contains both "delete" and "snapshots" (case-insensitive)
+    if [[ $exit_code -ne 0 ]] || ! echo "$confirmation" | grep -qi "delete" || ! echo "$confirmation" | grep -qi "snapshots"; then
+        dialog --msgbox "VM Standard migration mode cancelled." 8 40
+        return 1
+    fi
+    
+    log_info "User confirmed VM standard mode with snapshot deletion for $vm_count VMs"
+    return 0
+}
+
+# Confirm container stop for CT standard mode
+confirm_container_stop() {
+    local running_cts=""
+    local running_count=0
+    local total_count=0
+    
+    # Build list of containers and check which are running
+    for vmct_data in "${selected_vmcts[@]}"; do
+        IFS='|' read -r ctid vm_type name storage_name <<< "$vmct_data"
+        if [[ "$vm_type" == "ct" ]]; then
+            ((total_count++))
+            if is_power_on "$ctid"; then
+                running_cts+="- CT $ctid ($name) - Currently RUNNING\n"
+                ((running_count++))
+            else
+                running_cts+="- CT $ctid ($name) - Currently stopped\n"
+            fi
+        fi
+    done
+    
+    local message
+    if [[ $running_count -gt 0 ]]; then
+        message="NOTICE: Container migration requires shutting down running containers temporarily.\n\nThe following containers will be affected:\n\n$running_cts\nRunning containers ($running_count) will be SHUTDOWN during migration and automatically RESTARTED when complete.\n\nTo confirm and proceed with container migration, type 'shutdown':"
+    else
+        message="Container migration will process the following containers:\n\n$running_cts\nAll containers are already stopped.\n\nTo confirm and proceed with container migration, type 'proceed':"
+    fi
+    
+    local confirm_input=$(mktemp)
+    local expected_response="shutdown"
+    if [[ $running_count -eq 0 ]]; then
+        expected_response="proceed"
+    fi
+    
+    dialog --inputbox "$message" 20 85 2> "$confirm_input"
+    local exit_code=$?
+    local confirmation=$(trimq "$(cat "$confirm_input")")
+    rm -f "$confirm_input"
+    
+    if [[ $exit_code -ne 0 || "$confirmation" != "$expected_response" ]]; then
+        dialog --msgbox "Container migration cancelled." 8 40
+        return 1
+    fi
+    
+    log_info "User confirmed CT standard mode for $total_count containers ($running_count running)"
+    return 0
+}
+
+# Validate VM power states for preserve mode
+validate_vm_preserve_mode() {
+    local running_vms=""
+    local running_count=0
+    local total_count=0
+    
+    # Check power states of selected VMs
+    for vmct_data in "${selected_vmcts[@]}"; do
+        IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
+        if [[ "$vm_type" == "vm" ]]; then
+            ((total_count++))
+            if is_power_on "$vmid"; then
+                running_vms+="- VM $vmid ($name)\n"
+                ((running_count++))
+            fi
+        fi
+    done
+    
+    if [[ $running_count -gt 0 ]]; then
+        dialog --msgbox "ERROR: VM Preserve mode requires all VMs to be powered OFF.\n\nThe following VMs are currently running:\n\n$running_vms\nPlease power off these VMs and try again, or use VM Standard mode instead." 16 70
+        return 1
+    fi
+    
+    log_info "VM preserve mode validated: all $total_count VMs are powered off"
+    return 0
+}
+
+# Step 2: Select mode based on type (simplified - no mixed-type complexity)
+move_storage_step2_select_mode() {
+    local available_types="$1"
+    local dialog_selected=$(mktemp)
+    local menu_options=()
+    local step_number=""
+    
+    # Determine step number based on environment type
+    if [[ "$available_types" == "mixed" ]]; then
+        step_number="Step 3/5"
+    else
+        step_number="Step 2/4"
+    fi
+    
+    # Build menu options based on selected migration type (no mixed complexity!)
+    if [[ "$selected_migration_type" == "vm" ]]; then
+        # VM migration modes
+        menu_options+=(
+            "preserve" "Preserve VM snapshots (VMs must be powered OFF)"
+            "standard" "Delete VM snapshots (VMs can be ON or OFF)"
+        )
+    elif [[ "$selected_migration_type" == "ct" ]]; then
+        # CT migration modes (only one option)
+        menu_options+=(
+            "standard" "Migrate containers (will shutdown running containers temporarily)"
+        )
+    fi
+    
+    cmd=(dialog --keep-tite --title "$step_number: Select Migration Mode"
+         --ok-label "Next" --cancel-label "Back"
+         --menu "Select migration mode for $selected_migration_type migration:" 14 85 2)
+    options=("${menu_options[@]}")
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Next
+            case "$selected_option" in
+                preserve)
+                    if validate_vm_preserve_mode; then
+                        move_storage_mode="preserve-snapshots"
+                        log_info "User selected VM preserve snapshots mode"
+                        return 0
+                    else
+                        return 2  # Stay on same step - validation failed
+                    fi
+                    ;;
+                standard)
+                    if [[ "$selected_migration_type" == "vm" ]]; then
+                        if confirm_vm_snapshot_deletion; then
+                            move_storage_mode="standard"
+                            log_info "User selected VM standard mode (no snapshot preservation)"
+                            return 0
+                        else
+                            return 2  # Stay on same step - confirmation cancelled
+                        fi
+                    elif [[ "$selected_migration_type" == "ct" ]]; then
+                        if confirm_container_stop; then
+                            move_storage_mode="standard"
+                            log_info "User selected CT standard mode"
+                            return 0
+                        else
+                            return 2  # Stay on same step - confirmation cancelled
+                        fi
+                    fi
+                    ;;
+            esac
+            ;;
+        1)  # Back
+            return 1
+            ;;
+    esac
+}
+
 
 # VM/CT power state checking functions for disk migration
 vm_type() {
@@ -5677,6 +6045,97 @@ vm_type() {
     else
         echo "vm"
     fi
+}
+
+# Optimized function to get all VM/CT information using direct file parsing
+# Returns: vmid|name|type|status|node|tags|lock
+# This is ~10x faster than using pvesh API calls
+get_all_vm_ct_info() {
+    local vm_ct_list=()
+    
+    # Process VMs from qemu-server configs
+    for conf_file in /etc/pve/nodes/*/qemu-server/*.conf; do
+        [[ -f "$conf_file" ]] || continue
+        
+        local vmid=$(basename "$conf_file" .conf)
+        local node=$(echo "$conf_file" | cut -d'/' -f5)
+        local name="unnamed"
+        local tags=""
+        local lock=""
+        local status="unknown"
+        
+        # Parse config file for details
+        while IFS=': ' read -r key value; do
+            case "$key" in
+                "name") name="$value" ;;
+                "tags") tags="$value" ;;
+                "lock") lock="$value" ;;
+            esac
+        done < "$conf_file"
+        
+        # Check VM status - running if PID file exists
+        if [[ -f "/var/run/qemu-server/${vmid}.pid" ]]; then
+            status="running"
+        else
+            status="stopped"
+        fi
+        
+        # Handle suspended/paused status
+        if [[ "$lock" == "suspended" ]]; then
+            status="suspended"
+        fi
+        
+        vm_ct_list+=("$vmid|$name|vm|$status|$node|$tags|$lock")
+    done
+    
+    # Process CTs from lxc configs
+    for conf_file in /etc/pve/nodes/*/lxc/*.conf; do
+        [[ -f "$conf_file" ]] || continue
+        
+        local ctid=$(basename "$conf_file" .conf)
+        local node=$(echo "$conf_file" | cut -d'/' -f5)
+        local name="unnamed"
+        local tags=""
+        local lock=""
+        local status="unknown"
+        
+        # Parse config file for details
+        while IFS=': ' read -r key value; do
+            case "$key" in
+                "hostname") name="$value" ;;
+                "tags") tags="$value" ;;
+                "lock") lock="$value" ;;
+            esac
+        done < "$conf_file"
+        
+        # Check CT status using lxc-info or process check
+        if command -v lxc-info >/dev/null 2>&1; then
+            local ct_status=$(lxc-info -n "$ctid" 2>/dev/null | grep "State:" | awk '{print $2}')
+            case "$ct_status" in
+                "RUNNING") status="running" ;;
+                "STOPPED") status="stopped" ;;
+                "FROZEN") status="suspended" ;;
+                *) status="stopped" ;;
+            esac
+        else
+            # Fallback: check if container's init process exists
+            if [[ -d "/proc/$(cat /var/run/lxc/${ctid}.pid 2>/dev/null)" ]]; then
+                status="running"
+            else
+                status="stopped"
+            fi
+        fi
+        
+        # Handle suspended/paused status
+        if [[ "$lock" == "suspended" ]]; then
+            status="suspended"
+        fi
+        
+        vm_ct_list+=("$ctid|$name|ct|$status|$node|$tags|$lock")
+    done
+    
+    # Output all results
+    printf '%s\n' "${vm_ct_list[@]}" | sort -t'|' -k1,1n
 }
 
 is_power_on() {
@@ -5708,8 +6167,9 @@ is_power_on() {
     fi
 }
 
-# Step 1: Select VM/CT using cloned NFS storage
+# Step 1: Select VM/CT using cloned NFS storage (filtered by type)
 move_storage_step1_select_vmct() {
+    local available_types="$1"
     local vmct_data menu_items=() vmct_list=()
     
     # Initialize API cache for optimal performance
@@ -5727,34 +6187,17 @@ move_storage_step1_select_vmct() {
         return 1
     fi
     
-    # Process the list into arrays with power state filtering based on mode
+    # Process the list into arrays - filter by selected migration type
     while IFS='|' read -r vmid vm_type name storage_name; do
-        if [[ -n "$vmid" ]]; then
-            # Check power state for filtering based on mode
-            if [[ "$move_storage_mode" == "preserve-snapshots" ]]; then
-                # In preserve mode, only include powered off VMs
-                if is_power_on "$vmid"; then
-                    log_debug "Excluding VM/CT $vmid (running) - preserve mode requires powered off VMs"
-                    continue
-                else
-                    log_debug "Including VM/CT $vmid (powered off) - compatible with preserve mode"
-                fi
-            else
-                # In standard mode, include all VMs regardless of power state
-                log_debug "Including VM/CT $vmid - standard mode accepts any power state"
-            fi
-            
+        if [[ -n "$vmid" && "$vm_type" == "$selected_migration_type" ]]; then
+            log_debug "Including $vm_type $vmid for $selected_migration_type migration"
             vmct_list+=("$vmid|$vm_type|$name|$storage_name")
         fi
     done <<< "$vmct_raw_list"
     
-    # Check if filtering resulted in an empty list
+    # Check if list is empty
     if [[ ${#vmct_list[@]} -eq 0 ]]; then
-        if [[ "$move_storage_mode" == "preserve-snapshots" ]]; then
-            dialog --msgbox "No powered-off VM/CT found using cloned NFS storage.\n\nFor snapshot preservation mode, VMs must be powered OFF.\nPlease power off your VMs or use standard mode." 12 70
-        else
-            dialog --msgbox "No VM/CT found using cloned NFS storage after filtering.\nPlease ensure you have VM/CT using cloned NFS storage." 10 60
-        fi
+        dialog --msgbox "No VM/CT found using cloned NFS storage.\nPlease ensure you have VM/CT using cloned NFS storage." 10 60
         return 1
     fi
     
@@ -5776,10 +6219,16 @@ move_storage_step1_select_vmct() {
     for vmct_data in "${vmct_list[@]}"; do
         IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
         
-        # Format the display string with proper alignment
+        # Check power state for display
+        local power_state="OFF"
+        if is_power_on "$vmid"; then
+            power_state="ON "
+        fi
+        
+        # Format the display string with proper alignment including power state
         local name_with_parens="($name)"
         local formatted_name=$(printf "%-${max_name_len}s" "$name_with_parens")
-        local display_string=$(printf "%-2s %s  %s" "$vm_type" "$formatted_name" "$storage_name")
+        local display_string=$(printf "%-2s %s  %s  [%s]" "$vm_type" "$formatted_name" "$storage_name" "$power_state")
         
         # Check if this VM/CT was previously selected by checking if vmid is in selected list
         local status="off"
@@ -5800,10 +6249,38 @@ move_storage_step1_select_vmct() {
         select_label="Deselect All"
     fi
     
+    # Build type-specific dialog title and description
+    local dialog_title=""
+    local dialog_description=""
+    local step_number=""
+    
+    if [[ "$available_types" == "mixed" ]]; then
+        if [[ "$selected_migration_type" == "ct" ]]; then
+            step_number="Step 2/4"  # Mixed environment, CT selected (shorter workflow)
+        else
+            step_number="Step 2/5"  # Mixed environment, VM selected (full workflow)
+        fi
+    elif [[ "$available_types" == "ct-only" ]]; then
+        step_number="Step 1/3"  # CT-only workflow is shorter (no mode selection)
+    else
+        step_number="Step 1/4"  # VM-only workflow
+    fi
+    
+    if [[ "$selected_migration_type" == "vm" ]]; then
+        dialog_title="$step_number: Select Virtual Machines for Storage Migration"
+        dialog_description="Choose VMs to migrate storage (use SPACE to select/deselect):\n\nFormat: [vm] (Name) Storage [Power State]"
+    elif [[ "$selected_migration_type" == "ct" ]]; then
+        dialog_title="$step_number: Select Containers for Storage Migration"
+        dialog_description="Choose containers to migrate storage (use SPACE to select/deselect):\n\nFormat: [ct] (Name) Storage [Power State]"
+    else
+        dialog_title="$step_number: Select VM/CT for Storage Migration"
+        dialog_description="Choose VM/CT to migrate storage (use SPACE to select/deselect):\n\nFormat: [Type] (Name) Storage [Power State]"
+    fi
+    
     # Display dialog
-    cmd=(dialog --keep-tite --title "Step 1/2: Select VM/CT for Storage Migration"
+    cmd=(dialog --keep-tite --title "$dialog_title"
          --ok-label "Next" --cancel-label "Back" --extra-button --extra-label "$select_label"
-         --checklist "Choose VM/CT to migrate storage (use SPACE to select/deselect):" 20 100 10)
+         --checklist "$dialog_description" 20 110 10)
     options=("${menu_items[@]}")
     dialog_menu
     rm -f "$dialog_selected"
@@ -5855,8 +6332,26 @@ move_storage_step1_select_vmct() {
 }
 
 # Step 2: Select target non-cloned NFS storage
-move_storage_step2_select_target_storage() {
+move_storage_step3_select_target_storage() {
     local storage_list menu_items=()
+    local step_number=""
+    
+    # Determine step number based on selected migration type
+    local available_types=$(detect_available_vm_ct_types)
+    if [[ "$selected_migration_type" == "ct" ]]; then
+        if [[ "$available_types" == "ct-only" ]]; then
+            step_number="Step 2/3"  # CT-only workflow
+        else
+            step_number="Step 3/4"  # Mixed environment, CT selected
+        fi
+    else
+        # VM migration workflow
+        if [[ "$available_types" == "mixed" ]]; then
+            step_number="Step 4/5"  # Mixed environment, VM selected
+        else
+            step_number="Step 3/4"  # VM-only workflow
+        fi
+    fi
     
     # Get list of non-cloned NFS storage
     local non_cloned_storages
@@ -5889,7 +6384,7 @@ move_storage_step2_select_target_storage() {
     local dialog_selected=$(mktemp)
     
     # Display dialog
-    cmd=(dialog --keep-tite --title "Step 2/2: Select Target Storage"
+    cmd=(dialog --keep-tite --title "$step_number: Select Target Storage"
          --ok-label "Migrate" --cancel-label "Back to Main" --extra-button --extra-label "Back"
          --radiolist "Choose target non-cloned NFS storage:" 15 80 8)
     options=("${menu_items[@]}")
@@ -5920,29 +6415,27 @@ move_storage_step2_select_target_storage() {
 gather_disks() {
     local vmid="$1"
     local SRC="$2"
+    
+    # Detect type for proper logging
+    local type=$(vm_type "$vmid")
 
-    log_debug "Gathering disks on $SRC for VM $vmid"
+    log_debug "Gathering disks on $SRC for $type $vmid"
 
-    # Parse VM config to find disks on source storage
-    # Format: "device: storage:vm-ID-disk-N,options..."
+    # Parse VM/CT config to find disks on source storage
+    # Format: "device: storage:vm-ID-disk-N,options..." (VM) or "device: storage:..." (CT)
     # Extract device name (before first colon)
-    if command -v qm >/dev/null 2>&1; then
-        log_debug "Querying VM config for disks..."
-        if ! mapfile -t disks < <(timeout 10s qm config "$vmid" | grep "$SRC" | awk -F: '{print $1}'); then
-            log_error "Failed to query VM config for VM $vmid"
-            return 1
-        fi
-    else
-        log_error "qm command not available"
+    log_debug "Querying $type config for disks..."
+    if ! mapfile -t disks < <(pve_vm_ct_conf_file "$vmid" | grep "$SRC" | awk -F: '{print $1}'); then
+        log_error "Failed to query $type config for $type $vmid"
         return 1
     fi
 
     # Check if any disks were found
     if [[ ${#disks[@]} -eq 0 ]]; then
-        log_debug "No disks found on source storage $SRC for VM $vmid"
+        log_debug "No disks found on source storage $SRC for $type $vmid"
         return 1
     else
-        log_debug "Found disks for VM $vmid: ${disks[*]}"
+        log_debug "Found disks for $type $vmid: ${disks[*]}"
         return 0
     fi
 }
@@ -5951,33 +6444,52 @@ launch_disk_move() {
     local vmid="$1"
     local SRC="$2"
     local DST="$3"
-    local CONFIG_DIR="/etc/pve/nodes/$(hostname)/qemu-server"
-
-    log_info "Launching disk move operations for VM $vmid from $SRC to $DST"
+    
+    # Detect VM/CT type to determine correct config directory and commands
+    local type=$(vm_type "$vmid")
+    local CONFIG_DIR
+    local move_cmd
+    local cleanup_cmd
+    
+    if [[ "$type" == "ct" ]]; then
+        CONFIG_DIR="/etc/pve/nodes/$(hostname)/lxc"
+        log_info "Launching disk move operations for CT $vmid from $SRC to $DST"
+    else
+        CONFIG_DIR="/etc/pve/nodes/$(hostname)/qemu-server"  
+        log_info "Launching disk move operations for VM $vmid from $SRC to $DST"
+    fi
+    
     log_info "Using nohup pattern - processes will survive shell exit"
     
-    # Initialize disk move PIDs array for this VM
+    # Initialize disk move PIDs array for this VM/CT
     disk_move_pids=()
 
     # Process each disk found by gather_disks
     for disk in "${disks[@]}"; do
-        log_info "Moving disk $disk for VM $vmid from $SRC to $DST"
+        log_info "Moving disk $disk for $type $vmid from $SRC to $DST"
 
-        # Construct the move command
-        local move_cmd="qm move_disk '$vmid' '$disk' '$DST' --delete 0"
-        local cleanup_cmd="sed -i '/^unused[0-9]\\+:/d' '$CONFIG_DIR/$vmid.conf'"
+        # Construct the appropriate move command based on type
+        if [[ "$type" == "ct" ]]; then
+            # For containers, use pct move-volume
+            move_cmd="pct move-volume '$vmid' '$disk' '$DST' --delete 0"
+            cleanup_cmd="sed -i '/^unused[0-9]\\+:/d' '$CONFIG_DIR/$vmid.conf'"
+        else
+            # For VMs, use qm move_disk (original behavior)
+            move_cmd="qm move_disk '$vmid' '$disk' '$DST' --delete 0"
+            cleanup_cmd="sed -i '/^unused[0-9]\\+:/d' '$CONFIG_DIR/$vmid.conf'"
+        fi
 
         # Launch disk move in background with nohup (survives shell exit)
         # Use the pattern from user's research: nohup + PID capture + wait monitoring
         nohup bash -c "
             if $move_cmd >> '$LOG_FILE' 2>&1; then
-                echo \"[\$(date '+%F %T')] INFO: Successfully moved disk $disk for VM $vmid\" >> '$LOG_FILE'
+                echo \"[\$(date '+%F %T')] INFO: Successfully moved disk $disk for $type $vmid\" >> '$LOG_FILE'
 
                 # Clean up unused entries that may be created during move
                 $cleanup_cmd >> '$LOG_FILE' 2>&1
-                echo \"[\$(date '+%F %T')] INFO: Cleaned unused entries for VM $vmid\" >> '$LOG_FILE'
+                echo \"[\$(date '+%F %T')] INFO: Cleaned unused entries for $type $vmid\" >> '$LOG_FILE'
             else
-                echo \"[\$(date '+%F %T')] ERROR: Failed to move disk $disk for VM $vmid\" >> '$LOG_FILE'
+                echo \"[\$(date '+%F %T')] ERROR: Failed to move disk $disk for $type $vmid\" >> '$LOG_FILE'
                 exit 1
             fi
         " >> "$LOG_FILE" 2>&1 &
@@ -5991,8 +6503,11 @@ launch_disk_move() {
 
 wait_for_disk_migration_completion() {
     local vmid="$1"
+    
+    # Detect type for proper logging
+    local type=$(vm_type "$vmid")
 
-    log_info "Waiting for disk migration to complete for VM $vmid"
+    log_info "Waiting for disk migration to complete for $type $vmid"
     log_info "Waiting for ${#disk_move_pids[@]} nohup disk move processes: ${disk_move_pids[*]}"
     log_info "These processes will survive shell exit and continue running"
 
@@ -6020,10 +6535,10 @@ wait_for_disk_migration_completion() {
         fi
     done
 
-    log_info "Disk migration completed for VM $vmid: $completed successful, $failed failed"
+    log_info "Disk migration completed for $type $vmid: $completed successful, $failed failed"
     log_info "All nohup processes monitored and reaped successfully"
     
-    # Reset the PIDs array for next VM
+    # Reset the PIDs array for next VM/CT
     disk_move_pids=()
     
     # Return failure if any disk moves failed
@@ -6057,7 +6572,7 @@ delete_snapshots() {
 }
 
 # Step 3: Execute migration
-move_storage_step3_execute_migration() {
+move_storage_step4_execute_migration() {
     local migration_summary=""
     migration_summary="Migration Summary:\n\n"
     migration_summary+="Migration Mode: $move_storage_mode\n"
@@ -6076,6 +6591,14 @@ move_storage_step3_execute_migration() {
     if ! dialog --yesno "$migration_summary" 20 80; then
         log_info "User cancelled storage migration"
         return 1
+    fi
+    
+    # For CT migrations, show container shutdown confirmation
+    if [[ "$selected_migration_type" == "ct" ]]; then
+        if ! confirm_container_stop; then
+            log_info "User cancelled container migration during shutdown confirmation"
+            return 1
+        fi
     fi
     
     log_info "Starting storage migration for ${#selected_vmcts[@]} VM/CT in $move_storage_mode mode"
@@ -6182,7 +6705,7 @@ my $migration = PVE::API2::PveToolsDiskMigration->new(
 # Execute the migration workflow
 my $result = $migration->execute_migration_workflow();
 
-print "Migration completed successfully\n" if $result;
+# Don't print to stdout - let the script handle logging
 EOF
                         chmod +x "$perl_script"
                         
@@ -6263,7 +6786,7 @@ EOF
                                 else
                                     # Couldn't get task status - may have completed very quickly
                                     # Try alternate method using pvenode
-                                    if pvenode task status $upid 2>&1 | grep -q "no such task"; then
+                                    if pvenode task status $upid 2>/dev/null | grep -q "no such task" 2>/dev/null; then
                                         # Task no longer exists - likely completed
                                         log_info "Task no longer exists - checking if migration completed for VM $vmid"
                                         # Check if disks exist in destination storage
@@ -6295,37 +6818,89 @@ EOF
                         fi
                     fi
                 else
-                    # Standard mode - delete snapshots and use qm move_disk
-                    log_info "Using standard mode for VM $vmid"
+                    # Detect type once for all logging
+                    local type=$(vm_type "$vmid")
+                    
+                    # Prepare result file for early exit scenarios
+                    local result_file="/tmp/pve_migrate_result_${vmid}.tmp"
+                    
+                    # Standard mode - delete snapshots and use appropriate move command
+                    log_info "Using standard mode for $type $vmid"
                     log_info "*** STANDARD MODE: This will actually wait for completion ***"
                     
+                    # Check if container needs to be stopped for migration
+                    local was_running=false
+                    if [[ "$type" == "ct" ]] && is_power_on "$vmid"; then
+                        log_info "Step 0: Stopping running container $vmid for storage migration"
+                        if pct stop "$vmid" >> "$LOG_FILE" 2>&1; then
+                            log_info "Container $vmid stopped successfully"
+                            was_running=true
+                        else
+                            log_error "Failed to stop container $vmid - aborting migration"
+                            vm_success=false
+                            # Early exit if we can't stop the container
+                            echo "FAILED:$vmid" > "$result_file"
+                            return 1
+                        fi
+                    fi
+                    
                     # Step 1: Delete snapshots
-                    log_info "Step 1: Deleting snapshots for VM $vmid"
+                    log_info "Step 1: Deleting snapshots for $type $vmid"
                     delete_snapshots "$vmid"
                     
                     # Step 2: Gather disks
-                    log_info "Step 2: Gathering disks for VM $vmid"
+                    log_info "Step 2: Gathering disks for $type $vmid"
                     if gather_disks "$vmid" "$storage_name"; then
                         # Step 3: Launch disk moves
-                        log_info "Step 3: Launching disk move for VM $vmid"
+                        log_info "Step 3: Launching disk move for $type $vmid"
                         launch_disk_move "$vmid" "$storage_name" "$selected_target_storage"
                         
                         # Step 4: Wait for completion
-                        log_info "Step 4: Waiting for disk migration completion for VM $vmid"
+                        log_info "Step 4: Waiting for disk migration completion for $type $vmid"
                         if wait_for_disk_migration_completion "$vmid"; then
-                            log_info "Step 4 completed: VM $vmid migration finished successfully"
+                            log_info "Step 4 completed: $type $vmid migration finished successfully"
+                            
+                            # Step 5: Restart container if it was running before migration
+                            if [[ "$type" == "ct" && "$was_running" == "true" ]]; then
+                                log_info "Step 5: Restarting container $vmid (was running before migration)"
+                                if pct start "$vmid" >> "$LOG_FILE" 2>&1; then
+                                    log_info "Container $vmid restarted successfully"
+                                else
+                                    log_error "Failed to restart container $vmid - manual intervention may be required"
+                                    # Don't fail the migration for restart issues
+                                fi
+                            fi
                         else
-                            log_error "Step 4 failed: VM $vmid migration had errors"
+                            log_error "Step 4 failed: $type $vmid migration had errors"
                             vm_success=false
+                            
+                            # If migration failed but container was stopped, try to restart it
+                            if [[ "$type" == "ct" && "$was_running" == "true" ]]; then
+                                log_info "Attempting to restart container $vmid after failed migration"
+                                if pct start "$vmid" >> "$LOG_FILE" 2>&1; then
+                                    log_info "Container $vmid restarted successfully after failed migration"
+                                else
+                                    log_error "Failed to restart container $vmid after failed migration - manual intervention required"
+                                fi
+                            fi
                         fi
                     else
-                        log_error "No disks found for VM $vmid on storage $storage_name"
+                        log_error "No disks found for $type $vmid on storage $storage_name"
                         vm_success=false
+                        
+                        # If we stopped the container but can't find disks, restart it
+                        if [[ "$type" == "ct" && "$was_running" == "true" ]]; then
+                            log_info "Restarting container $vmid after disk discovery failure"
+                            if pct start "$vmid" >> "$LOG_FILE" 2>&1; then
+                                log_info "Container $vmid restarted successfully"
+                            else
+                                log_error "Failed to restart container $vmid - manual intervention required"
+                            fi
+                        fi
                     fi
                 fi
                 
                 # Write result to file for parent process to check
-                local result_file="/tmp/pve_migrate_result_${vmid}.tmp"
                 if [[ "$vm_success" == "true" ]]; then
                     log_info "*** SUBSHELL EXITING: Migration completed successfully for VM $vmid ***"
                     log_info "*** MODE: $move_storage_mode - If preserve-snapshots, actual migration is still running! ***"
@@ -6532,7 +7107,7 @@ rest_api_connection_test() {
     fi
 }
 
-# Function to get product information from JovianDSS REST API
+# Function to get product information from $PRODUCT REST API
 get_jovian_product_info() {
     local ip="$1"
     local response status
@@ -7117,11 +7692,11 @@ nfs_step2_select_pool() {
     
     if [[ $conn_test_exit -eq 10 ]]; then
         # Authentication failure (401)
-        dialog --msgbox "REST API Authentication Failed!\n\nThe REST API credentials are incorrect or have been changed on the storage server.\n\nPlease go to Setup → Configure REST API and update your credentials.\n\nCurrent user: $rest_api_user" 12 70
+        dialog --msgbox "REST API Authentication Failed!\n\nThe REST API credentials are incorrect or have been changed on the $PRODUCT.\n\nPlease go to Setup → Configure REST API and update your credentials.\n\nCurrent user: $rest_api_user" 12 70
         return 2  # Go back
     elif [[ $conn_test_exit -eq 11 ]]; then
         # Access forbidden (403)
-        dialog --msgbox "REST API Access Forbidden!\n\nThe user '$rest_api_user' does not have permission to perform this operation.\n\nPlease check user permissions on the storage server." 10 70
+        dialog --msgbox "REST API Access Forbidden!\n\nThe user '$rest_api_user' does not have permission to perform this operation.\n\nPlease check user permissions on the $PRODUCT." 10 70
         return 2  # Go back
     elif [[ $conn_test_exit -ne 0 ]]; then
         # Other connection error
@@ -7498,7 +8073,8 @@ sync_storage_discovery() {
     # Clear any cached storage information
     rm -f /tmp/pve-storage-* 2>/dev/null || true
     
-    pvesm status >/dev/null 2>&1
+    # Note: Removed pvesm status call which was causing 10-second delay
+    # Storage discovery is handled by build_storage_ip_map reading config directly
     
     log_info "Storage discovery synchronization complete"
 }
@@ -8559,7 +9135,13 @@ check_vmct_using_storage() {
                 fi
                 
                 # Get VM/CT name from config (handle both formats: "name: value" and "name=value")
-                local vmct_name=$(grep -E "^name[[:space:]]*[:=]" "$conf_file" 2>/dev/null | sed -E 's/^name[[:space:]]*[:=][[:space:]]*//' | head -1)
+                # For VMs (QEMU), use 'name:' field; for containers (LXC), use 'hostname:' field
+                local vmct_name
+                vmct_name=$(grep -E "^name[[:space:]]*[:=]" "$conf_file" 2>/dev/null | sed -E 's/^name[[:space:]]*[:=][[:space:]]*//' | head -1)
+                if [[ -z "$vmct_name" ]]; then
+                    # Try hostname field for LXC containers
+                    vmct_name=$(grep -E "^hostname[[:space:]]*[:=]" "$conf_file" 2>/dev/null | sed -E 's/^hostname[[:space:]]*[:=][[:space:]]*//' | head -1)
+                fi
                 if [[ -z "$vmct_name" ]]; then
                     vmct_name="(no name)"
                 fi
@@ -8716,11 +9298,11 @@ delete_cloned_nfs_storage_wizard() {
     if [[ $get_list_exit -eq 10 ]]; then
         log_debug "delete_cloned_nfs_storage_wizard: Authentication failure detected, showing dialog"
         # Now we can safely show the dialog since we're at the top level
-        dialog --msgbox "REST API Authentication Failed!\n\nThe REST API credentials are incorrect or have been changed on the storage server.\n\nPlease go to Setup → Configure REST API and update your credentials.\n\nCurrent user: $rest_api_user" 15 70
+        dialog --msgbox "REST API Authentication Failed!\n\nThe REST API credentials are incorrect or have been changed on the $PRODUCT.\n\nPlease go to Setup → Configure REST API and update your credentials.\n\nCurrent user: $rest_api_user" 15 70
         return 1
     elif [[ $get_list_exit -eq 11 ]]; then
         log_debug "delete_cloned_nfs_storage_wizard: Access forbidden detected, showing dialog"
-        dialog --msgbox "REST API Access Forbidden!\n\nThe user '$rest_api_user' does not have permission to perform this operation.\n\nPlease check user permissions on the storage server." 10 70
+        dialog --msgbox "REST API Access Forbidden!\n\nThe user '$rest_api_user' does not have permission to perform this operation.\n\nPlease check user permissions on the $PRODUCT." 10 70
         return 1
     elif [[ $get_list_exit -ne 0 ]]; then
         log_debug "delete_cloned_nfs_storage_wizard: Other error occurred (code: $get_list_exit)"
@@ -8868,9 +9450,9 @@ vm_manager_get_vm_ct_list() {
     # Get VMs with hostpci for skipping
     readarray -t hostpci_vms < <(vm_manager_get_vms_with_hostpci)
     
-    # Get cluster-wide resources using pvesh
-    while IFS='|' read -r vmid name type status node tags; do
-        if [[ -n "$vmid" && "$vmid" != "VMID" ]]; then
+    # Get cluster-wide resources using optimized file parsing
+    while IFS='|' read -r vmid name type status node tags lock; do
+        if [[ -n "$vmid" ]]; then
             # Skip VMs with hostpci (passthrough)
             if [[ "$type" == "vm" ]] && [[ " ${hostpci_vms[*]} " == *" $vmid "* ]]; then
                 log_debug "Skipping vm:$vmid (hostpci present)"
@@ -8883,42 +9465,10 @@ vm_manager_get_vm_ct_list() {
                 continue
             fi
             
+            # Format output without lock field to match original format
             vm_list+=("$vmid|$name|$type|$status|$tags")
         fi
-    done < <(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
-        python3 -c "
-import sys, json
-try:
-    resources = json.load(sys.stdin)
-    for resource in resources:
-        vmid = resource.get('vmid', '')
-        name = resource.get('name', 'unnamed')
-        res_type = resource.get('type', '')
-        status = resource.get('status', 'unknown')
-        node = resource.get('node', '')
-        tags = resource.get('tags', '')
-        lock = resource.get('lock', '')
-        
-        # Map resource type to our format
-        if res_type == 'qemu':
-            vm_type = 'vm'
-        elif res_type == 'lxc':
-            vm_type = 'ct'
-        else:
-            continue
-            
-        # Clean up tags (empty if None)
-        if not tags:
-            tags = ''
-            
-        # Check if VM/CT is suspended (has suspended lock or paused status)
-        if lock == 'suspended' or status == 'paused':
-            status = 'suspended'
-            
-        print(f'{vmid}|{name}|{vm_type}|{status}|{node}|{tags}')
-except Exception as e:
-    print(f'Error: {e}', file=sys.stderr)
-")
+    done < <(get_all_vm_ct_info)
     
     printf '%s\n' "${vm_list[@]}"
 }
@@ -9146,41 +9696,17 @@ vm_manager_select_action() {
 vm_manager_get_vm_type_status_node() {
     local vmid="$1"
     
-    # Get VM/CT info from cluster resources
-    local vm_info=$(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
-        python3 -c "
-import sys, json
-try:
-    resources = json.load(sys.stdin)
-    for resource in resources:
-        if str(resource.get('vmid', '')) == '$vmid':
-            res_type = resource.get('type', '')
-            status = resource.get('status', 'unknown')
-            node = resource.get('node', '')
-            lock = resource.get('lock', '')
-            
-            # Map resource type to our format
-            if res_type == 'qemu':
-                vm_type = 'vm'
-            elif res_type == 'lxc':
-                vm_type = 'ct'
-            else:
-                vm_type = 'unknown'
-                
-            # Check if VM/CT is suspended (has suspended lock or paused status)
-            if lock == 'suspended' or status == 'paused':
-                status = 'suspended'
-                
-            print(f'{vm_type}|{status}|{node}')
-            sys.exit(0)
-    print('unknown|unknown|unknown')
-except Exception as e:
-    print('unknown|unknown|unknown')
-    print(f'Error: {e}', file=sys.stderr)
-")
+    # Get VM/CT info using optimized function
+    local vm_info=$(get_all_vm_ct_info | grep "^${vmid}|" | head -1)
     
-    if [[ -n "$vm_info" && "$vm_info" != "unknown|unknown|unknown" ]]; then
-        echo "$vm_info"
+    if [[ -n "$vm_info" ]]; then
+        # Extract type, status, and node from the info
+        # Format: vmid|name|type|status|node|tags|lock
+        local type=$(echo "$vm_info" | cut -d'|' -f3)
+        local status=$(echo "$vm_info" | cut -d'|' -f4)
+        local node=$(echo "$vm_info" | cut -d'|' -f5)
+        
+        echo "${type}|${status}|${node}"
         return 0
     fi
     
@@ -9192,84 +9718,19 @@ except Exception as e:
 vm_manager_get_vm_details() {
     local vmid="$1"
     
-    # Get VM/CT info from cluster resources
-    local vm_info=$(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
-        python3 -c "
-import sys, json
-try:
-    resources = json.load(sys.stdin)
-    for resource in resources:
-        if str(resource.get('vmid', '')) == '$vmid':
-            res_type = resource.get('type', '')
-            status = resource.get('status', 'unknown')
-            node = resource.get('node', '')
-            lock = resource.get('lock', '')
-            name = resource.get('name', '')
-            
-            # Map resource type to our format
-            if res_type == 'qemu':
-                vm_type = 'vm'
-            elif res_type == 'lxc':
-                vm_type = 'ct'
-            else:
-                vm_type = 'unknown'
-                
-            # Check if VM/CT is suspended (has suspended lock or paused status)
-            if lock == 'suspended' or status == 'paused':
-                status = 'suspended'
-                
-            print(f'{vm_type}|{status}|{node}|{name}')
-            sys.exit(0)
-    print('unknown|unknown|unknown|')
-except Exception as e:
-    print('unknown|unknown|unknown|')
-    print(f'Error: {e}', file=sys.stderr)
-")
+    # Get VM/CT info using optimized function
+    local vm_info=$(get_all_vm_ct_info | grep "^${vmid}|" | head -1)
     
-    # Get tags from VM/CT config if available
-    local vm_type_status_node_name="$vm_info"
-    local vm_type
-    IFS='|' read -r vm_type _ _ _ <<< "$vm_type_status_node_name"
-    
-    local tags=""
-    if [[ "$vm_type" == "vm" ]]; then
-        # Get tags from qemu config
-        tags=$(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
-            python3 -c "
-import sys, json
-try:
-    resources = json.load(sys.stdin)
-    for resource in resources:
-        if str(resource.get('vmid', '')) == '$vmid':
-            tags = resource.get('tags', '')
-            print(tags)
-            sys.exit(0)
-    print('')
-except Exception as e:
-    print('')
-    print(f'Error: {e}', file=sys.stderr)
-")
-    elif [[ "$vm_type" == "ct" ]]; then
-        # Get tags from lxc config
-        tags=$(pvesh get /cluster/resources --type vm --output-format=json 2>/dev/null | \
-            python3 -c "
-import sys, json
-try:
-    resources = json.load(sys.stdin)
-    for resource in resources:
-        if str(resource.get('vmid', '')) == '$vmid':
-            tags = resource.get('tags', '')
-            print(tags)
-            sys.exit(0)
-    print('')
-except Exception as e:
-    print('')
-    print(f'Error: {e}', file=sys.stderr)
-")
-    fi
-    
-    if [[ -n "$vm_info" && "$vm_info" != "unknown|unknown|unknown|" ]]; then
-        echo "${vm_info}|${tags}"
+    if [[ -n "$vm_info" ]]; then
+        # Extract details from the info
+        # Format: vmid|name|type|status|node|tags|lock
+        local name=$(echo "$vm_info" | cut -d'|' -f2)
+        local type=$(echo "$vm_info" | cut -d'|' -f3)
+        local status=$(echo "$vm_info" | cut -d'|' -f4)
+        local node=$(echo "$vm_info" | cut -d'|' -f5)
+        local tags=$(echo "$vm_info" | cut -d'|' -f6)
+        
+        echo "${type}|${status}|${node}|${name}|${tags}"
         return 0
     fi
     
@@ -9709,21 +10170,8 @@ confirm_ha_nodes() {
 
 # Get all VM/CT resources from cluster
 get_all_vm_ct_resources() {
-    pvesh get /cluster/resources --type vm --output-format=json | \
-    python3 -c "
-import sys, json
-resources = json.load(sys.stdin)
-for resource in resources:
-    if resource['type'] in ['qemu', 'lxc']:
-        vmid = resource['vmid']
-        name = resource.get('name', 'N/A')
-        vm_type = 'vm' if resource['type'] == 'qemu' else 'ct'
-        status = resource.get('status', 'unknown')
-        node = resource.get('node', 'unknown')
-        
-        # Get maximum field lengths for alignment
-        print(f\"{vmid}|{name}|{vm_type}|{status}|{node}\")
-"
+    # Use optimized function and format output to match expected format
+    get_all_vm_ct_info | awk -F'|' '{print $1"|"$2"|"$3"|"$4"|"$5}'
 }
 
 # Calculate maximum field lengths for formatting
@@ -9945,15 +10393,7 @@ process_ha_resources() {
     
     # Get type information for selected VMs/CTs
     local vm_type_map
-    vm_type_map=$(pvesh get /cluster/resources --type vm --output-format=json | \
-    python3 -c "
-import sys, json
-resources = json.load(sys.stdin)
-mapping = {'qemu': 'vm', 'lxc': 'ct'}
-for resource in resources:
-    if resource['type'] in mapping:
-        print(f\"{resource['vmid']}:{mapping[resource['type']]}\")
-")
+    vm_type_map=$(get_all_vm_ct_info | awk -F'|' '{print $1":"$3}')
     
     # Count total selected resources for progress
     local total_resources=${#SELECTED_VMIDS[@]}
@@ -10626,7 +11066,7 @@ configure_startup_settings_wizard() {
     
     local summary
     summary=$(cat <<EOF
-Note: Startup settings apply only to the JovianDSS VM. 
+Note: Startup settings apply only to the $PRODUCT VM. 
 All other VMs are managed by Proxmox VE HA, 
 which uses its own logic to control startup/shutdown based on HA settings, 
 not the VM's configuration.

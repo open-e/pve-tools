@@ -26,7 +26,7 @@ export NCURSES_NO_UTF8_ACS=1
 # Debug mode flag - automatically set to false during commits
 DEBUG_MODE=false
 
-# Version information - RELEASE_DATE and VERSION automatically managed during commits
+# Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
 VERSION="0.43"
 RELEASE_DATE="2025-08-06"
 

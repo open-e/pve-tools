@@ -24,14 +24,15 @@ export NCURSES_NO_UTF8_ACS=1
 
 # GLOBAL VARIABLES
 # Debug mode flag
-DEBUG_MODE="false"
+DEBUG_MODE=true
 
 # Version information
-VERSION="0.41"
+VERSION="0.42"
 RELEASE_DATE="2025-08-06"
 
 # Script mode flag
 VERSION_MODE=false
+TEST_UPDATE_MODE=false
 
 
 # Product information
@@ -2567,6 +2568,179 @@ get_commit_info() {
     fi
 }
 
+# Get all commits since a specific version from GitHub API
+get_commits_since_version() {
+    local current_version="$1"
+    local current_date="$2"
+    local vendor_lower
+    local api_url
+    local commits_json
+    local formatted_commits=""
+    local commit_count=0
+    
+    # Convert VENDOR to lowercase for URL
+    vendor_lower=$(lower "$VENDOR")
+    
+    # First, try to fetch recent commits (up to 50)
+    api_url="https://api.github.com/repos/${vendor_lower}/pve-tools/commits?sha=main&per_page=50"
+    
+    log_debug "Fetching commit history from: $api_url"
+    log_debug "Current version: $current_version, Release date: $current_date"
+    
+    # Fetch commits from GitHub API with timeout and rate limit handling
+    commits_json=$(curl -s --connect-timeout 10 --max-time 30 "$api_url" 2>/dev/null)
+    
+    # Check for various failure conditions
+    if [ -z "$commits_json" ] || [ "$commits_json" = "null" ]; then
+        log_error "Failed to retrieve commit history from GitHub API"
+        return 1
+    fi
+    
+    # Check for GitHub API rate limiting
+    if echo "$commits_json" | grep -q '"message".*API rate limit exceeded'; then
+        log_error "GitHub API rate limit exceeded"
+        log_debug "Rate limit response: $commits_json"
+        return 1
+    fi
+    
+    # Check for not found or other API errors
+    if echo "$commits_json" | grep -q '"message".*Not Found'; then
+        log_error "GitHub repository not found or inaccessible"
+        return 1
+    fi
+    
+    # Parse commits based on available tools
+    if command -v jq >/dev/null 2>&1; then
+        log_debug "Using jq to parse commit history"
+        
+        # Parse each commit and format it
+        while IFS= read -r commit_line; do
+            # Skip if this line is empty
+            [ -z "$commit_line" ] && continue
+            
+            # Parse the JSON line (format: date|message)
+            local commit_date=$(echo "$commit_line" | cut -d'|' -f1)
+            local commit_message=$(echo "$commit_line" | cut -d'|' -f2-)
+            
+            # Compare dates to see if this commit is newer than our version
+            # For very old versions (0.x where x < 10), skip date filtering entirely
+            local current_ver_major=$(echo "$current_version" | cut -d. -f1)
+            local current_ver_minor=$(echo "$current_version" | cut -d. -f2 2>/dev/null || echo "0")
+            
+            if [ "$current_ver_major" = "0" ] && [ "$current_ver_minor" -lt "10" ]; then
+                log_debug "Very old version detected ($current_version), skipping date filtering for commit from $commit_date"
+            elif [ -n "$current_date" ]; then
+                # For normal versions, use date filtering
+                local commit_date_num=$(echo "$commit_date" | tr -d '-')
+                local current_date_num=$(echo "$current_date" | tr -d '-')
+                
+                # If commit is from on or before our version date, stop
+                if [ "$commit_date_num" -le "$current_date_num" ]; then
+                    log_debug "Reached commit from $commit_date (on or before $current_date), stopping"
+                    break
+                fi
+            fi
+            
+            # Check if commit message contains version bump to our current version
+            if echo "$commit_message" | grep -q "version.*$current_version"; then
+                log_debug "Found version bump to $current_version, stopping"
+                break
+            fi
+            
+            # Add this commit to our list
+            if [ -n "$formatted_commits" ]; then
+                formatted_commits+="\n\n"
+            fi
+            formatted_commits+="$commit_date - $commit_message"
+            ((commit_count++))
+            
+            # Limit to reasonable number of commits for display
+            if [ $commit_count -ge 20 ]; then
+                formatted_commits+="\n\n... and more commits (showing latest 20)"
+                formatted_commits+="\nVisit https://github.com/${vendor_lower}/pve-tools/commits for full history"
+                break
+            fi
+        done < <(echo "$commits_json" | jq -r '.[] | "\(.commit.author.date | split("T")[0])|\(.commit.message | split("\n")[0])"' 2>/dev/null)
+        
+    else
+        log_debug "Using grep/sed fallback for commit parsing"
+        
+        # Fallback parsing without jq - extract basic commit info
+        # This is more limited but functional
+        local in_commit=false
+        local temp_date=""
+        local temp_author=""
+        local temp_message=""
+        
+        while IFS= read -r line; do
+            # Look for commit date
+            if echo "$line" | grep -q '"date"[[:space:]]*:'; then
+                temp_date=$(echo "$line" | sed 's/.*"date"[[:space:]]*:[[:space:]]*"\([^T]*\)T.*/\1/')
+            fi
+            
+            # Look for author name  
+            if echo "$line" | grep -q '"name"[[:space:]]*:'; then
+                temp_author=$(echo "$line" | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+            fi
+            
+            # Look for commit message
+            if echo "$line" | grep -q '"message"[[:space:]]*:'; then
+                temp_message=$(echo "$line" | sed 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+                
+                # We have all parts, check if we should include this commit
+                if [ -n "$temp_date" ] && [ -n "$temp_message" ]; then
+                    # Compare dates (same logic as jq parsing)
+                    local current_ver_major=$(echo "$current_version" | cut -d. -f1)
+                    local current_ver_minor=$(echo "$current_version" | cut -d. -f2 2>/dev/null || echo "0")
+                    
+                    if [ "$current_ver_major" = "0" ] && [ "$current_ver_minor" -lt "10" ]; then
+                        log_debug "Very old version detected ($current_version), skipping date filtering for commit from $temp_date"
+                    elif [ -n "$current_date" ]; then
+                        local commit_date_num=$(echo "$temp_date" | tr -d '-')
+                        local current_date_num=$(echo "$current_date" | tr -d '-')
+                        
+                        if [ "$commit_date_num" -le "$current_date_num" ]; then
+                            break
+                        fi
+                    fi
+                    
+                    # Check for version bump
+                    if echo "$temp_message" | grep -qi "version.*$current_version"; then
+                        break
+                    fi
+                    
+                    # Add commit
+                    if [ -n "$formatted_commits" ]; then
+                        formatted_commits+="\n\n"
+                    fi
+                    formatted_commits+="$temp_date - $temp_message"
+                    ((commit_count++))
+                    
+                    if [ $commit_count -ge 20 ]; then
+                        formatted_commits+="\n\n... and more commits (showing latest 20)"
+                        formatted_commits+="\nVisit https://github.com/${vendor_lower}/pve-tools/commits for full history"
+                        break
+                    fi
+                    
+                    # Reset for next commit
+                    temp_date=""
+                    temp_author=""
+                    temp_message=""
+                fi
+            fi
+        done <<< "$commits_json"
+    fi
+    
+    if [ $commit_count -eq 0 ]; then
+        log_debug "No commits found since version $current_version"
+        return 1
+    fi
+    
+    log_debug "Found $commit_count commits since version $current_version"
+    echo "$formatted_commits"
+    return 0
+}
+
 # Check for script updates from GitHub
 check_for_updates() {
     local current_version="$VERSION"
@@ -2673,7 +2847,10 @@ update_script() {
 prompt_for_update() {
     local remote_version
     local commit_info
+    local commits_list
+    local commit_count
     local update_message
+    local dialog_height=20
     
     # Convert VENDOR to lowercase for URL
     local vendor_lower
@@ -2688,30 +2865,62 @@ prompt_for_update() {
     
     log_debug "Retrieved remote version for prompt: '$remote_version'"
     
-    # Get commit description
-    log_debug "Fetching commit description for update prompt"
-    commit_info=$(get_commit_info 2>/dev/null)
+    # Get all commits since current version
+    log_debug "Fetching commit history since version $VERSION ($RELEASE_DATE)"
+    commits_list=$(get_commits_since_version "$VERSION" "$RELEASE_DATE" 2>/dev/null)
     
-    if [ -n "$commit_info" ]; then
-        log_debug "Successfully retrieved commit info: '$commit_info'"
+    if [ -n "$commits_list" ]; then
+        # Count number of commits (count lines that start with a date)
+        commit_count=$(echo -e "$commits_list" | grep -c "^[0-9][0-9][0-9][0-9]-" || echo "0")
+        log_debug "Successfully retrieved $commit_count commits since current version"
+        
+        # Adjust dialog height based on number of commits
+        if [ "$commit_count" -gt 5 ]; then
+            dialog_height=25  # Use larger dialog for many commits
+        fi
     else
-        log_debug "No commit info available, will show version-only prompt"
+        log_debug "No commit history available, trying single commit fallback"
+        # Fallback to single commit info if full history fails
+        commit_info=$(get_commit_info 2>/dev/null)
+        if [ -n "$commit_info" ]; then
+            commits_list="Latest change:\n  $commit_info"
+            commit_count=1
+        else
+            log_debug "No commit info available at all"
+            commit_count=0
+        fi
     fi
     
-    # Build update message with or without commit info
-    if [ -n "$commit_info" ]; then
-        update_message="A new version of pve-tools is available!\n\nCurrent version: $VERSION\nNew version: $remote_version\n\nWhat's new:\n$commit_info\n\nWould you like to update now?"
-        log_debug "Built update message with commit info"
+    # Build update message with commit history
+    if [ -n "$commits_list" ] && [ "$commit_count" -gt 0 ]; then
+        if [ "$commit_count" -eq 1 ]; then
+            update_message="A new version of pve-tools is available!\n\nCurrent version: $VERSION ($RELEASE_DATE)\nNew version: $remote_version\n\nWhat's new:\n$commits_list\n\nWould you like to update now?"
+        else
+            update_message="A new version of pve-tools is available!\n\nCurrent version: $VERSION ($RELEASE_DATE)\nNew version: $remote_version\n\nChanges since your version ($commit_count commits):\n\n$commits_list\n\nWould you like to update now?"
+        fi
+        log_debug "Built update message with $commit_count commits"
     else
-        update_message="A new version of pve-tools is available!\n\nCurrent version: $VERSION\nNew version: $remote_version\n\nWould you like to update now?"
+        update_message="A new version of pve-tools is available!\n\nCurrent version: $VERSION ($RELEASE_DATE)\nNew version: $remote_version\n\nWould you like to update now?"
         log_debug "Built update message without commit info"
     fi
     
-    log_debug "Showing update dialog to user"
-    dialog --title "Update Available" \
-           --yes-label "Update" \
-           --no-label "Continue" \
-           --yesno "$update_message" 16 80
+    log_debug "Showing update dialog to user (height: $dialog_height)"
+    
+    # Use --scrolltext for dialogs with many commits
+    if [ "$commit_count" -gt 10 ]; then
+        # For many commits, use scrollable text
+        echo -e "$update_message" | dialog --title "Update Available" \
+               --yes-label "Update" \
+               --no-label "Continue" \
+               --scrolltext \
+               --yesno "$(cat)" $dialog_height 80
+    else
+        # For fewer commits, use regular dialog
+        dialog --title "Update Available" \
+               --yes-label "Update" \
+               --no-label "Continue" \
+               --yesno "$update_message" $dialog_height 80
+    fi
     
     case $? in
         0)  # Yes - update
@@ -11896,5 +12105,48 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
         echo "$VERSION"
         exit 0
     fi
+    
+    # Handle test-update argument for testing update functionality
+    if [ "$1" = "--test-update" ]; then
+        TEST_UPDATE_MODE=true
+        # Initialize logging for test
+        init_logging
+        log_info "Running in TEST UPDATE MODE"
+        
+        # Test with a fake old version to see multiple commits
+        echo "Testing update check with simulated old version..."
+        
+        # Temporarily set old version for testing
+        OLD_VERSION="$VERSION"
+        OLD_DATE="$RELEASE_DATE"
+        VERSION="0.1"   # Simulate much older version  
+        RELEASE_DATE="2025-08-04"  # Same as your original test
+        
+        echo "Simulated current version: $VERSION ($RELEASE_DATE)"
+        echo "Actual version: $OLD_VERSION ($OLD_DATE)"
+        echo ""
+        echo "Fetching commits since simulated version..."
+        
+        # Test the function
+        commits=$(get_commits_since_version "$VERSION" "$RELEASE_DATE" 2>&1)
+        
+        if [ -n "$commits" ]; then
+            echo "Successfully retrieved commit history:"
+            echo "=================================="
+            echo -e "$commits"
+            echo "=================================="
+        else
+            echo "No commits retrieved (this might be an error)"
+        fi
+        
+        # Restore actual version
+        VERSION="$OLD_VERSION"
+        RELEASE_DATE="$OLD_DATE"
+        
+        echo ""
+        echo "Test completed. Check /var/log/pve-tools/pve-tools.log for debug output."
+        exit 0
+    fi
+    
     main "$@"
 fi

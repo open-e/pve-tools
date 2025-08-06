@@ -24,11 +24,11 @@ export NCURSES_NO_UTF8_ACS=1
 
 # GLOBAL VARIABLES
 # Debug mode flag
-DEBUG_MODE=false
+DEBUG_MODE="false"
 
 # Version information
-VERSION="0.40"
-RELEASE_DATE="2025-08-05"
+VERSION="0.41"
+RELEASE_DATE="2025-08-06"
 
 # Script mode flag
 VERSION_MODE=false
@@ -470,7 +470,7 @@ get_cached_pools() {
     
     local response="${API_POOLS_CACHE[$nfs_ip]}"
     if [[ -z "$response" ]]; then
-        log_error "get_cached_pools: No cached data for IP $nfs_ip"
+        log_debug "get_cached_pools: No cached data for IP $nfs_ip (cache miss)"
         return 1
     fi
     
@@ -501,7 +501,7 @@ get_cached_nas_volumes() {
     
     local response="${API_NAS_VOLUMES_CACHE[${nfs_ip}:${pool_name}]}"
     if [[ -z "$response" ]]; then
-        log_error "get_cached_nas_volumes: No cached nas-volumes for IP $nfs_ip, Pool: $pool_name"
+        log_debug "get_cached_nas_volumes: No cached nas-volumes for IP $nfs_ip, Pool: $pool_name (cache miss)"
         return 1
     fi
     
@@ -539,7 +539,7 @@ get_dataset_pool_name_cached() {
     local pools
     pools=$(get_cached_pools "$nfs_ip")
     if [[ $? -ne 0 ]]; then
-        log_error "get_dataset_pool_name_cached: Failed to get cached pools list"
+        log_debug "get_dataset_pool_name_cached: No cached pools list available for IP $nfs_ip"
         return 1
     fi
 
@@ -580,7 +580,7 @@ except Exception as e:
     done <<< "$pools"
 
     # Dataset not found in any pool
-    log_error "get_dataset_pool_name_cached: Dataset '$dataset_name' not found on IP '$nfs_ip'"
+    log_info "get_dataset_pool_name_cached: Dataset '$dataset_name' not found on IP '$nfs_ip'"
     return 1
 }
 
@@ -7946,7 +7946,7 @@ create_clone_from_snapshot() {
     local json_input="{\"name\": \"${clone_name}\"}"
 
     local response
-    response=$(curl -k -s -w "\n%{http_code}" -X POST -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots/$snapshot_name/clones")
@@ -7956,6 +7956,17 @@ create_clone_from_snapshot() {
 
     if [[ $status -eq 200 ]]; then
         log_info "Clone '$clone_name' created"
+        return 0
+    elif [[ $status -eq 500 ]]; then
+        # Check if it's a "dataset already exists" error
+        if echo "$body" | grep -q "dataset already exists"; then
+            log_info "Clone '$clone_name' already exists"
+            return 2  # Special return code for "already exists"
+        else
+            log_error "Failed to create clone. Status: $status"
+            log_error "Response: $body"
+            return 1
+        fi
     else
         log_error "Failed to create clone. Status: $status"
         log_error "Response: $body"
@@ -8152,17 +8163,117 @@ set_readonly_conf_files() {
     return 0
 }
 
+# Check if a clone already exists by querying the API
+check_clone_exists() {
+    local pool_name="$1"
+    local clone_name="$2"
+    
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X GET \
+        -u "${rest_api_user}:${rest_api_password}" \
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$clone_name" 2>/dev/null)
+    
+    local status=$(echo "$response" | tail -n1)
+    
+    if [[ $status -eq 200 ]]; then
+        return 0  # Clone exists
+    else
+        return 1  # Clone doesn't exist
+    fi
+}
+
+# Generate a unique clone name by appending a suffix if needed
+generate_unique_clone_name() {
+    local pool_name="$1"
+    local base_clone_name="$2"
+    local clone_name="$base_clone_name"
+    local suffix=1
+    
+    # Check if the base name exists
+    if ! check_clone_exists "$pool_name" "$clone_name"; then
+        echo "$clone_name"
+        return 0
+    fi
+    
+    # Keep trying with incrementing suffix until we find an available name
+    while [[ $suffix -le 99 ]]; do
+        clone_name="${base_clone_name}_$(printf "%02d" $suffix)"
+        if ! check_clone_exists "$pool_name" "$clone_name"; then
+            echo "$clone_name"
+            return 0
+        fi
+        ((suffix++))
+    done
+    
+    # If we couldn't find an available name after 99 tries, return error
+    log_error "Could not generate unique clone name after 99 attempts"
+    return 1
+}
+
+# Handle the dialog when a clone already exists
+handle_existing_clone_dialog() {
+    local existing_clone="$1"
+    local proposed_clone="$2"
+    
+    local message="A clone with the name '$existing_clone' already exists.\n\n"
+    message+="Would you like to:\n"
+    message+="• Create another clone with name '$proposed_clone'\n"
+    message+="• Go back to select a different snapshot\n\n"
+    message+="Current clone: $existing_clone\n"
+    message+="Proposed name: $proposed_clone"
+    
+    dialog --title "Clone Already Exists" \
+           --yes-label "Continue" \
+           --no-label "Back" \
+           --yesno "$message" 14 70
+    
+    return $?  # 0 for Continue, 1 for Back
+}
+
 perform_clone_and_setup() {
     local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot")
+    local actual_clone_name="$clone_name"
 
     # Show progress
     dialog --title "Processing..." --infobox "Creating clone: $clone_name..." 6 50
     sleep 1
 
-    if ! create_clone_from_snapshot "$selected_pool" "$selected_dataset" "$selected_snapshot" "$clone_name"; then
+    # Try to create the clone
+    create_clone_from_snapshot "$selected_pool" "$selected_dataset" "$selected_snapshot" "$clone_name"
+    local create_result=$?
+    
+    if [[ $create_result -eq 2 ]]; then
+        # Clone already exists, ask user what to do
+        local new_clone_name
+        new_clone_name=$(generate_unique_clone_name "$selected_pool" "$clone_name")
+        
+        if [[ $? -ne 0 ]]; then
+            dialog --msgbox "Unable to generate a unique clone name. Too many clones exist." 8 60
+            return 1
+        fi
+        
+        if handle_existing_clone_dialog "$clone_name" "$new_clone_name"; then
+            # User chose to continue with new name
+            actual_clone_name="$new_clone_name"
+            dialog --title "Processing..." --infobox "Creating clone: $actual_clone_name..." 6 50
+            sleep 1
+            
+            if ! create_clone_from_snapshot "$selected_pool" "$selected_dataset" "$selected_snapshot" "$actual_clone_name"; then
+                dialog --msgbox "Failed to create clone with new name!" 8 40
+                return 1
+            fi
+        else
+            # User chose to go back
+            return 2  # Special return code to indicate going back to snapshot selection
+        fi
+    elif [[ $create_result -ne 0 ]]; then
+        # Other error occurred
         dialog --msgbox "Failed to create clone!" 8 40
         return 1
     fi
+    
+    # Update clone_name to actual_clone_name for rest of the function
+    clone_name="$actual_clone_name"
 
     dialog --title "Processing..." --infobox "Creating NFS share..." 6 50
     sleep 1
@@ -8283,7 +8394,17 @@ add_nfs_storage_wizard() {
                 case $? in
                     0)  # Apply
                         perform_clone_and_setup
-                        return
+                        local setup_result=$?
+                        if [[ $setup_result -eq 2 ]]; then
+                            # User chose to go back to snapshot selection
+                            nfs_current_step=4
+                        elif [[ $setup_result -eq 0 ]]; then
+                            # Success
+                            return
+                        else
+                            # Error occurred, stay on current step
+                            continue
+                        fi
                         ;;
                     1)  # Back to Main
                         return

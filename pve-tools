@@ -2613,6 +2613,10 @@ get_commits_since_version() {
     if command -v jq >/dev/null 2>&1; then
         log_debug "Using jq to parse commit history"
         
+        # First let's see the raw commit data for debugging
+        local raw_commits=$(echo "$commits_json" | jq -r '.[] | "\(.commit.author.date | split("T")[0])|\(.commit.message | split("\n")[0])"' 2>/dev/null | head -10)
+        log_debug "Raw commits (first 10): $raw_commits"
+        
         # Parse each commit and format it
         while IFS= read -r commit_line; do
             # Skip if this line is empty
@@ -2622,29 +2626,54 @@ get_commits_since_version() {
             local commit_date=$(echo "$commit_line" | cut -d'|' -f1)
             local commit_message=$(echo "$commit_line" | cut -d'|' -f2-)
             
-            # Compare dates to see if this commit is newer than our version
-            # For very old versions (0.x where x < 10), skip date filtering entirely
-            local current_ver_major=$(echo "$current_version" | cut -d. -f1)
-            local current_ver_minor=$(echo "$current_version" | cut -d. -f2 2>/dev/null || echo "0")
+            # First check if commit message contains version bump to our current version or older
+            if echo "$commit_message" | grep -q "VERSION=$current_version"; then
+                log_debug "Found exact version bump to $current_version in commit: $commit_message"
+                break
+            fi
             
-            if [ "$current_ver_major" = "0" ] && [ "$current_ver_minor" -lt "10" ]; then
-                log_debug "Very old version detected ($current_version), skipping date filtering for commit from $commit_date"
-            elif [ -n "$current_date" ]; then
-                # For normal versions, use date filtering
-                local commit_date_num=$(echo "$commit_date" | tr -d '-')
-                local current_date_num=$(echo "$current_date" | tr -d '-')
-                
-                # If commit is from on or before our version date, stop
-                if [ "$commit_date_num" -le "$current_date_num" ]; then
-                    log_debug "Reached commit from $commit_date (on or before $current_date), stopping"
+            # Also check for older versions that would be before our current version
+            if echo "$commit_message" | grep -q "version.*$current_version\|VERSION.*$current_version"; then
+                log_debug "Found version reference to $current_version in commit: $commit_message"
+                # Don't break here, check if it's actually setting this version
+                if echo "$commit_message" | grep -q "VERSION=$current_version\|version to $current_version"; then
+                    log_debug "Confirmed version bump to $current_version, stopping"
                     break
                 fi
             fi
             
-            # Check if commit message contains version bump to our current version
-            if echo "$commit_message" | grep -q "version.*$current_version"; then
-                log_debug "Found version bump to $current_version, stopping"
-                break
+            # Compare dates to see if this commit is newer than our version
+            # For very old versions (0.x where x < 10), be more lenient with date filtering
+            local current_ver_major=$(echo "$current_version" | cut -d. -f1)
+            local current_ver_minor=$(echo "$current_version" | cut -d. -f2 2>/dev/null || echo "0")
+            
+            if [ "$current_ver_major" = "0" ] && [ "$current_ver_minor" -lt "10" ]; then
+                log_debug "Very old version detected ($current_version), using extended date filtering for commit from $commit_date"
+                # For very old versions, only stop if commit is significantly older
+                if [ -n "$current_date" ]; then
+                    local commit_date_num=$(echo "$commit_date" | tr -d '-')
+                    local current_date_num=$(echo "$current_date" | tr -d '-')
+                    
+                    # Only stop if commit is from before our version date (not same day)
+                    if [ "$commit_date_num" -lt "$current_date_num" ]; then
+                        log_debug "Found older commit from $commit_date (before $current_date), stopping"
+                        break
+                    else
+                        log_debug "Commit from $commit_date is same day or newer than $current_date, including it"
+                    fi
+                fi
+            elif [ -n "$current_date" ]; then
+                # For normal versions, use stricter date filtering but still check same-day commits
+                local commit_date_num=$(echo "$commit_date" | tr -d '-')
+                local current_date_num=$(echo "$current_date" | tr -d '-')
+                
+                # If commit is from before our version date, stop
+                if [ "$commit_date_num" -lt "$current_date_num" ]; then
+                    log_debug "Reached commit from $commit_date (before $current_date), stopping"
+                    break
+                fi
+                
+                log_debug "Processing commit from $commit_date: '$commit_message'"
             fi
             
             # Add this commit to our list
@@ -2689,24 +2718,48 @@ get_commits_since_version() {
                 
                 # We have all parts, check if we should include this commit
                 if [ -n "$temp_date" ] && [ -n "$temp_message" ]; then
-                    # Compare dates (same logic as jq parsing)
-                    local current_ver_major=$(echo "$current_version" | cut -d. -f1)
-                    local current_ver_minor=$(echo "$current_version" | cut -d. -f2 2>/dev/null || echo "0")
+                    # First check if commit message contains version bump to our current version
+                    if echo "$temp_message" | grep -q "VERSION=$current_version"; then
+                        log_debug "Found exact version bump to $current_version in commit: $temp_message"
+                        break
+                    fi
                     
-                    if [ "$current_ver_major" = "0" ] && [ "$current_ver_minor" -lt "10" ]; then
-                        log_debug "Very old version detected ($current_version), skipping date filtering for commit from $temp_date"
-                    elif [ -n "$current_date" ]; then
-                        local commit_date_num=$(echo "$temp_date" | tr -d '-')
-                        local current_date_num=$(echo "$current_date" | tr -d '-')
-                        
-                        if [ "$commit_date_num" -le "$current_date_num" ]; then
+                    # Also check for other version references
+                    if echo "$temp_message" | grep -q "version.*$current_version\|VERSION.*$current_version"; then
+                        log_debug "Found version reference to $current_version in commit: $temp_message"
+                        if echo "$temp_message" | grep -q "VERSION=$current_version\|version to $current_version"; then
+                            log_debug "Confirmed version bump to $current_version, stopping"
                             break
                         fi
                     fi
                     
-                    # Check for version bump
-                    if echo "$temp_message" | grep -qi "version.*$current_version"; then
-                        break
+                    # Compare dates (updated logic matching jq parsing)
+                    local current_ver_major=$(echo "$current_version" | cut -d. -f1)
+                    local current_ver_minor=$(echo "$current_version" | cut -d. -f2 2>/dev/null || echo "0")
+                    
+                    if [ "$current_ver_major" = "0" ] && [ "$current_ver_minor" -lt "10" ]; then
+                        log_debug "Very old version detected ($current_version), using extended date filtering for commit from $temp_date"
+                        if [ -n "$current_date" ]; then
+                            local commit_date_num=$(echo "$temp_date" | tr -d '-')
+                            local current_date_num=$(echo "$current_date" | tr -d '-')
+                            
+                            if [ "$commit_date_num" -lt "$current_date_num" ]; then
+                                log_debug "Found older commit from $temp_date (before $current_date), stopping"
+                                break
+                            else
+                                log_debug "Commit from $temp_date is same day or newer than $current_date, including it"
+                            fi
+                        fi
+                    elif [ -n "$current_date" ]; then
+                        local commit_date_num=$(echo "$temp_date" | tr -d '-')
+                        local current_date_num=$(echo "$current_date" | tr -d '-')
+                        
+                        if [ "$commit_date_num" -lt "$current_date_num" ]; then
+                            log_debug "Reached commit from $temp_date (before $current_date), stopping"
+                            break
+                        fi
+                        
+                        log_debug "Processing commit from $temp_date: '$temp_message'"
                     fi
                     
                     # Add commit
@@ -2736,7 +2789,8 @@ get_commits_since_version() {
         return 1
     fi
     
-    log_debug "Found $commit_count commits since version $current_version"
+    log_debug "Successfully parsed $commit_count commits since version $current_version"
+    log_debug "First commit in list: $(echo -e "$formatted_commits" | head -1)"
     echo "$formatted_commits"
     return 0
 }
@@ -2913,13 +2967,13 @@ prompt_for_update() {
                --yes-label "Update" \
                --no-label "Continue" \
                --scrolltext \
-               --yesno "$(cat)" $dialog_height 80
+               --yesno "$(cat)" $dialog_height 100
     else
         # For fewer commits, use regular dialog
         dialog --title "Update Available" \
                --yes-label "Update" \
                --no-label "Continue" \
-               --yesno "$update_message" $dialog_height 80
+               --yesno "$update_message" $dialog_height 100
     fi
     
     case $? in

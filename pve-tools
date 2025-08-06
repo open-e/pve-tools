@@ -28,7 +28,7 @@ DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
 VERSION="0.50"
-RELEASE_DATE="2025-08-06"
+RELEASE_DATE="2025-08-07"
 
 # Script mode flag
 VERSION_MODE=false
@@ -1663,13 +1663,18 @@ dialog_menu() {
 resolve_vmct_conflict() {
     local vmid="$1"
     local type="$2"
+    local config_path="$3"
     
-    if [ -z "$vmid" ] || [ -z "$type" ]; then
+    if [ -z "$vmid" ] || [ -z "$type" ] || [ -z "$config_path" ]; then
         log_error "resolve_vmct_conflict: Missing required parameters"
         return 1
     fi
     
-    log_info "Resolving VM/CT conflict for ID $vmid ($type)"
+    # Extract storage name from config path
+    local storage_name
+    storage_name="$(echo "$config_path" | awk -F'/' '{print $(NF-3)}')"
+    
+    log_info "Resolving VM/CT conflict for ID $vmid ($type) with storage $storage_name"
     
     local vm_type_upper=$(upper "$type")
     local conflict_msg="$vm_type_upper ID $vmid already exists in PVE repository!\n\n"
@@ -1687,7 +1692,7 @@ resolve_vmct_conflict() {
     if [ $choice -eq 0 ]; then
         # User chose "New ID", prompt for input
         log_info "User chose New ID - prompting for input"
-        if get_new_vmct_id "$vmid" "$type"; then
+        if get_new_vmct_id "$vmid" "$type" "$storage_name"; then
             log_info "User provided new ID: $new_vmct_id"
             return 0
         else
@@ -1703,9 +1708,10 @@ resolve_vmct_conflict() {
 get_new_vmct_id() {
     local original_id="$1"
     local type="$2"
+    local storage_name="$3"
     local input_file=$(mktemp)
     
-    log_info "Prompting user for new $(upper "$type") ID for $type $original_id"
+    log_info "Prompting user for new $(upper "$type") ID for $type $original_id (storage: $storage_name)"
     
     while true; do
         dialog --keep-tite --title "Enter New $(upper "$type") ID" \
@@ -1734,12 +1740,316 @@ get_new_vmct_id() {
             continue
         fi
         
-        # Valid new ID provided
+        # Check if the cloned storage is already in use by another VM/CT
+        CONFLICTING_VMCT_ID=""  # Reset global variable
+        if check_cloned_storage_in_use "$storage_name" "$original_id"; then
+            local conflicting_type=$(vm_type "$CONFLICTING_VMCT_ID")
+            local conflicting_type_upper=$(upper "$conflicting_type")
+            local error_msg="Storage '$storage_name' is already in use by $conflicting_type_upper $CONFLICTING_VMCT_ID.\n\n"
+            error_msg+="Each cloned storage can only be used by one $conflicting_type_upper at a time.\n"
+            error_msg+="Please move disk of $conflicting_type_upper $CONFLICTING_VMCT_ID to not cloned storage or use a different cloned storage."
+            dialog --msgbox "$error_msg" 12 70
+            rm -f "$input_file"
+            return 1  # Return failure since storage is not available
+        fi
+        
+        # Check if the cloned storage has been modified after snapshot creation (staleness check)
+        STALE_STORAGE_NAME=""  # Reset global variables
+        STALE_SNAPSHOT_DATE=""
+        STALE_DISK_DATE=""
+        if check_cloned_storage_staleness "$storage_name" "$original_id"; then
+            local warning_msg="WARNING: Cloned storage has been modified!\n\n"
+            warning_msg+="The cloned storage '$STALE_STORAGE_NAME' was created from a snapshot taken on $STALE_SNAPSHOT_DATE, "
+            warning_msg+="but virtual disks in this storage have been modified on $STALE_DISK_DATE.\n\n"
+            warning_msg+="This means the cloned storage no longer contains the original snapshot state and may "
+            warning_msg+="have been used for previous VM restorations.\n\n"
+            warning_msg+="RECOMMENDATION:\n"
+            warning_msg+="Use \"Add cloned NFS storage from $PRODUCT snapshot\" function to create a fresh "
+            warning_msg+="cloned storage from the original snapshot, then retry the restore operation.\n\n"
+            warning_msg+="Do you want to continue anyway? (NOT RECOMMENDED)"
+            
+            dialog --keep-tite --title "Storage Staleness Warning" \
+                   --yes-label "Continue (NOT RECOMMENDED)" --no-label "Cancel" \
+                   --yesno "$warning_msg" 20 80
+            
+            if [ $? -ne 0 ]; then
+                # User chose to cancel
+                rm -f "$input_file"
+                return 1
+            fi
+            
+            log_info "User chose to continue with stale cloned storage '$storage_name' despite warning"
+        fi
+        
+        # Valid new ID provided and storage is available
         new_vmct_id="$user_input"
         rm -f "$input_file"
         log_info "User provided new $(upper "$type") ID: $new_vmct_id for original ID: $original_id"
         return 0
     done
+}
+
+# Check if a cloned storage is already in use by any VM/CT
+check_cloned_storage_in_use() {
+    local storage_name="$1"
+    local original_vmid="$2"
+    
+    if [ -z "$storage_name" ]; then
+        log_error "check_cloned_storage_in_use: Missing storage_name parameter"
+        return 1
+    fi
+    
+    log_debug "Checking if cloned storage '$storage_name' is already in use (excluding VMID: $original_vmid)"
+    
+    # Check VM configs directly for the storage name
+    for conf_file in /etc/pve/nodes/*/qemu-server/*.conf; do
+        [[ -f "$conf_file" ]] || continue
+        
+        local vmid=$(basename "$conf_file" .conf)
+        
+        # Skip the original VM ID (it's being restored/replaced)
+        if [[ "$vmid" == "$original_vmid" ]]; then
+            log_debug "Skipping original VM ID $vmid"
+            continue
+        fi
+        
+        # Check if this VM config contains the storage name
+        if grep -q ": $storage_name:" "$conf_file" 2>/dev/null; then
+            log_info "Found VM $vmid already using storage '$storage_name'"
+            # Store the conflicting VM ID for error message
+            CONFLICTING_VMCT_ID="$vmid"
+            return 0  # Storage is in use
+        fi
+    done
+    
+    # Check CT configs directly for the storage name
+    for conf_file in /etc/pve/nodes/*/lxc/*.conf; do
+        [[ -f "$conf_file" ]] || continue
+        
+        local ctid=$(basename "$conf_file" .conf)
+        
+        # Skip the original CT ID (it's being restored/replaced)
+        if [[ "$ctid" == "$original_vmid" ]]; then
+            log_debug "Skipping original CT ID $ctid"
+            continue
+        fi
+        
+        # Check if this CT config contains the storage name
+        if grep -q ": $storage_name:" "$conf_file" 2>/dev/null; then
+            log_info "Found CT $ctid already using storage '$storage_name'"
+            # Store the conflicting VM ID for error message
+            CONFLICTING_VMCT_ID="$ctid"
+            return 0  # Storage is in use
+        fi
+    done
+    
+    log_debug "Storage '$storage_name' is not in use by any other VM/CT"
+    return 1  # Storage not in use
+}
+
+# Extract snapshot creation timestamp from cloned storage name
+# Input: storage name like "datastore00_clone_2025-08-06-1822"
+# Output: Unix timestamp of snapshot creation
+extract_snapshot_timestamp_from_clone_name() {
+    local storage_name="$1"
+    
+    if [ -z "$storage_name" ]; then
+        log_error "extract_snapshot_timestamp_from_clone_name: Missing storage_name parameter"
+        return 1
+    fi
+    
+    log_debug "Extracting snapshot timestamp from cloned storage name: '$storage_name'"
+    
+    # Check if this is a cloned storage (contains "_clone_")
+    if [[ ! "$storage_name" =~ _clone_ ]]; then
+        log_error "extract_snapshot_timestamp_from_clone_name: Not a cloned storage name: '$storage_name'"
+        return 1
+    fi
+    
+    # Extract the timestamp part after "_clone_"
+    # Format: datastore00_clone_2025-08-06-1822 -> 2025-08-06-1822
+    local timestamp_part="${storage_name##*_clone_}"
+    
+    if [ -z "$timestamp_part" ]; then
+        log_error "extract_snapshot_timestamp_from_clone_name: Could not extract timestamp from '$storage_name'"
+        return 1
+    fi
+    
+    log_debug "Extracted timestamp part: '$timestamp_part'"
+    
+    # Parse the formatted timestamp: 2025-08-06-1822 -> 2025-08-06 18:22
+    if [[ "$timestamp_part" =~ ^([0-9]{4})-([0-9]{2})-([0-9]{2})-([0-9]{4})$ ]]; then
+        local year="${BASH_REMATCH[1]}"
+        local month="${BASH_REMATCH[2]}"
+        local day="${BASH_REMATCH[3]}"
+        local time="${BASH_REMATCH[4]}"
+        
+        # Split time: 1822 -> 18:22
+        local hour="${time:0:2}"
+        local minute="${time:2:2}"
+        
+        local formatted_date="${year}-${month}-${day} ${hour}:${minute}"
+        log_debug "Parsed date: '$formatted_date'"
+        
+        # Convert to Unix timestamp
+        local unix_timestamp
+        unix_timestamp=$(date -d "$formatted_date" +%s 2>/dev/null)
+        
+        if [ $? -eq 0 ] && [ -n "$unix_timestamp" ]; then
+            log_debug "Converted to Unix timestamp: $unix_timestamp"
+            echo "$unix_timestamp"
+            return 0
+        else
+            log_error "extract_snapshot_timestamp_from_clone_name: Failed to convert '$formatted_date' to Unix timestamp"
+            return 1
+        fi
+    else
+        log_error "extract_snapshot_timestamp_from_clone_name: Invalid timestamp format in '$timestamp_part'"
+        return 1
+    fi
+}
+
+# Get most recent virtual disk modification time from cloned storage
+# Input: storage path like "/mnt/pve/datastore00_clone_2025-08-06-1822/images/104/"
+# Output: Unix timestamp of most recent virtual disk modification
+get_most_recent_disk_modification_time() {
+    local storage_path="$1"
+    
+    if [ -z "$storage_path" ]; then
+        log_error "get_most_recent_disk_modification_time: Missing storage_path parameter"
+        return 1
+    fi
+    
+    log_debug "Getting most recent disk modification time from: '$storage_path'"
+    
+    # Check if storage path exists
+    if [ ! -d "$storage_path" ]; then
+        log_error "get_most_recent_disk_modification_time: Storage path does not exist: '$storage_path'"
+        return 1
+    fi
+    
+    # Get list of files with timestamps, excluding .conf files
+    # Format: YYYY-MM-DDTHH:MM:SS filename
+    local file_list
+    file_list=$(ls -la --time-style=+%Y-%m-%dT%H:%M:%S "$storage_path" 2>/dev/null | grep -v '\.conf$' | awk 'NR>1 && !/^d/ && !/^total/ {print $6, $7}' | grep -E '\.(qcow2|raw|vmdk|vdi)$|vm-.*-state-.*\.raw$')
+    
+    if [ -z "$file_list" ]; then
+        log_debug "get_most_recent_disk_modification_time: No virtual disk files found in '$storage_path'"
+        # Return 0 timestamp if no disks found (should not prevent validation)
+        echo "0"
+        return 0
+    fi
+    
+    log_debug "Found virtual disk files:"
+    while read -r timestamp filename; do
+        log_debug "  $filename: $timestamp"
+    done <<< "$file_list"
+    
+    # Find the most recent timestamp
+    local most_recent_timestamp=""
+    local most_recent_unix=0
+    
+    while read -r timestamp filename; do
+        if [ -n "$timestamp" ]; then
+            # Convert ISO timestamp to Unix timestamp
+            local unix_time
+            unix_time=$(date -d "$timestamp" +%s 2>/dev/null)
+            
+            if [ $? -eq 0 ] && [ "$unix_time" -gt "$most_recent_unix" ]; then
+                most_recent_unix="$unix_time"
+                most_recent_timestamp="$timestamp"
+                log_debug "New most recent: $filename ($timestamp -> $unix_time)"
+            fi
+        fi
+    done <<< "$file_list"
+    
+    if [ "$most_recent_unix" -gt 0 ]; then
+        log_debug "Most recent disk modification time: $most_recent_timestamp ($most_recent_unix)"
+        echo "$most_recent_unix"
+        return 0
+    else
+        log_error "get_most_recent_disk_modification_time: Failed to parse any timestamps"
+        return 1
+    fi
+}
+
+# Check if cloned storage has been modified after snapshot creation (staleness check)
+# Input: storage_name, original_vmid (source VMID from cloned storage)
+# Output: 0 if stale (disks newer than snapshot), 1 if fresh or undetermined
+check_cloned_storage_staleness() {
+    local storage_name="$1"
+    local original_vmid="$2"
+    
+    if [ -z "$storage_name" ] || [ -z "$original_vmid" ]; then
+        log_error "check_cloned_storage_staleness: Missing parameters (storage_name: '$storage_name', original_vmid: '$original_vmid')"
+        return 1
+    fi
+    
+    log_debug "Checking staleness of cloned storage '$storage_name' for original VM/CT $original_vmid"
+    
+    # Check if this is a cloned storage
+    if [[ ! "$storage_name" =~ _clone_ ]]; then
+        log_debug "check_cloned_storage_staleness: '$storage_name' is not a cloned storage, skipping staleness check"
+        return 1  # Not stale (not a cloned storage)
+    fi
+    
+    # Get snapshot creation timestamp from storage name
+    local snapshot_timestamp
+    snapshot_timestamp=$(extract_snapshot_timestamp_from_clone_name "$storage_name")
+    
+    if [ $? -ne 0 ] || [ -z "$snapshot_timestamp" ]; then
+        log_error "check_cloned_storage_staleness: Failed to extract snapshot timestamp from '$storage_name'"
+        return 1  # Allow continuation if we can't determine staleness
+    fi
+    
+    # Get storage mount path
+    local storage_path
+    storage_path=$(grep -A5 "^nfs:[[:space:]]*$storage_name" /etc/pve/storage.cfg | grep "^[[:space:]]*path" | awk '{print $2}')
+    
+    if [ -z "$storage_path" ]; then
+        log_error "check_cloned_storage_staleness: Could not find storage path for '$storage_name'"
+        return 1  # Allow continuation if we can't find the path
+    fi
+    
+    # Construct full path to VM/CT directory
+    local vm_storage_path="${storage_path}/images/${original_vmid}/"
+    log_debug "Checking virtual disk files in: '$vm_storage_path'"
+    
+    # Get most recent disk modification time
+    local disk_timestamp
+    disk_timestamp=$(get_most_recent_disk_modification_time "$vm_storage_path")
+    
+    if [ $? -ne 0 ]; then
+        log_error "check_cloned_storage_staleness: Failed to get disk modification time from '$vm_storage_path'"
+        return 1  # Allow continuation if we can't check disk times
+    fi
+    
+    # Skip check if no disks found
+    if [ "$disk_timestamp" -eq 0 ]; then
+        log_debug "check_cloned_storage_staleness: No virtual disks found, skipping staleness check"
+        return 1  # Not stale (no disks to check)
+    fi
+    
+    # Compare timestamps
+    log_debug "Snapshot timestamp: $snapshot_timestamp ($(date -d "@$snapshot_timestamp" 2>/dev/null || echo "invalid"))"
+    log_debug "Most recent disk timestamp: $disk_timestamp ($(date -d "@$disk_timestamp" 2>/dev/null || echo "invalid"))"
+    
+    if [ "$disk_timestamp" -gt "$snapshot_timestamp" ]; then
+        local snapshot_date=$(date -d "@$snapshot_timestamp" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+        local disk_date=$(date -d "@$disk_timestamp" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+        
+        log_info "STALENESS DETECTED: Storage '$storage_name' was created from snapshot on $snapshot_date, but disks were modified on $disk_date"
+        
+        # Store information for user warning (global variables)
+        STALE_STORAGE_NAME="$storage_name"
+        STALE_SNAPSHOT_DATE="$snapshot_date"
+        STALE_DISK_DATE="$disk_date"
+        
+        return 0  # Storage is stale
+    else
+        log_debug "check_cloned_storage_staleness: Storage '$storage_name' is fresh (disks not modified after snapshot)"
+        return 1  # Storage is fresh
+    fi
 }
 
 # Select host for conflicting VM/CT restoration
@@ -5166,28 +5476,42 @@ get_vmid_ctid_using_cloned_nfs_storage_list() {
     local vmct_list=()
     local vmct_info
     
+    log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Starting VM/CT scan for cloned storage usage"
+    
     # Get all VM/CT from cluster resources using optimized function
     local vm_list
     vm_list=$(get_all_vm_ct_info | awk -F'|' '{print $1"|"$2"|"$3}')
     
+    log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: VM list: $vm_list"
+    
     # Process each VM/CT to check if it uses cloned NFS storage
     while IFS='|' read -r vmid name vm_type; do
         if [[ -n "$vmid" ]]; then
+            log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Processing VM/CT $vmid ($vm_type)"
+            
             # Get storage name used by this VM/CT
             local storage_name
             storage_name=$(get_storage_name_of_id "$vmid" 2>/dev/null)
             
+            log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: VM/CT $vmid uses storage: '$storage_name'"
+            
             if [[ -n "$storage_name" ]]; then
                 # Check if this storage is NFS
                 if grep -q "^nfs:[[:space:]]*$storage_name" /etc/pve/storage.cfg 2>/dev/null; then
+                    log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Storage $storage_name is NFS"
+                    
                     # Get NFS server IP for this storage
                     local nfs_ip
                     nfs_ip=$(get_nfs_server_ip_of_given_storage "$storage_name")
+                    
+                    log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: NFS IP for $storage_name: '$nfs_ip'"
                     
                     if [[ -n "$nfs_ip" ]]; then
                         # Get dataset pool name for is_clone check (using cached data)
                         local pool_name
                         pool_name=$(get_dataset_pool_name_cached "$storage_name" "$nfs_ip" 2>/dev/null)
+                        
+                        log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Pool name for $storage_name: '$pool_name'"
                         
                         if [[ -n "$pool_name" ]]; then
                             local volume_name="$pool_name/$storage_name"
@@ -5195,14 +5519,26 @@ get_vmid_ctid_using_cloned_nfs_storage_list() {
                             # Check if this storage is a clone (using cached data)
                             if is_clone_cached "$volume_name" "$nfs_ip"; then
                                 vmct_list+=("$vmid|$vm_type|$name|$storage_name")
-                                log_debug "Found VM/CT $vmid ($vm_type) using cloned storage $storage_name"
+                                log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Found VM/CT $vmid ($vm_type) using cloned storage $storage_name"
+                            else
+                                log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Storage $storage_name is not a clone"
                             fi
+                        else
+                            log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Could not get pool name for $storage_name"
                         fi
+                    else
+                        log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Could not get NFS IP for $storage_name"
                     fi
+                else
+                    log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Storage $storage_name is not NFS"
                 fi
+            else
+                log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Could not get storage name for VM/CT $vmid"
             fi
         fi
     done <<< "$vm_list"
+    
+    log_debug "get_vmid_ctid_using_cloned_nfs_storage_list: Found ${#vmct_list[@]} VM/CTs using cloned storage"
     
     # Output the list
     printf '%s\n' "${vmct_list[@]}"
@@ -5702,7 +6038,7 @@ perform_restore() {
             conflict_selected_host=""
             
             # Show conflict resolution dialog
-            if resolve_vmct_conflict "$vmid" "$type"; then
+            if resolve_vmct_conflict "$vmid" "$type" "$conf"; then
                 # User provided new ID, now ask for host selection
                 if select_host_for_conflict "$new_vmct_id" "$type"; then
                     # User selected host, proceed with restore using new ID and host

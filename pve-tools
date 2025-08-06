@@ -23,8 +23,8 @@ export LC_ALL=en_US.UTF-8
 export NCURSES_NO_UTF8_ACS=1
 
 # GLOBAL VARIABLES
-# Debug mode flag
-DEBUG_MODE=true
+# Debug mode flag - automatically set to false during commits
+DEBUG_MODE=false
 
 # Version information
 VERSION="0.42"

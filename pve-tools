@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.52"
+VERSION="0.53"
 RELEASE_DATE="2025-08-08"
 
 # Script mode flag
@@ -38,6 +38,9 @@ TEST_UPDATE_MODE=false
 # Product information
 VENDOR="Open-E"
 PRODUCT="JovianDSS"
+
+# Auto-created dataset prefix
+DATASET_AUTO_PREFIX="datastore-pve"
 
 CONFIG_DIR="/etc/$(basename "$0" .sh)"
 CONFIG_FILE="$CONFIG_DIR/config.conf"
@@ -224,13 +227,36 @@ get_storage_ip() {
         return 1
     fi
     
+    log_debug "get_storage_ip: Looking for storage '$storage_name'"
+    log_debug "get_storage_ip: storage_ip_map has ${#storage_ip_map[@]} entries"
+    
+    # Debug: List all available storage names
+    if [[ ${#storage_ip_map[@]} -gt 0 ]]; then
+        log_debug "get_storage_ip: Available storage names in map:"
+        for key in "${!storage_ip_map[@]}"; do
+            log_debug "  - '$key'"
+        done
+    else
+        log_error "get_storage_ip: storage_ip_map is empty!"
+    fi
+    
     if [[ -n "${storage_ip_map[$storage_name]}" ]]; then
         local ip="${storage_ip_map[$storage_name]}"
         log_debug "get_storage_ip: Found IP '$ip' for storage '$storage_name'"
         echo "$ip"
+        selected_nfs_ip="$ip"
         return 0
     else
         log_error "get_storage_ip: No IP mapping found for storage '$storage_name'"
+        log_error "get_storage_ip: Exact match failed. Checking for similar names..."
+        
+        # Check for partial matches
+        for key in "${!storage_ip_map[@]}"; do
+            if [[ "$key" == *"$storage_name"* ]] || [[ "$storage_name" == *"$key"* ]]; then
+                log_error "get_storage_ip: Found similar storage name: '$key'"
+            fi
+        done
+        
         return 1
     fi
 }
@@ -395,7 +421,7 @@ cache_pools_for_ip() {
     local response
     local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
     
-    response=$(curl -k -s -X GET -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "$url" 2>/dev/null)
     
@@ -447,7 +473,7 @@ except:
             local response
             local url="https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes"
             
-            response=$(curl -k -s -X GET -u "${rest_api_user}:${rest_api_password}" \
+            response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "${rest_api_user}:${rest_api_password}" \
                 -H 'Content-Type: application/json' \
                 "$url" 2>/dev/null)
             
@@ -817,6 +843,13 @@ EOF
 # Convert string to lowercase
 lower() {
     echo "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+# Trim leading and trailing whitespace from a string
+trim_str() {
+    local str="$1"
+    # Remove leading and trailing whitespace (spaces, tabs, newlines)
+    echo "$str" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
 # URL encode a string for safe use in curl credentials
@@ -1651,12 +1684,16 @@ cleanup_selected_unused_disks() {
 
 # Execute dialog menu and capture result
 dialog_menu() {
+    log_debug "dialog_menu: About to execute dialog command: ${cmd[*]}"
     "${cmd[@]}" "${options[@]}" 2> "$dialog_selected"
     dialog_exit_code=$?
     selected_option=$(< "$dialog_selected")
+    log_debug "dialog_menu: Dialog completed, exit code: $dialog_exit_code, selected: $selected_option"
+    log_debug "dialog_menu: Showing 'Please wait...' info box"
     dialog --infobox "Please wait..." 5 20 &
     # Give up to 0.1 second to suck out up to 10 000 bytes from keyboard buffer:
     read -t 0.2 -n 10000 discard
+    log_debug "dialog_menu: Finished dialog_menu function"
 }
 
 # Show VM/CT conflict dialog and get user decision
@@ -2868,7 +2905,8 @@ get_commit_info() {
     if [ -n "$commit_message" ] && [ "$commit_message" != "null" ] && [ "$commit_message" != "empty" ]; then
         # Truncate very long commit messages and clean up formatting
         local formatted_message
-        formatted_message=$(echo "$commit_message" | head -c 200 | tr '\n' ' ' | sed 's/[[:space:]]*$//')
+        formatted_message=$(echo "$commit_message" | head -c 200 | tr '\n' ' ')
+        formatted_message=$(trim_str "$formatted_message")
         log_debug "Formatted commit message: '$formatted_message'"
         echo "$formatted_message"
     else
@@ -2990,6 +3028,8 @@ get_commits_since_version() {
             if [ -n "$formatted_commits" ]; then
                 formatted_commits+="\n\n"
             fi
+            # Trim leading and trailing spaces from commit message
+            commit_message=$(trim_str "$commit_message")
             formatted_commits+="$commit_date - $commit_message"
             ((commit_count++))
             
@@ -3076,6 +3116,8 @@ get_commits_since_version() {
                     if [ -n "$formatted_commits" ]; then
                         formatted_commits+="\n\n"
                     fi
+                    # Trim leading and trailing spaces from commit message
+                    temp_message=$(trim_str "$temp_message")
                     formatted_commits+="$temp_date - $temp_message"
                     ((commit_count++))
                     
@@ -3581,7 +3623,7 @@ get_oodp_details() {
     log_debug "get_oodp_details: Making request to: $url"
     
     local response
-    response=$(curl -k -s -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "$url" 2>/dev/null)
     local curl_exit=$?
@@ -3929,7 +3971,7 @@ perform_oodp_checkup() {
     if [[ -n "$test_ip" ]]; then
         # Test authentication with a simple API call
         local auth_test_response
-        auth_test_response=$(curl -k -s -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+        auth_test_response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
             -H 'Content-Type: application/json' \
             "https://$test_ip:$rest_api_port/api/v4/conn_test" 2>/dev/null)
         local auth_curl_exit=$?
@@ -4763,21 +4805,22 @@ main_menu() {
 
     cmd=(dialog --keep-tite --title "$menu_title"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
-         --menu "Choose an option:" 21 85 13)
+         --menu "Choose an option:" 22 85 13)
     options=("0" "Add new NFS storage from $PRODUCT pool"
              "1" "Add cloned NFS storage from $PRODUCT datastore-snapshot"
              "2" "Restore VM/CT from cloned NFS storage"
-             "3" "Move storage for VM/CT using cloned NFS storage"
+             "3" "Move disk for VM/CT from cloned NFS storage to regular NFS storage"
              "4" "Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT"
-             "5" "Clean up inactive NFS storage"
-             "6" "Clean up unused disks in VM/CT configurations"
-             "7" "Bulk VM/CT operations – start, stop, reboot, and more"
-             "8" "NFS tuning – set nconnect, sync options"
-             "9" "Add VM/CT to Proxmox VE HA resources"
-             "10" "Set up auto-start at boot for $PRODUCT VMs"
-             "11" "Apply known issue fixes and tuning"
-             "12" "System check-up"
-             "13" "Help & About pve-tools")
+             "5" "Delete unused NFS storage in PVE and the dataset in $PRODUCT"
+             "6" "Clean up inactive NFS storage"
+             "7" "Clean up unused disks in VM/CT configurations"
+             "8" "Bulk VM/CT operations – start, stop, reboot, and more"
+             "9" "NFS tuning – set nconnect, sync options"
+             "10" "Add VM/CT to Proxmox VE HA resources"
+             "11" "Set up auto-start at boot for $PRODUCT VMs"
+             "12" "Apply known issue fixes and tuning"
+             "13" "System check-up"
+             "14" "Help & About pve-tools")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -4800,31 +4843,34 @@ main_menu() {
                 4)  # Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT
                     delete_cloned_nfs_storage_wizard
                     ;;
-                5)  # Clean up inactive NFS storage
+                5)  # Delete unused NFS storage in PVE and the dataset in $PRODUCT
+                    delete_unused_nfs_storage_wizard
+                    ;;
+                6)  # Clean up inactive NFS storage
                     cleanup_inactive_nfs_storage
                     ;;
-                6)  # Clean up unused disks in VM/CT configurations
+                7)  # Clean up unused disks in VM/CT configurations
                     cleanup_unused_disks_wizard
                     ;;
-                7)  # Bulk VM/CT operations – start, stop, reboot, and more
+                8)  # Bulk VM/CT operations – start, stop, reboot, and more
                     vm_ct_manager_bulk_actions
                     ;;
-                8)  # NFS tuning – set nconnect, sync options
+                9)  # NFS tuning – set nconnect, sync options
                     nfs_tuning_wizard
                     ;;
-                9)  # Add VM/CT to Proxmox VE HA resources
+                10)  # Add VM/CT to Proxmox VE HA resources
                     add_vmct_to_ha_resources
                     ;;
-                10)  # Set up auto-start at boot for $PRODUCT VMs
+                11)  # Set up auto-start at boot for $PRODUCT VMs
                     setup_storage_vm_startup_wizard
                     ;;
-                11)  # Apply known issue fixes and tuning
+                12)  # Apply known issue fixes and tuning
                     post_known_issues_fixes
                     ;;
-                12)  # System check-up
+                13)  # System check-up
                     checkup_summary
                     ;;
-                13)  # Help & About pve-tools
+                14)  # Help & About pve-tools
                     help_about_dialog
                     ;;
             esac
@@ -4886,15 +4932,16 @@ help_about_dialog() {
     help_text+="2. Restore VM/CT from cloned NFS storage\n"
     help_text+="3. Move storage for VM/CT using cloned NFS storage\n"
     help_text+="4. Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT\n"
-    help_text+="5. Clean up inactive NFS storage\n"
-    help_text+="6. Clean up unused disks in VM/CT configurations\n"
-    help_text+="7. Bulk VM/CT operations – start, stop, reboot, and more\n"
-    help_text+="8. NFS tuning – set nconnect, sync options\n"
-    help_text+="9. Add VM/CT to Proxmox VE HA resources\n"
-    help_text+="10. Set up auto-start at boot for $PRODUCT VMs\n"
-    help_text+="11. Apply known issue fixes and tuning\n"
-    help_text+="12. System check-up\n"
-    help_text+="13. Help & About pve-tools\n"
+    help_text+="5. Delete unused NFS storage in PVE and the dataset in $PRODUCT\n"
+    help_text+="6. Clean up inactive NFS storage\n"
+    help_text+="7. Clean up unused disks in VM/CT configurations\n"
+    help_text+="8. Bulk VM/CT operations – start, stop, reboot, and more\n"
+    help_text+="9. NFS tuning – set nconnect, sync options\n"
+    help_text+="10. Add VM/CT to Proxmox VE HA resources\n"
+    help_text+="11. Set up auto-start at boot for $PRODUCT VMs\n"
+    help_text+="12. Apply known issue fixes and tuning\n"
+    help_text+="13. System check-up\n"
+    help_text+="14. Help & About pve-tools\n"
     help_text+="\n"
     help_text+="REQUIREMENTS:\n"
     help_text+="-------------\n"
@@ -7676,7 +7723,7 @@ rest_api_connection_test() {
     local url="https://$selected_nfs_ip:$rest_api_port/api/v4/conn_test"
     log_debug "rest_api_connection_test: Full URL: $url"
     
-    response=$(curl -k -s -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
         "$url" 2>&1)
     local curl_exit=$?
     
@@ -7722,7 +7769,7 @@ get_jovian_product_info() {
     local url="https://$ip:$rest_api_port/api/v4/product"
     log_debug "get_jovian_product_info: Full URL: $url"
     
-    response=$(curl -k -s -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 5 --max-time 10 -u "$rest_api_user:$rest_api_password" \
         "$url" 2>&1)
     local curl_exit=$?
     
@@ -7860,6 +7907,75 @@ validate_ip() {
     return 0
 }
 
+# Enhanced IP validation with REST API connectivity testing
+# Returns: 0=valid, 1=invalid format, 2=unreachable, 3=auth failure, 4=other error
+validate_ip_with_connectivity() {
+    local ip="$1"
+    local error_msg_var="$2"  # Variable name to store error message
+    
+    log_debug "validate_ip_with_connectivity: Testing IP: $ip"
+    
+    # Step 1: Basic IP format validation
+    if ! validate_ip "$ip"; then
+        local msg="Invalid IP address format. Please enter a valid IP address (e.g., 192.168.1.100)."
+        if [[ -n "$error_msg_var" ]]; then
+            printf -v "$error_msg_var" "%s" "$msg"
+        fi
+        log_debug "validate_ip_with_connectivity: Invalid IP format: $ip"
+        return 1
+    fi
+    
+    # Step 2: REST API connectivity test
+    log_debug "validate_ip_with_connectivity: Testing connectivity to $ip"
+    
+    # Test connection using get_jovian_product_info with timeout
+    if get_jovian_product_info "$ip" >/dev/null 2>&1; then
+        log_debug "validate_ip_with_connectivity: Successfully connected to $ip"
+        if [[ -n "$error_msg_var" ]]; then
+            printf -v "$error_msg_var" ""
+        fi
+        return 0
+    else
+        local exit_code=$?
+        log_debug "validate_ip_with_connectivity: Connection failed to $ip, exit code: $exit_code"
+        
+        # Test if it's a basic network connectivity issue vs authentication
+        local test_response
+        test_response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 5 --max-time 10 \
+            "https://$ip:$rest_api_port/api/v4/product" 2>&1)
+        local curl_exit=$?
+        
+        if [[ $curl_exit -ne 0 ]]; then
+            # Network/timeout error
+            local msg="Cannot connect to $PRODUCT at $ip. Please verify the IP address and ensure the server is reachable."
+            if [[ -n "$error_msg_var" ]]; then
+                printf -v "$error_msg_var" "%s" "$msg"
+            fi
+            log_debug "validate_ip_with_connectivity: Network error for $ip"
+            return 2
+        else
+            # Got HTTP response but authentication might have failed
+            local status=$(echo "$test_response" | tail -n1)
+            if [[ "$status" == "401" || "$status" == "403" ]]; then
+                local msg="Authentication failed for $PRODUCT at $ip. Please check the REST API credentials in configuration."
+                if [[ -n "$error_msg_var" ]]; then
+                    printf -v "$error_msg_var" "%s" "$msg"
+                fi
+                log_debug "validate_ip_with_connectivity: Authentication failed for $ip (HTTP $status)"
+                return 3
+            else
+                # Other HTTP error
+                local msg="Connection to $PRODUCT at $ip failed (HTTP $status). Please verify the server configuration."
+                if [[ -n "$error_msg_var" ]]; then
+                    printf -v "$error_msg_var" "%s" "$msg"
+                fi
+                log_debug "validate_ip_with_connectivity: HTTP error for $ip (status $status)"
+                return 4
+            fi
+        fi
+    fi
+}
+
 ip_already_exists() {
     local check_ip="$1"
     local existing_ips
@@ -7946,16 +8062,30 @@ manage_custom_ips() {
     fi
     
     for ((i=0; i<${#custom_ips_array[@]}; i++)); do
-        menu_items+=("$i" "${custom_ips_array[i]}")
+        local ip="${custom_ips_array[i]}"
+        local hostname
+        if [[ "$ip" == "Enter new IP" || "$ip" == "Manage custom IPs" ]]; then
+            hostname=""
+        else
+            hostname=$(get_hostname_for_ip "$ip")
+        fi
+        if [[ -n "$hostname" && "$hostname" != "Unknown" ]]; then
+            menu_items+=("$i" "$(printf "%-16s - %s" "$ip" "$hostname")")
+        else
+            menu_items+=("$i" "$(printf "%-16s" "$ip")")
+        fi
     done
     
     local selected_ip
-    selected_ip=$(dialog --keep-tite --title "Manage Custom IPs" \
+    local temp_output=$(mktemp)
+    dialog --keep-tite --title "Manage Custom IPs" \
         --ok-label "Delete" --cancel-label "Back" \
         --menu "Select IP to delete:" 15 50 8 \
-        "${menu_items[@]}" 3>&1 1>&2 2>&3)
+        "${menu_items[@]}" 2>"$temp_output"
     
     local dialog_result=$?
+    selected_ip=$(< "$temp_output")
+    rm -f "$temp_output"
     
     # Only proceed if user selected an IP (not cancelled)
     if [[ $dialog_result -eq 0 && -n "$selected_ip" ]]; then
@@ -7997,7 +8127,7 @@ get_pool_names() {
     local addr="$1"
     local response
 
-    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
         "https://$addr:$rest_api_port/api/v4/pools")
 
     local curl_exit=$?
@@ -8032,7 +8162,7 @@ get_datasets_in_pool() {
     local pool_name="$1"
     local response
 
-    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes")
 
     local curl_exit=$?
@@ -8068,7 +8198,7 @@ get_snapshots_in_dataset() {
     local dataset_name="$2"
     local response
 
-    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
 
     local curl_exit=$?
@@ -8114,7 +8244,7 @@ get_snapshots_with_times() {
     local dataset_name="$2"
     local response
 
-    response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
 
     local curl_exit=$?
@@ -8284,10 +8414,12 @@ get_pve_storage_for_dataset() {
 }
 
 nfs_step1_select_ip() {
+    log_debug "nfs_step1_select_ip: Function started"
     local line ips=() menu_items=()
     while IFS= read -r line; do
         ips+=("$line")
     done < <(get_current_storage_servers_ip)
+    log_debug "nfs_step1_select_ip: Got ${#ips[@]} IPs: ${ips[*]}"
 
     if [ "${#ips[@]}" -eq 0 ]; then
         dialog --msgbox "No IPs found." 8 40
@@ -8316,32 +8448,65 @@ nfs_step1_select_ip() {
         extra_button="--default-item $selected_nfs_ip_index"
     fi
 
+    log_debug "nfs_step1_select_ip: About to display dialog menu with ${#menu_items[@]} items"
     cmd=(dialog --keep-tite --title "Step 1/$nfs_total_steps: Select $PRODUCT NFS Storage IP (VIP)"
          --ok-label "Next" --cancel-label "Back to Main" $extra_button
          --menu "Choose $PRODUCT NFS Storage IP (VIP):" 15 80 8)
     options=("${menu_items[@]}")
     dialog_menu
+    log_debug "nfs_step1_select_ip: dialog_menu returned, exit code: $dialog_exit_code, selected: $selected_option"
     rm -f "$dialog_selected"
 
     case $dialog_exit_code in
         0)  # Next
             selected_nfs_ip_index="$selected_option"
             if [[ "${ips[selected_option]}" == "Enter new IP" ]]; then
+                log_debug "nfs_step1_select_ip: User selected 'Enter new IP', showing input dialog"
                 # Get custom IP input with validation loop
                 local input_ip
                 while true; do
-                    input_ip=$(dialog --keep-tite --title "Enter New IP" --inputbox "Enter the NFS Storage IP address:" 8 40 3>&1 1>&2 2>&3)
-                    if [[ $? -ne 0 ]]; then
+                    log_debug "nfs_step1_select_ip: Displaying IP input dialog"
+                    # Kill any background "Please wait..." dialogs that might be interfering
+                    pkill -f "Please wait" 2>/dev/null || true  # Don't fail if no processes found
+                    sleep 0.1  # Brief delay for cleanup
+                    log_debug "nfs_step1_select_ip: Killed background dialogs, showing input dialog"
+                    
+                    # Use temporary file for dialog output instead of complex redirection
+                    local temp_input=$(mktemp)
+                    dialog --keep-tite --title "Enter New IP" --inputbox "Enter the NFS Storage IP address:" 8 40 2>"$temp_input"
+                    local input_exit_code=$?
+                    input_ip=$(< "$temp_input")
+                    rm -f "$temp_input"
+                    log_debug "nfs_step1_select_ip: Input dialog returned, exit code: $input_exit_code, input: '$input_ip'"
+                    if [[ $input_exit_code -ne 0 ]]; then
+                        log_debug "nfs_step1_select_ip: User cancelled input dialog"
                         return 2  # User cancelled
                     fi
                     
                     if [[ -z "$input_ip" ]]; then
+                        log_debug "nfs_step1_select_ip: Empty IP address entered, showing error"
                         dialog --msgbox "IP address cannot be empty. Please try again." 8 50
                         continue
                     fi
                     
-                    if ! validate_ip "$input_ip"; then
-                        dialog --msgbox "Invalid IP address format or range. Please enter a valid IP address (e.g., 192.168.1.100)." 10 60
+                    # Enhanced validation with REST API connectivity testing
+                    local validation_error=""
+                    log_debug "nfs_step1_select_ip: Starting enhanced validation for $input_ip"
+                    
+                    # Show progress dialog while testing connectivity
+                    dialog --infobox "Testing connection to $PRODUCT at $input_ip...\nPlease wait (up to 10 seconds)" 5 60 &
+                    local progress_pid=$!
+                    
+                    validate_ip_with_connectivity "$input_ip" validation_error
+                    local validation_result=$?
+                    
+                    # Kill progress dialog
+                    kill $progress_pid 2>/dev/null || true
+                    wait $progress_pid 2>/dev/null || true
+                    
+                    if [[ $validation_result -ne 0 ]]; then
+                        log_debug "nfs_step1_select_ip: Validation failed for $input_ip, result: $validation_result, error: $validation_error"
+                        dialog --msgbox "$validation_error" 12 70
                         continue
                     fi
                     
@@ -8350,7 +8515,8 @@ nfs_step1_select_ip() {
                         continue
                     fi
                     
-                    # IP is valid and new, break the loop
+                    # IP is valid, reachable, and new - break the loop
+                    log_debug "nfs_step1_select_ip: IP $input_ip validated successfully"
                     break
                 done
                 
@@ -8595,7 +8761,7 @@ extract_timestamp_from_snapname() {
         echo "${day_part}-${hourmin}"
     else
         local response
-        response=$(curl -k -s -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
+        response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
             "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
         local curl_exit=$?
         if [[ $curl_exit -ne 0 ]]; then
@@ -8645,7 +8811,7 @@ make_clone_name() {
     local base_name="${pve_storage_name:-$dataset_name}"
     
     # Remove any leading/trailing whitespace
-    base_name=$(echo "$base_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    base_name=$(trim_str "$base_name")
     
     # If still empty, use dataset name as fallback
     if [[ -z "$base_name" ]]; then
@@ -8664,7 +8830,7 @@ create_clone_from_snapshot() {
     local json_input="{\"name\": \"${clone_name}\"}"
 
     local response
-    response=$(curl -k -s -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots/$snapshot_name/clones")
@@ -8712,7 +8878,7 @@ EOF
 )
 
     local response
-    response=$(curl -k -s -w "\n%{http_code}" -X POST -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X POST -u "$rest_api_user:$rest_api_password" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/shares")
@@ -9168,6 +9334,7 @@ add_new_nfs_storage_wizard() {
     
     # Update connected storage servers information
     update_connected_storage_servers
+    log_debug "add_new_nfs_storage_wizard: Finished update_connected_storage_servers"
     
     # Reset wizard variables
     selected_nfs_ip=""
@@ -9182,22 +9349,31 @@ add_new_nfs_storage_wizard() {
     nfs_new_current_step=1
     nfs_new_total_steps=5
     
+    log_debug "add_new_nfs_storage_wizard: Reset wizard variables"
+    
     while true; do
+        log_debug "add_new_nfs_storage_wizard: Entering while loop, current step: $nfs_new_current_step"
         case $nfs_new_current_step in
             1)
+                log_debug "add_new_nfs_storage_wizard: About to call nfs_step1_select_ip"
                 # Temporarily set the variable name that nfs_step1_select_ip expects
                 nfs_total_steps=$nfs_new_total_steps
                 nfs_step1_select_ip
                 # Restore the variable name
                 nfs_total_steps=
-                case $? in
+                local step1_result=$?
+                log_debug "add_new_nfs_storage_wizard: nfs_step1_select_ip returned: $step1_result"
+                case $step1_result in
                     0)  # Next
+                        log_debug "add_new_nfs_storage_wizard: Moving to step 2"
                         nfs_new_current_step=2
                         ;;
                     1)  # Back to Main
+                        log_debug "add_new_nfs_storage_wizard: User wants back to main, exiting wizard"
                         return
                         ;;
                     2)  # Retry same step
+                        log_debug "add_new_nfs_storage_wizard: Retrying step 1"
                         ;;
                 esac
                 ;;
@@ -9279,11 +9455,8 @@ add_new_nfs_storage_wizard() {
                         return
                         ;;
                     2)  # Back
-                        if [[ "$selected_dataset_option" == "create" ]]; then
-                            nfs_new_current_step=4
-                        else
-                            nfs_new_current_step=5
-                        fi
+                        # Go back to step 3 (dataset option selection)
+                        nfs_new_current_step=3
                         ;;
                 esac
                 ;;
@@ -9381,28 +9554,11 @@ nfs_new_step4a_create_dataset() {
         return 2  # Go back
     fi
     
-    new_dataset_name="dataset-pve-$next_number"
+    new_dataset_name="${DATASET_AUTO_PREFIX}-$next_number"
     selected_dataset="$new_dataset_name"
     
-    # Show confirmation
-    local confirm_text="Will create new dataset:\n\n"
-    confirm_text+="Dataset Name: $new_dataset_name\n"
-    confirm_text+="Pool: $selected_pool\n"
-    confirm_text+="Server: $selected_nfs_ip\n\n"
-    confirm_text+="Continue?"
-    
-    dialog --keep-tite --title "Confirm Dataset Creation" \
-           --yesno "$confirm_text" 12 50
-    
-    case $? in
-        0)  # Yes - continue
-            log_info "Will create dataset: $new_dataset_name"
-            return 0
-            ;;
-        1)  # No - go back
-            return 2
-            ;;
-    esac
+    log_info "Generated new dataset name: $new_dataset_name"
+    return 0
 }
 
 # Step 4B: Select Existing Dataset
@@ -9494,19 +9650,32 @@ nfs_new_step5_summary() {
     summary+="Pool: $selected_pool\n"
     
     if [[ "$selected_dataset_option" == "create" ]]; then
-        summary+="Dataset: $new_dataset_name (NEW)\n"
+        summary+="\n--- NEW DATASET WILL BE CREATED ---\n"
+        summary+="Dataset Name: $new_dataset_name\n"
     else
         summary+="Dataset: $selected_dataset (EXISTING)\n"
     fi
     
+    summary+="\n--- STORAGE CONFIGURATION ---\n"
     summary+="NFS Share: /$selected_dataset\n"
-    summary+="PVE Storage Name: $new_storage_name\n\n"
+    summary+="PVE Storage Name: $new_storage_name\n"
+    
+    summary+="\n--- OODP AUTO-SNAPSHOT CONFIGURATION ---\n"
+    summary+="Schedule: 1hr=>1min, 3days=>15min, 2weeks=>1hr\n"
+    summary+="Note: OODP backup destinations must be\n"
+    summary+="      configured in JovianDSS GUI\n\n"
     summary+="Do you want to proceed with this configuration?"
+    
+    # Adjust dialog height based on whether creating new dataset
+    local dialog_height=23
+    if [[ "$selected_dataset_option" == "create" ]]; then
+        dialog_height=25
+    fi
+    local dialog_width=65
     
     dialog --keep-tite --title "Step 5/$nfs_new_total_steps: Confirm Configuration" \
            --yes-label "Apply" --no-label "Back" \
-           --yesno "$summary" 14 65
-    
+           --yesno "$summary" $dialog_height $dialog_width    
     case $? in
         0)  # Apply
             return 0
@@ -9639,11 +9808,123 @@ perform_new_nfs_setup() {
     # Rebuild storage IP mapping
     build_storage_ip_map
     
+    # Step 6: Check for existing OODP task or create new one
+    dialog --title "Processing..." --infobox "Checking OODP auto-snapshot task..." 6 50
+    
+    # First check if OODP task already exists
+    if check_oodp_task_exists "$selected_pool" "$selected_dataset" "$selected_nfs_ip"; then
+        log_info "OODP task already exists for $selected_pool/$selected_dataset"
+        local oodp_status="OODP auto-snapshot: Already configured"
+    else
+        # Task doesn't exist, try to create it
+        dialog --title "Processing..." --infobox "Creating OODP auto-snapshot task..." 6 50
+        if create_oodp_task "$selected_pool" "$selected_dataset" "$new_storage_name" "$selected_nfs_ip"; then
+            log_info "OODP task created successfully for $selected_pool/$selected_dataset"
+            local oodp_status="OODP auto-snapshot: Configured"
+        else
+            log_warning "Failed to create OODP task - manual configuration required"
+            local oodp_status="OODP auto-snapshot: Manual setup required"
+        fi
+    fi
+    
     # Success message
-    dialog --msgbox "NFS storage setup completed successfully!\n\nStorage Name: $new_storage_name\nDataset: $selected_dataset\nServer: $selected_nfs_ip\nPath: /mnt/pve/$new_storage_name" 12 60
+    dialog --msgbox "NFS storage setup completed successfully!\n\nStorage Name: $new_storage_name\nDataset: $selected_dataset\nServer: $selected_nfs_ip\nPath: /mnt/pve/$new_storage_name\n\n$oodp_status" 14 60
     
     log_info "NFS storage setup completed: $new_storage_name"
     return 0
+}
+
+# Helper function: Create OODP task for automatic snapshots
+create_oodp_task() {
+    local pool_name="$1"
+    local dataset_name="$2"
+    local storage_name="$3"
+    local ip_address="$4"
+    
+    log_info "Creating OODP task for dataset: $pool_name/$dataset_name"
+    
+    # Prepare JSON payload for OODP task creation
+    local json_payload=$(cat <<EOF
+{
+    "name": "$pool_name/$dataset_name",
+    "plan": "1hour=>1minute,3days=>15minutes,2weeks=>1hour",
+    "description": "$storage_name",
+    "dedup": false,
+    "granular_resync": true,
+    "mbuffer": false
+}
+EOF
+    )
+    
+    log_debug "create_oodp_task: JSON payload: $json_payload"
+    
+    # Make REST API call to create OODP task
+    local url="https://$ip_address:$rest_api_port/api/v4/odp/tasks"
+    log_debug "create_oodp_task: Making POST request to: $url"
+    
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X POST \
+        -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        -d "$json_payload" \
+        "$url" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "create_oodp_task: Failed to connect to OODP API at $ip_address:$rest_api_port"
+        return 1
+    fi
+    
+    # Extract HTTP status code (last line)
+    local http_code=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | head -n -1)
+    
+    log_debug "create_oodp_task: HTTP status code: $http_code"
+    log_debug "create_oodp_task: Response body: $response_body"
+    
+    # Check if task was created successfully (2xx status codes)
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        log_info "Successfully created OODP task for $pool_name/$dataset_name"
+        return 0
+    else
+        log_error "Failed to create OODP task. HTTP status: $http_code, Response: $response_body"
+        return 1
+    fi
+}
+# Helper function: Check if OODP task already exists for dataset
+check_oodp_task_exists() {
+    local pool_name="$1"
+    local dataset_name="$2"
+    local ip_address="$3"
+    
+    log_info "Checking if OODP task exists for dataset: $pool_name/$dataset_name"
+    
+    # Use the existing get_oodp_details function to check for task
+    get_oodp_details "$ip_address" "$pool_name" "$dataset_name"
+    local get_result=$?
+    
+    case $get_result in
+        0)
+            log_info "OODP task found for $pool_name/$dataset_name"
+            return 0  # Task exists
+            ;;
+        1)
+            log_info "No OODP task found for $pool_name/$dataset_name"
+            return 1  # Task does not exist
+            ;;
+        10)
+            log_error "Authentication failure when checking OODP task"
+            return 10  # Auth failure
+            ;;
+        11)
+            log_error "Access forbidden when checking OODP task"
+            return 11  # Access forbidden
+            ;;
+        *)
+            log_error "Error checking OODP task (code: $get_result)"
+            return 1  # Treat as no task found
+            ;;
+    esac
 }
 
 # Helper function: Create a new dataset via REST API
@@ -9658,7 +9939,7 @@ create_dataset() {
     local json_input="{\"name\": \"${dataset_name}\"}"
     
     local response
-    response=$(curl -k -s -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes")
@@ -9701,7 +9982,7 @@ EOF
 )
     
     local response
-    response=$(curl -k -s -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/shares")
@@ -9732,7 +10013,7 @@ find_next_dataset_number() {
     
     # Get existing datasets and find highest number
     while IFS= read -r dataset; do
-        if [[ "$dataset" =~ ^dataset-pve-([0-9]+)$ ]]; then
+        if [[ "$dataset" =~ ^${DATASET_AUTO_PREFIX}-([0-9]+)$ ]]; then
             local num="${BASH_REMATCH[1]}"
             # Remove leading zeros for comparison
             num=$((10#$num))
@@ -9882,25 +10163,45 @@ auto_select_nfs_ip() {
     local options=("${menu_items[@]}")
     
     local selected_option dialog_exit_code
-    exec 3>&1
-    selected_option=$(dialog "${cmd[@]}" "${options[@]}" 2>&1 1>&3)
+    local temp_selection=$(mktemp)
+    dialog "${cmd[@]}" "${options[@]}" 2>"$temp_selection"
     dialog_exit_code=$?
-    exec 3>&-
-    rm -f "$dialog_selected"
+    selected_option=$(< "$temp_selection")
+    rm -f "$temp_selection"
     
     case $dialog_exit_code in
         0)  # User selected an option
             if [[ "${ips[selected_option]}" == "Enter new IP" ]]; then
                 # Get custom IP input
                 local input_ip
-                input_ip=$(dialog --keep-tite --title "Enter New IP" --inputbox "Enter the NFS Storage IP address:" 8 40 3>&1 1>&2 2>&3)
-                if [[ $? -eq 0 && -n "$input_ip" ]]; then
-                    if [[ "$input_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                local temp_input=$(mktemp)
+                dialog --keep-tite --title "Enter New IP" --inputbox "Enter the NFS Storage IP address:" 8 40 2>"$temp_input"
+                local input_exit_code=$?
+                input_ip=$(< "$temp_input")
+                rm -f "$temp_input"
+                if [[ $input_exit_code -eq 0 && -n "$input_ip" ]]; then
+                    # Enhanced validation with REST API connectivity testing
+                    local validation_error=""
+                    log_debug "auto_select_nfs_ip: Starting enhanced validation for $input_ip"
+                    
+                    # Show progress dialog while testing connectivity
+                    dialog --infobox "Testing connection to $PRODUCT at $input_ip...\nPlease wait (up to 10 seconds)" 5 60 &
+                    local progress_pid=$!
+                    
+                    validate_ip_with_connectivity "$input_ip" validation_error
+                    local validation_result=$?
+                    
+                    # Kill progress dialog
+                    kill $progress_pid 2>/dev/null || true
+                    wait $progress_pid 2>/dev/null || true
+                    
+                    if [[ $validation_result -eq 0 ]]; then
                         selected_nfs_ip="$input_ip"
-                        log_info "auto_select_nfs_ip: User provided IP: $selected_nfs_ip"
+                        log_info "auto_select_nfs_ip: User provided IP: $selected_nfs_ip (validated successfully)"
                         return 0
                     else
-                        log_error "auto_select_nfs_ip: Invalid IP address format: $input_ip"
+                        log_error "auto_select_nfs_ip: Validation failed for $input_ip, result: $validation_result, error: $validation_error"
+                        dialog --msgbox "$validation_error" 12 70
                         return 1
                     fi
                 else
@@ -9972,7 +10273,7 @@ get_pools() {
     local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
     log_debug "get_pools: Making request to: $url"
     
-    response=$(curl -k -s -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "$url" 2>/dev/null)
 
@@ -10108,14 +10409,17 @@ get_dataset_pool_name() {
             continue
         fi
 
+        log_debug "get_dataset_pool_name: Checking pool '$pool_name' for dataset '$dataset_name'"
+
         # Get nas-volumes for this pool
         local response
-        response=$(curl -k -s -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+        response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
             -H 'Content-Type: application/json' \
             "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
 
         local curl_exit=$?
         if [[ $curl_exit -ne 0 ]]; then
+            log_debug "get_dataset_pool_name: curl failed for pool '$pool_name', skipping"
             continue  # Skip this pool if we can't access it
         fi
         
@@ -10123,14 +10427,32 @@ get_dataset_pool_name() {
         local http_status=$(echo "$response" | tail -n1)
         local body=$(echo "$response" | sed '$d')
         
+        log_debug "get_dataset_pool_name: Pool '$pool_name' - HTTP status: $http_status"
+        
         # Check for authentication failure (but don't show dialog for each pool)
         if [[ "$http_status" == "401" ]]; then
             log_error "get_dataset_pool_name: REST API authentication failed (HTTP 401)"
             # For this function, we'll return error without showing dialog to avoid multiple popups
             return 1
         elif [[ "$http_status" != "200" ]]; then
+            log_debug "get_dataset_pool_name: Non-200 status for pool '$pool_name': $http_status"
             continue  # Skip this pool if request failed
         fi
+
+        # Debug: Show available datasets in this pool
+        local available_datasets
+        available_datasets=$(printf '%s' "$body" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    entries = data.get('data', {}).get('entries', [])
+    names = [d.get('name', 'UNKNOWN') for d in entries]
+    print(' '.join(names))
+except Exception as e:
+    print('ERROR_PARSING')
+    sys.exit(1)
+" 2>/dev/null)
+        log_debug "get_dataset_pool_name: Pool '$pool_name' contains datasets: $available_datasets"
 
         # Check if dataset exists in this pool
         local dataset_found
@@ -10149,14 +10471,17 @@ except Exception as e:
     sys.exit(1)
 ")
 
+        log_debug "get_dataset_pool_name: Dataset search result in pool '$pool_name': $dataset_found"
+
         if [[ "$dataset_found" == "FOUND" ]]; then
+            log_debug "get_dataset_pool_name: Found dataset '$dataset_name' in pool '$pool_name'"
             echo "$pool_name"
             return 0
         fi
     done <<< "$pools"
 
     # Dataset not found in any pool
-    # echo "Error: Dataset '$dataset_name' not found in any pool" >&2
+    log_error "get_dataset_pool_name: Dataset '$dataset_name' not found in any pool. Searched pools: $pools"
     return 1
 }
 
@@ -10188,7 +10513,7 @@ is_clone() {
 
     # Make REST API call to get nas-volumes for the pool
     local response
-    response=$(curl -k -s -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
 
@@ -10257,6 +10582,76 @@ except Exception as e:
 }
 
 # Function: delete_cloned_dataset
+# Function to delete a regular dataset (not necessarily a clone)
+delete_dataset() {
+    local volume_name="$1"
+    local nfs_ip="$2"
+
+    if [[ -z "$volume_name" ]]; then
+        log_error "delete_dataset: volume_name is required"
+        return 1
+    fi
+
+    if [[ -z "$nfs_ip" ]]; then
+        log_error "delete_dataset: nfs_ip is required"
+        return 1
+    fi
+
+    log_info "Deleting dataset: $volume_name on IP: $nfs_ip"
+
+    # Extract pool name and dataset name from volume_name (format: pool/dataset)
+    local pool_name="${volume_name%/*}"
+    local dataset_name="${volume_name##*/}"
+
+    log_info "Pool: '$pool_name', Dataset: '$dataset_name'"
+
+    # Make REST API call to delete the dataset
+    local url="https://${nfs_ip}:${rest_api_port}/api/v4/pools/${pool_name}/nas-volumes/${dataset_name}"
+
+    local response
+    response=$(curl -k -s -X DELETE \
+        -u "$rest_api_user:$rest_api_password" \
+        -H 'Content-Type: application/json' \
+        -d '{}' \
+        -w "\n%{http_code}\n%{redirect_url}" \
+        "$url" 2>/dev/null)
+
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "Failed to connect to server for deletion"
+        return 1
+    fi
+
+    # Parse response
+    local response_body=$(echo "$response" | sed -n '1p')
+    local http_status=$(echo "$response" | sed -n '2p')
+    local redirect_url=$(echo "$response" | sed -n '3p')
+
+    log_debug "delete_dataset: HTTP Status: $http_status"
+    log_debug "delete_dataset: Response: $response_body"
+
+    # Check for authentication failure
+    if check_rest_api_auth_failure "delete_dataset" "$http_status" "$response_body"; then
+        local auth_result=$?
+        if [[ $auth_result -eq 10 ]]; then
+            log_error "delete_dataset: REST API authentication failed (401)"
+            return 10
+        elif [[ $auth_result -eq 11 ]]; then
+            log_error "delete_dataset: REST API access forbidden (403)"
+            return 11
+        fi
+    fi
+
+    # Check if deletion was successful
+    if [[ "$http_status" == "200" ]] || [[ "$http_status" == "204" ]]; then
+        log_info "Dataset '$volume_name' deleted successfully"
+        return 0
+    else
+        log_error "Failed to delete dataset '$volume_name'. HTTP status: $http_status, Response: $response_body"
+        return 1
+    fi
+}
+
 delete_cloned_dataset() {
     local dataset_name="$1"
     local nfs_ip="$2"
@@ -10484,6 +10879,133 @@ delete_pve_NFS_storage() {
     fi
 
     log_info "Storage '$pve_storage_name' deleted"
+    return 0
+}
+
+# Function: delete_unused_pve_nfs_storage - Delete unused NFS storage (not necessarily cloned)
+delete_unused_pve_nfs_storage() {
+    local pve_storage_name="$1"
+
+    if [[ -z "$pve_storage_name" ]]; then
+        log_error "delete_unused_pve_nfs_storage: pve_storage_name is required"
+        return 1
+    fi
+
+    log_info "Processing unused PVE NFS storage: $pve_storage_name"
+
+    # Step 1: Check if given storage is a PVE NFS storage
+    local pve_nfs_storages
+    pve_nfs_storages=$(get_pve_NFS_storage)
+    if [[ $? -ne 0 ]]; then
+        log_error "delete_unused_pve_nfs_storage: Failed to get PVE NFS storages"
+        return 1
+    fi
+
+    local is_pve_nfs_storage=false
+    while IFS= read -r storage; do
+        if [[ "$storage" == "$pve_storage_name" ]]; then
+            is_pve_nfs_storage=true
+            break
+        fi
+    done <<< "$pve_nfs_storages"
+
+    if [[ "$is_pve_nfs_storage" == "false" ]]; then
+        log_error "'$pve_storage_name' is not a PVE NFS storage"
+        return 1
+    fi
+
+    log_info "Confirmed: '$pve_storage_name' is a PVE NFS storage"
+
+    # Step 2: Get the IP address for this storage
+    local storage_ip
+    storage_ip=$(get_storage_ip "$pve_storage_name")
+    if [[ $? -ne 0 ]]; then
+        log_error "delete_unused_pve_nfs_storage: No IP mapping found for storage '$pve_storage_name'"
+        return 1
+    fi
+
+    log_info "Storage '$pve_storage_name' mapped to IP '$storage_ip'"
+
+    # Step 3: Find which pool this storage belongs to
+    local pool_name
+    pool_name=$(get_dataset_pool_name "$pve_storage_name" "$storage_ip")
+    local pool_result=$?
+    if [[ $pool_result -ne 0 ]]; then
+        log_error "delete_unused_pve_nfs_storage: Storage '$pve_storage_name' not found in any pool on JovianDSS"
+        log_info "This might be a storage configuration that exists in PVE but the dataset was already deleted from JovianDSS"
+        log_info "Proceeding to remove only the PVE storage configuration"
+        
+        # Skip dataset deletion, only remove PVE storage configuration
+        log_info "Removing PVE storage configuration..."
+        if ! pvesm remove "$pve_storage_name"; then
+            log_error "Failed to remove PVE storage '$pve_storage_name'"
+            return 1
+        fi
+
+        log_info "Successfully removed PVE storage configuration '$pve_storage_name'"
+
+        # Run cleanup of inactive NFS storage
+        log_info "Running cleanup of inactive NFS storage..."
+        if ! cleanup_inactive_nfs_storage; then
+            log_error "cleanup_inactive_nfs_storage failed, but main deletion was successful"
+        else
+            log_info "NFS storage cleanup complete"
+        fi
+
+        log_info "Unused storage '$pve_storage_name' (PVE-only) deleted successfully"
+        return 0
+    fi
+
+    log_info "Storage '$pve_storage_name' found in pool '$pool_name'"
+
+    # Step 4: Check if this is a clone or regular dataset
+    local volume_name="$pool_name/$pve_storage_name"
+    local is_clone_dataset=false
+    
+    if is_clone "$volume_name" "$storage_ip"; then
+        is_clone_dataset=true
+        log_info "Storage '$pve_storage_name' is a clone dataset - will delete cloned dataset"
+    else
+        log_info "Storage '$pve_storage_name' is a regular dataset - will delete dataset"
+    fi
+
+    # Step 5: Delete the dataset (clone or regular) via REST API
+    log_info "Deleting dataset..."
+    
+    if [[ "$is_clone_dataset" == "true" ]]; then
+        # Delete as cloned dataset
+        if ! delete_cloned_dataset "$pve_storage_name" "$storage_ip"; then
+            log_error "Failed to delete cloned dataset '$pve_storage_name'"
+            return 1
+        fi
+        log_info "Successfully deleted cloned dataset '$pve_storage_name'"
+    else
+        # Delete as regular dataset  
+        if ! delete_dataset "$volume_name" "$storage_ip"; then
+            log_error "Failed to delete dataset '$pve_storage_name'"
+            return 1
+        fi
+        log_info "Successfully deleted dataset '$pve_storage_name'"
+    fi
+
+    # Step 6: Remove PVE storage configuration
+    log_info "Removing PVE storage configuration..."
+    if ! pvesm remove "$pve_storage_name"; then
+        log_error "Failed to remove PVE storage '$pve_storage_name'"
+        return 1
+    fi
+
+    log_info "Successfully removed PVE storage configuration '$pve_storage_name'"
+
+    # Step 7: Run cleanup of inactive NFS storage
+    log_info "Running cleanup of inactive NFS storage..."
+    if ! cleanup_inactive_nfs_storage; then
+        log_error "cleanup_inactive_nfs_storage failed, but main deletion was successful"
+    else
+        log_info "NFS storage cleanup complete"
+    fi
+
+    log_info "Unused storage '$pve_storage_name' deleted successfully"
     return 0
 }
 
@@ -10745,6 +11267,164 @@ show_vmct_usage_warning() {
     esac
 }
 
+# Get list of storages currently being used by VMs and CTs
+get_storages_used_by_vms_cts() {
+    local used_storages=""
+    
+    log_debug "get_storages_used_by_vms_cts: Scanning VM/CT configurations for storage usage"
+    
+    # Check VM configurations
+    for conf_file in /etc/pve/nodes/*/qemu-server/*.conf; do
+        if [[ -f "$conf_file" ]]; then
+            # Extract storage names from disk configurations
+            # Lines like: scsi0: storage-name:vm-100-disk-0.qcow2,size=32G
+            # or: virtio0: storage-name:100/vm-100-disk-0.raw,size=32G
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^(scsi|virtio|ide|sata|efidisk)[0-9]+:[[:space:]]*([^:]+): ]]; then
+                    local storage_name="${BASH_REMATCH[2]}"
+                    if [[ -n "$storage_name" && ! "$used_storages" =~ (^|$'\n')"$storage_name"($'\n'|$) ]]; then
+                        used_storages+="$storage_name"$'\n'
+                    fi
+                fi
+            done < "$conf_file"
+        fi
+    done
+    
+    # Check CT configurations  
+    for conf_file in /etc/pve/nodes/*/lxc/*.conf; do
+        if [[ -f "$conf_file" ]]; then
+            # Extract storage names from rootfs and mp configurations
+            # Lines like: rootfs: storage-name:subvol-100-disk-0,size=8G
+            # or: mp0: storage-name:100/vm-100-disk-0.raw,mp=/mnt/data
+            while IFS= read -r line; do
+                if [[ "$line" =~ ^(rootfs|mp[0-9]+):[[:space:]]*([^:,]+) ]]; then
+                    local storage_name="${BASH_REMATCH[2]}"
+                    if [[ -n "$storage_name" && ! "$used_storages" =~ (^|$'\n')"$storage_name"($'\n'|$) ]]; then
+                        used_storages+="$storage_name"$'\n'
+                    fi
+                fi
+            done < "$conf_file"
+        fi
+    done
+    
+    # Remove trailing newline and return
+    echo -n "$used_storages" | sed '/^$/d'
+}
+
+# Get list of unused NFS storages (not used by any VM/CT)
+get_unused_nfs_storages() {
+    local all_nfs_storages=""
+    local used_storages=""
+    local unused_storages=""
+    
+    log_debug "get_unused_nfs_storages: Getting list of all NFS storages"
+    
+    # Get all NFS storages from PVE storage configuration
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^nfs:[[:space:]]*([^[:space:]]+) ]]; then
+            local storage_name="${BASH_REMATCH[1]}"
+            all_nfs_storages+="$storage_name"$'\n'
+            log_debug "get_unused_nfs_storages: Found NFS storage: '$storage_name'"
+        fi
+    done < /etc/pve/storage.cfg
+    
+    log_debug "get_unused_nfs_storages: All NFS storages found: $(echo "$all_nfs_storages" | tr '\n' ' ')"
+    
+    # Get storages that are in use
+    used_storages=$(get_storages_used_by_vms_cts)
+    
+    log_debug "get_unused_nfs_storages: Used storages: $(echo "$used_storages" | tr '\n' ' ')"
+    
+    # Find unused storages
+    while IFS= read -r storage; do
+        if [[ -n "$storage" ]]; then
+            if [[ ! "$used_storages" =~ (^|$'\n')"$storage"($'\n'|$) ]]; then
+                unused_storages+="$storage"$'\n'
+                log_debug "get_unused_nfs_storages: Storage '$storage' is unused"
+            else
+                log_debug "get_unused_nfs_storages: Storage '$storage' is in use"
+            fi
+        fi
+    done <<< "$all_nfs_storages"
+    
+    log_debug "get_unused_nfs_storages: Unused storages: $(echo "$unused_storages" | tr '\n' ' ')"
+    
+    # Remove trailing newline and return
+    echo -n "$unused_storages" | sed '/^$/d'
+}
+
+# Get storage details including file count and size
+get_storage_file_details() {
+    local storage_name="$1"
+    local mount_path="/mnt/pve/$storage_name"
+    local images_path="$mount_path/images"
+    local file_count=0
+    local total_size="0"
+    
+    if [[ -d "$images_path" ]]; then
+        # Count files
+        file_count=$(find "$images_path" -type f 2>/dev/null | wc -l)
+        
+        # Get total size
+        if [[ $file_count -gt 0 ]]; then
+            total_size=$(du -sh "$images_path" 2>/dev/null | awk '{print $1}')
+        fi
+    fi
+    
+    echo "$file_count|$total_size"
+}
+
+# Display detailed file listing for a storage and get confirmation for deletion
+show_storage_file_listing_and_confirm() {
+    local storage_name="$1"
+    local images_path="/mnt/pve/$storage_name/images"
+    
+    if [[ ! -d "$images_path" ]]; then
+        dialog --msgbox "Error: Storage directory not found at $images_path" 8 60
+        return 1
+    fi
+    
+    log_debug "show_storage_file_listing_and_confirm: Generating file listing for $storage_name"
+    
+    # Generate detailed file listing
+    local file_listing=""
+    file_listing=$(find "$images_path" -type f -exec ls -lh {} + 2>/dev/null | awk '
+        BEGIN {
+            count=0
+            print "File listing for storage: '"$storage_name"'\n"
+            print "Path                                          Size"
+            print "----                                          ----"
+        } 
+        {
+            count++
+            # Extract just the filename and size
+            size = $5
+            path = $9
+            # Remove the base path to make it cleaner
+            gsub("^/mnt/pve/'"$storage_name"'/images/", "", path)
+            printf "%-42s %8s\n", path, size
+        } 
+        END {
+            printf "\nTotal files: %d", count
+        }')
+    
+    # Add total size
+    local total_size
+    total_size=$(du -sh "$images_path" 2>/dev/null | awk '{print $1}')
+    file_listing+="\nTotal size: $total_size"
+    
+    # Show file listing with confirmation dialog
+    dialog --keep-tite \
+        --title "Storage Contains Files - Confirm Deletion" \
+        --yes-label "Delete All Files" --no-label "Cancel" --extra-button --extra-label "Back" \
+        --yesno "$file_listing\n\nWARNING: Deleting this storage will permanently remove all listed files!\n\nDo you want to proceed with deletion?" 25 100
+    
+    local result=$?
+    log_debug "show_storage_file_listing_and_confirm: User selection result: $result"
+    
+    return $result
+}
+
 # Function: delete_cloned_nfs_storage_wizard
 delete_cloned_nfs_storage_wizard() {
     # Check if REST API is configured
@@ -10900,6 +11580,173 @@ This may take a moment." 8 50
         return 0
     else
         dialog --msgbox "Error: Failed to delete cloned NFS storage '$selected_storage'. Check the log file for details." 8 70
+        return 1
+    fi
+}
+
+# Function: delete_unused_nfs_storage_wizard
+delete_unused_nfs_storage_wizard() {
+    # Check if REST API is configured
+    if [[ -z "$rest_api_user" || -z "$rest_api_password" || -z "$rest_api_port" ]]; then
+        dialog --msgbox "REST API configuration is incomplete. Please use Setup to configure it first." 8 60
+        return 1
+    fi
+
+    # Show progress message while fetching data
+    log_debug "delete_unused_nfs_storage_wizard: Getting unused NFS storages"
+    dialog --infobox "Scanning for unused NFS storages..." 5 40
+
+    # Get list of unused NFS storages
+    local unused_storages
+    unused_storages=$(get_unused_nfs_storages)
+    log_debug "delete_unused_nfs_storage_wizard: get_unused_nfs_storages returned: '$unused_storages'"
+    
+    # Clear the fetching dialog
+    dialog --clear >/dev/null 2>&1
+
+    if [[ -z "$unused_storages" ]]; then
+        log_debug "delete_unused_nfs_storage_wizard: No unused storages found"
+        dialog --msgbox "No unused NFS storages found.\n\nAll NFS storages are currently being used by VMs or CTs." 8 60
+        return 1
+    fi
+    
+    log_debug "delete_unused_nfs_storage_wizard: Found unused storages: $unused_storages"
+
+    # Build menu options with file count and size information
+    local menu_items=()
+    local storage_details=()
+    local index=1
+    
+    log_debug "delete_unused_nfs_storage_wizard: Building menu with file details"
+    
+    while IFS= read -r storage; do
+        if [[ -n "$storage" ]]; then
+            # Get file details for this storage
+            local file_info
+            file_info=$(get_storage_file_details "$storage")
+            local file_count="${file_info%|*}"
+            local total_size="${file_info#*|}"
+            
+            # Format menu item with storage name and file info
+            local menu_text="$storage - Files: $file_count, Size: $total_size"
+            menu_items+=("$index" "$menu_text")
+            storage_details+=("$storage|$file_count|$total_size")
+            ((index++))
+        fi
+    done <<< "$unused_storages"
+
+    # Show selection dialog
+    local dialog_selected=$(mktemp)
+
+    # Storage selection loop
+    while true; do
+        # Show storage selection menu
+        dialog --keep-tite \
+            --title "Select Unused NFS Storage to Delete" \
+            --ok-label "Select" --cancel-label "Cancel" \
+            --menu "Choose an unused NFS storage to delete:" 18 100 10 \
+            "${menu_items[@]}" 2> "$dialog_selected"
+
+        exit_code=$?
+        local selected_index=$(cat "$dialog_selected")
+        rm -f "$dialog_selected"
+
+        if [[ $exit_code -ne 0 || -z "$selected_index" ]]; then
+            return 1
+        fi
+
+        # Get the selected storage details
+        local selected_detail="${storage_details[$((selected_index - 1))]}"
+        local selected_storage="${selected_detail%%|*}"
+        local remaining="${selected_detail#*|}"
+        local file_count="${remaining%|*}"
+        local total_size="${remaining#*|}"
+
+        if [[ -z "$selected_storage" ]]; then
+            dialog --msgbox "Error: Could not determine selected storage." 8 50
+            return 1
+        fi
+
+        log_info "Selected unused storage: $selected_storage (Files: $file_count, Size: $total_size)"
+
+        # If storage has files, show detailed file listing and get confirmation
+        if [[ "$file_count" -gt 0 ]]; then
+            show_storage_file_listing_and_confirm "$selected_storage"
+            local confirm_result=$?
+            
+            case $confirm_result in
+                0)  # Confirmed deletion
+                    log_info "User confirmed deletion of storage with files: $selected_storage"
+                    break
+                    ;;
+                1)  # Cancelled
+                    log_info "User cancelled deletion of storage: $selected_storage"
+                    return 1
+                    ;;
+                3)  # Back to selection
+                    log_info "User went back to storage selection"
+                    continue
+                    ;;
+            esac
+        else
+            # Empty storage, proceed directly to final confirmation
+            log_info "Storage is empty, proceeding to final confirmation: $selected_storage"
+            break
+        fi
+    done
+
+    # Get NFS server IP for the selected storage
+    log_debug "delete_unused_nfs_storage_wizard: About to get IP for storage '$selected_storage'"
+    log_debug "delete_unused_nfs_storage_wizard: Current storage_ip_map has ${#storage_ip_map[@]} entries"
+    
+    # Ensure storage IP mapping is built
+    if [[ ${#storage_ip_map[@]} -eq 0 ]]; then
+        log_debug "delete_unused_nfs_storage_wizard: Storage IP map is empty, building it"
+        build_storage_ip_map
+        log_debug "delete_unused_nfs_storage_wizard: After build_storage_ip_map, map has ${#storage_ip_map[@]} entries"
+    fi
+    
+    # Debug: Show all storage mappings
+    log_debug "delete_unused_nfs_storage_wizard: Available storage mappings:"
+    for storage in "${!storage_ip_map[@]}"; do
+        log_debug "  - '$storage' -> '${storage_ip_map[$storage]}'"
+    done
+    
+    get_storage_ip "$selected_storage"
+    local get_ip_result=$?
+    log_debug "delete_unused_nfs_storage_wizard: get_storage_ip returned code: $get_ip_result"
+    
+    if [[ -z "$selected_nfs_ip" ]]; then
+        log_error "delete_unused_nfs_storage_wizard: Failed to get IP for storage '$selected_storage'"
+        dialog --msgbox "Error: Could not determine NFS server IP for storage '$selected_storage'.\n\nCheck logs for details: $LOG_FILE" 10 70
+        return 1
+    fi
+    
+    log_debug "delete_unused_nfs_storage_wizard: Successfully got IP '$selected_nfs_ip' for storage '$selected_storage'"
+
+    # Final confirmation dialog - user must type "delete"
+    local confirm_input=$(mktemp)
+    dialog --inputbox "WARNING: This action will delete the unused NFS storage '$selected_storage' in Proxmox VE and the dataset in $VENDOR $PRODUCT.\n\nThis operation is irreversible!\n\nTo confirm deletion, type 'delete':" 16 80 2> "$confirm_input"
+    exit_code=$?
+    local confirmation=$(trimq "$(cat "$confirm_input")")
+    rm -f "$confirm_input"
+
+    if [[ $exit_code -ne 0 || "$confirmation" != "delete" ]]; then
+        dialog --msgbox "Deletion cancelled." 8 40
+        return 1
+    fi
+
+    # Show progress dialog
+    dialog --infobox "Deleting unused NFS storage '$selected_storage'...
+
+This may take a moment." 8 50
+
+    # Execute deletion using the specialized function for unused storage
+    if delete_unused_pve_nfs_storage "$selected_storage"; then
+        dialog --msgbox "Successfully deleted unused NFS storage '$selected_storage'.\n\nCleanup finished.\nReview logs in:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details." 12 70
+        return 0
+    else
+        dialog --msgbox "Error: Failed to delete unused NFS storage '$selected_storage'. Check the log file for details." 8 70
         return 1
     fi
 }

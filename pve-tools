@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.50"
-RELEASE_DATE="2025-08-07"
+VERSION="0.51"
+RELEASE_DATE="2025-08-08"
 
 # Script mode flag
 VERSION_MODE=false
@@ -4763,20 +4763,21 @@ main_menu() {
 
     cmd=(dialog --keep-tite --title "$menu_title"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
-         --menu "Choose an option:" 20 85 12)
-    options=("0" "Add cloned NFS storage from $PRODUCT snapshot"
-             "1" "Restore VM/CT from cloned NFS storage"
-             "2" "Move storage for VM/CT using cloned NFS storage"
-             "3" "Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT"
-             "4" "Clean up inactive NFS storage"
-             "5" "Clean up unused disks in VM/CT configurations"
-             "6" "Bulk VM/CT operations – start, stop, reboot, and more"
-             "7" "NFS tuning – set nconnect, sync options"
-             "8" "Add VM/CT to Proxmox VE HA resources"
-             "9" "Set up auto-start at boot for $PRODUCT VMs"
-             "10" "Apply known issue fixes and tuning"
-             "11" "System check-up"
-             "12" "Help & About pve-tools")
+         --menu "Choose an option:" 21 85 13)
+    options=("0" "Add new NFS storage from $PRODUCT pool"
+             "1" "Add cloned NFS storage from $PRODUCT datastore-snapshot"
+             "2" "Restore VM/CT from cloned NFS storage"
+             "3" "Move storage for VM/CT using cloned NFS storage"
+             "4" "Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT"
+             "5" "Clean up inactive NFS storage"
+             "6" "Clean up unused disks in VM/CT configurations"
+             "7" "Bulk VM/CT operations – start, stop, reboot, and more"
+             "8" "NFS tuning – set nconnect, sync options"
+             "9" "Add VM/CT to Proxmox VE HA resources"
+             "10" "Set up auto-start at boot for $PRODUCT VMs"
+             "11" "Apply known issue fixes and tuning"
+             "12" "System check-up"
+             "13" "Help & About pve-tools")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -4784,43 +4785,46 @@ main_menu() {
     case $dialog_exit_code in
         0)  # Select
             case "$selected_option" in
-                0)  # Add cloned NFS storage from $PRODUCT snapshot
+                0)  # Add new NFS storage from $PRODUCT pool
+                    add_new_nfs_storage_wizard
+                    ;;
+                1)  # Add cloned NFS storage from $PRODUCT snapshot
                     add_nfs_storage_wizard
                     ;;
-                1)  # Restore VM/CT from cloned NFS storage
+                2)  # Restore VM/CT from cloned NFS storage
                     restore_from_clone_wizard
                     ;;
-                2)  # Move storage for VM/CT using cloned NFS storage
+                3)  # Move storage for VM/CT using cloned NFS storage
                     move_storage_cloned_nfs
                     ;;
-                3)  # Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT
+                4)  # Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT
                     delete_cloned_nfs_storage_wizard
                     ;;
-                4)  # Clean up inactive NFS storage
+                5)  # Clean up inactive NFS storage
                     cleanup_inactive_nfs_storage
                     ;;
-                5)  # Clean up unused disks in VM/CT configurations
+                6)  # Clean up unused disks in VM/CT configurations
                     cleanup_unused_disks_wizard
                     ;;
-                6)  # Bulk VM/CT operations – start, stop, reboot, and more
+                7)  # Bulk VM/CT operations – start, stop, reboot, and more
                     vm_ct_manager_bulk_actions
                     ;;
-                7)  # NFS tuning – set nconnect, sync options
+                8)  # NFS tuning – set nconnect, sync options
                     nfs_tuning_wizard
                     ;;
-                8)  # Add VM/CT to Proxmox VE HA resources
+                9)  # Add VM/CT to Proxmox VE HA resources
                     add_vmct_to_ha_resources
                     ;;
-                9)  # Set up auto-start at boot for $PRODUCT VMs
+                10)  # Set up auto-start at boot for $PRODUCT VMs
                     setup_storage_vm_startup_wizard
                     ;;
-                10)  # Apply known issue fixes and tuning
+                11)  # Apply known issue fixes and tuning
                     post_known_issues_fixes
                     ;;
-                11)  # System check-up
+                12)  # System check-up
                     checkup_summary
                     ;;
-                12)  # Help & About pve-tools
+                13)  # Help & About pve-tools
                     help_about_dialog
                     ;;
             esac
@@ -4877,19 +4881,20 @@ help_about_dialog() {
     help_text+="\n"
     help_text+="MAIN FUNCTIONS:\n"
     help_text+="---------------\n"
-    help_text+="0. Add cloned NFS storage from $PRODUCT snapshot\n"
-    help_text+="1. Restore VM/CT from cloned NFS storage\n"
-    help_text+="2. Move storage for VM/CT using cloned NFS storage\n"
-    help_text+="3. Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT\n"
-    help_text+="4. Clean up inactive NFS storage\n"
-    help_text+="5. Clean up unused disks in VM/CT configurations\n"
-    help_text+="6. Bulk VM/CT operations – start, stop, reboot, and more\n"
-    help_text+="7. NFS tuning – set nconnect, sync options\n"
-    help_text+="8. Add VM/CT to Proxmox VE HA resources\n"
-    help_text+="9. Set up auto-start at boot for $PRODUCT VMs\n"
-    help_text+="10. Apply known issue fixes and tuning\n"
-    help_text+="11. System check-up\n"
-    help_text+="12. Help & About pve-tools\n"
+    help_text+="0. Add new NFS storage from $PRODUCT pool\n"
+    help_text+="1. Add cloned NFS storage from $PRODUCT datastore-snapshot\n"
+    help_text+="2. Restore VM/CT from cloned NFS storage\n"
+    help_text+="3. Move storage for VM/CT using cloned NFS storage\n"
+    help_text+="4. Delete cloned NFS storage in PVE and the cloned dataset in $PRODUCT\n"
+    help_text+="5. Clean up inactive NFS storage\n"
+    help_text+="6. Clean up unused disks in VM/CT configurations\n"
+    help_text+="7. Bulk VM/CT operations – start, stop, reboot, and more\n"
+    help_text+="8. NFS tuning – set nconnect, sync options\n"
+    help_text+="9. Add VM/CT to Proxmox VE HA resources\n"
+    help_text+="10. Set up auto-start at boot for $PRODUCT VMs\n"
+    help_text+="11. Apply known issue fixes and tuning\n"
+    help_text+="12. System check-up\n"
+    help_text+="13. Help & About pve-tools\n"
     help_text+="\n"
     help_text+="REQUIREMENTS:\n"
     help_text+="-------------\n"
@@ -8193,6 +8198,90 @@ format_age_human() {
     fi
 }
 
+# Get PVE storage name for a given dataset path
+# Args: $1 = server IP, $2 = dataset name (can be "Pool-0/dataset1" or just "dataset1")
+# Returns: storage name if found, empty string if not
+get_pve_storage_for_dataset() {
+    local server_ip="$1"
+    local dataset="$2"
+    local storage_name=""
+    
+    # We need to check multiple possible export path formats:
+    # 1. With pool prefix: /Pool-0/dataset1
+    # 2. Without pool prefix: /dataset1 (just the dataset name)
+    local export_path_with_pool="/$dataset"
+    local export_path_without_pool=""
+    
+    # Extract just the dataset name (part after the last /)
+    if [[ "$dataset" =~ / ]]; then
+        export_path_without_pool="/$(echo "$dataset" | sed 's/.*\///')"
+    else
+        export_path_without_pool="/$dataset"
+    fi
+    
+    log_debug "get_pve_storage_for_dataset: Checking for dataset '$dataset' on server '$server_ip'"
+    log_debug "  Export path with pool: '$export_path_with_pool'"
+    log_debug "  Export path without pool: '$export_path_without_pool'"
+    
+    # Parse storage.cfg to find matching NFS storage
+    local in_nfs_block=false
+    local current_storage=""
+    local current_server=""
+    local current_export=""
+    
+    while IFS= read -r line; do
+        # Check if this is an NFS storage block
+        if [[ "$line" =~ ^nfs:[[:space:]]*(.+)$ ]]; then
+            # If we were in a block, check if it matches
+            if [[ "$in_nfs_block" == true && -n "$current_storage" ]]; then
+                if [[ "$current_server" == "$server_ip" ]] && \
+                   [[ "$current_export" == "$export_path_with_pool" || "$current_export" == "$export_path_without_pool" ]]; then
+                    storage_name="$current_storage"
+                    log_debug "  Found match: storage='$current_storage', server='$current_server', export='$current_export'"
+                    break
+                fi
+            fi
+            # Start new block
+            in_nfs_block=true
+            current_storage="${BASH_REMATCH[1]}"
+            current_server=""
+            current_export=""
+        elif [[ "$in_nfs_block" == true ]]; then
+            # Check for server line
+            if [[ "$line" =~ ^[[:space:]]+server[[:space:]]+(.+)$ ]]; then
+                current_server="${BASH_REMATCH[1]}"
+            # Check for export line
+            elif [[ "$line" =~ ^[[:space:]]+export[[:space:]]+(.+)$ ]]; then
+                current_export="${BASH_REMATCH[1]}"
+            # Check for empty line (end of block)
+            elif [[ "$line" =~ ^[[:space:]]*$ ]]; then
+                # Check if this block matches
+                if [[ "$current_server" == "$server_ip" ]] && \
+                   [[ "$current_export" == "$export_path_with_pool" || "$current_export" == "$export_path_without_pool" ]]; then
+                    storage_name="$current_storage"
+                    log_debug "  Found match: storage='$current_storage', server='$current_server', export='$current_export'"
+                    break
+                fi
+                in_nfs_block=false
+                current_storage=""
+                current_server=""
+                current_export=""
+            fi
+        fi
+    done < /etc/pve/storage.cfg
+    
+    # Check last block if we reached EOF
+    if [[ "$in_nfs_block" == true && -n "$current_storage" ]]; then
+        if [[ "$current_server" == "$server_ip" ]] && \
+           [[ "$current_export" == "$export_path_with_pool" || "$current_export" == "$export_path_without_pool" ]]; then
+            storage_name="$current_storage"
+            log_debug "  Found match at EOF: storage='$current_storage', server='$current_server', export='$current_export'"
+        fi
+    fi
+    
+    echo "$storage_name"
+}
+
 nfs_step1_select_ip() {
     local line ips=() menu_items=()
     while IFS= read -r line; do
@@ -8357,9 +8446,20 @@ nfs_step3_select_dataset() {
         return 2  # Go back
     fi
 
+    # Build menu items with dataset name and PVE storage (if any)
     local i
     for ((i=0; i<${#datasets[@]}; i++)); do
-        menu_items+=("$i" "${datasets[i]}")
+        local dataset="${datasets[i]}"
+        local full_dataset="$selected_pool/$dataset"
+        local pve_storage=$(get_pve_storage_for_dataset "$selected_nfs_ip" "$full_dataset")
+        
+        if [[ -n "$pve_storage" ]]; then
+            # Dataset has PVE storage attached
+            menu_items+=("$i" "$(printf "%-30s | PVE: %s" "$dataset" "$pve_storage")")
+        else
+            # Dataset is not attached to any PVE storage
+            menu_items+=("$i" "$(printf "%-30s | (Not in PVE)" "$dataset")")
+        fi
     done
 
     local dialog_selected=$(mktemp)
@@ -8370,7 +8470,7 @@ nfs_step3_select_dataset() {
 
     cmd=(dialog --keep-tite --title "Step 3/$nfs_total_steps: Select Dataset"
          --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back" $extra_button
-         --menu "Choose $PRODUCT Dataset from Pool $selected_pool:" 15 60 8)
+         --menu "Choose $PRODUCT Dataset from Pool $selected_pool:\n(Shows existing PVE storage mappings)" 17 75 8)
     options=("${menu_items[@]}")
     dialog_menu
     rm -f "$dialog_selected"
@@ -8622,19 +8722,42 @@ add_nfs_storage_to_proxmox() {
 
     local content="images,iso,vztmpl,backup,rootdir,snippets"
 
-    # echo "Adding NFS storage '$storage_id' with:"  :to-do: send all lines to logs
-    # echo "  Server: $server"
-    # echo "  Export: $export"
-    # echo "  Nodes:  $nodes_csv"
-    # echo
+    log_info "Adding NFS storage '$storage_id' with server: $server, export: $export, nodes: $nodes_csv"
 
-    pvesh create /storage \
-        --storage "$storage_id" \
-        --type nfs \
-        --server "$server" \
-        --export "$export" \
-        --content "$content" \
-        --nodes "$nodes_csv" > /dev/null 2>&1
+    # Build the pvesh command arguments
+    local pvesh_args=()
+    pvesh_args+=(create /storage)
+    pvesh_args+=(--storage "$storage_id")
+    pvesh_args+=(--type nfs)
+    pvesh_args+=(--server "$server")
+    pvesh_args+=(--export "$export")
+    pvesh_args+=(--content "$content")
+    
+    # Add nodes parameter only if nodes_csv is not empty
+    if [[ -n "$nodes_csv" ]]; then
+        pvesh_args+=(--nodes "$nodes_csv")
+        log_debug "add_nfs_storage_to_proxmox: Adding nodes parameter: $nodes_csv"
+    else
+        log_debug "add_nfs_storage_to_proxmox: No nodes parameter - nodes_csv is empty"
+    fi
+    
+    log_debug "add_nfs_storage_to_proxmox: Executing pvesh with args: ${pvesh_args[*]}"
+    
+    local pvesh_output
+    local pvesh_exit_code
+    pvesh_output=$(pvesh "${pvesh_args[@]}" 2>&1)
+    pvesh_exit_code=$?
+    
+    log_debug "add_nfs_storage_to_proxmox: pvesh exit code: $pvesh_exit_code"
+    log_debug "add_nfs_storage_to_proxmox: pvesh output: $pvesh_output"
+    
+    if [[ $pvesh_exit_code -ne 0 ]]; then
+        log_error "add_nfs_storage_to_proxmox: Failed to add NFS storage (exit code: $pvesh_exit_code): $pvesh_output"
+        return 1
+    fi
+    
+    log_info "add_nfs_storage_to_proxmox: Successfully added NFS storage: $storage_id"
+    return 0
 }
 
 wait_for_storage_mount() {
@@ -9015,6 +9138,617 @@ add_nfs_storage_wizard() {
                 ;;
         esac
     done
+}
+
+# ADD NEW NFS STORAGE FROM POOL FUNCTIONS
+
+# Main wizard for adding new NFS storage from a pool
+add_new_nfs_storage_wizard() {
+    log_info "Starting add new NFS storage wizard"
+    
+    # Update connected storage servers information
+    update_connected_storage_servers
+    
+    # Reset wizard variables
+    selected_nfs_ip=""
+    selected_pool=""
+    selected_dataset=""
+    selected_dataset_option=""  # "create" or "existing"
+    new_dataset_name=""
+    new_storage_name=""
+    selected_nfs_ip_index=""
+    selected_pool_index=""
+    selected_dataset_index=""
+    nfs_new_current_step=1
+    nfs_new_total_steps=5
+    
+    while true; do
+        case $nfs_new_current_step in
+            1)
+                # Temporarily set the variable name that nfs_step1_select_ip expects
+                nfs_total_steps=$nfs_new_total_steps
+                nfs_step1_select_ip
+                # Restore the variable name
+                nfs_total_steps=
+                case $? in
+                    0)  # Next
+                        nfs_new_current_step=2
+                        ;;
+                    1)  # Back to Main
+                        return
+                        ;;
+                    2)  # Retry same step
+                        ;;
+                esac
+                ;;
+            2)
+                nfs_new_step2_select_pool
+                case $? in
+                    0)  # Next
+                        nfs_new_current_step=3
+                        ;;
+                    1)  # Back to Main
+                        return
+                        ;;
+                    2)  # Back
+                        nfs_new_current_step=1
+                        ;;
+                esac
+                ;;
+            3)
+                nfs_new_step3_dataset_choice
+                case $? in
+                    0)  # Next
+                        if [[ "$selected_dataset_option" == "create" ]]; then
+                            nfs_new_current_step=4  # Go to create dataset
+                        else
+                            nfs_new_current_step=5  # Go to select existing dataset
+                        fi
+                        ;;
+                    1)  # Back to Main
+                        return
+                        ;;
+                    2)  # Back
+                        nfs_new_current_step=2
+                        ;;
+                esac
+                ;;
+            4)
+                nfs_new_step4a_create_dataset
+                case $? in
+                    0)  # Next
+                        nfs_new_current_step=6  # Go to summary
+                        ;;
+                    1)  # Back to Main
+                        return
+                        ;;
+                    2)  # Back
+                        nfs_new_current_step=3
+                        ;;
+                esac
+                ;;
+            5)
+                nfs_new_step4b_select_dataset
+                case $? in
+                    0)  # Next
+                        nfs_new_current_step=6  # Go to summary
+                        ;;
+                    1)  # Back to Main
+                        return
+                        ;;
+                    2)  # Back
+                        nfs_new_current_step=3
+                        ;;
+                esac
+                ;;
+            6)
+                nfs_new_step5_summary
+                case $? in
+                    0)  # Apply
+                        perform_new_nfs_setup
+                        local setup_result=$?
+                        if [[ $setup_result -eq 0 ]]; then
+                            # Success
+                            return
+                        else
+                            # Error occurred, stay on current step
+                            continue
+                        fi
+                        ;;
+                    1)  # Back to Main
+                        return
+                        ;;
+                    2)  # Back
+                        if [[ "$selected_dataset_option" == "create" ]]; then
+                            nfs_new_current_step=4
+                        else
+                            nfs_new_current_step=5
+                        fi
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
+
+# Step 2: Select Pool
+nfs_new_step2_select_pool() {
+    local pools=()
+    local menu_items=()
+    
+    # Get pools from selected IP
+    while IFS= read -r pool; do
+        [[ -n "$pool" ]] && pools+=("$pool")
+    done < <(get_pools)
+    
+    if [[ ${#pools[@]} -eq 0 ]]; then
+        dialog --msgbox "No pools found on $selected_nfs_ip" 8 50
+        return 2  # Go back
+    fi
+    
+    local i
+    for ((i=0; i<${#pools[@]}; i++)); do
+        menu_items+=("$i" "${pools[i]}")
+    done
+    
+    local dialog_selected=$(mktemp)
+    local extra_button=""
+    if [[ -n "$selected_pool_index" ]]; then
+        extra_button="--default-item $selected_pool_index"
+    fi
+    
+    cmd=(dialog --keep-tite --title "Step 2/$nfs_new_total_steps: Select Pool"
+         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back" $extra_button
+         --menu "Choose $PRODUCT Pool:" 15 60 8)
+    options=("${menu_items[@]}")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Next
+            selected_pool_index="$selected_option"
+            selected_pool="${pools[selected_option]}"
+            log_info "Selected pool: $selected_pool"
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Back
+            return 2
+            ;;
+    esac
+}
+
+# Step 3: Choose Dataset Creation Method
+nfs_new_step3_dataset_choice() {
+    local dialog_selected=$(mktemp)
+    
+    cmd=(dialog --keep-tite --title "Step 3/$nfs_new_total_steps: Dataset Selection"
+         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back"
+         --menu "Choose dataset option:" 10 60 3)
+    options=("create" "Create NEW dataset"
+             "existing" "Select existing dataset")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Next
+            selected_dataset_option="$selected_option"
+            log_info "Selected dataset option: $selected_dataset_option"
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Back
+            return 2
+            ;;
+    esac
+}
+
+# Step 4A: Create New Dataset
+nfs_new_step4a_create_dataset() {
+    # Find next available dataset number
+    local next_number
+    next_number=$(find_next_dataset_number "$selected_pool")
+    
+    if [[ $? -ne 0 ]]; then
+        dialog --msgbox "Failed to determine next dataset number!" 8 50
+        return 2  # Go back
+    fi
+    
+    new_dataset_name="dataset-pve-$next_number"
+    selected_dataset="$new_dataset_name"
+    
+    # Show confirmation
+    local confirm_text="Will create new dataset:\n\n"
+    confirm_text+="Dataset Name: $new_dataset_name\n"
+    confirm_text+="Pool: $selected_pool\n"
+    confirm_text+="Server: $selected_nfs_ip\n\n"
+    confirm_text+="Continue?"
+    
+    dialog --keep-tite --title "Confirm Dataset Creation" \
+           --yesno "$confirm_text" 12 50
+    
+    case $? in
+        0)  # Yes - continue
+            log_info "Will create dataset: $new_dataset_name"
+            return 0
+            ;;
+        1)  # No - go back
+            return 2
+            ;;
+    esac
+}
+
+# Step 4B: Select Existing Dataset
+nfs_new_step4b_select_dataset() {
+    local all_datasets=()
+    local available_datasets=()
+    local menu_items=()
+    
+    # Get all datasets in selected pool
+    while IFS= read -r dataset; do
+        [[ -n "$dataset" ]] && all_datasets+=("$dataset")
+    done < <(get_datasets_in_pool "$selected_pool")
+    
+    if [[ ${#all_datasets[@]} -eq 0 ]]; then
+        dialog --msgbox "No datasets found in pool $selected_pool" 8 50
+        return 2  # Go back
+    fi
+    
+    # Filter out datasets that already have PVE storage attached
+    local i
+    for dataset in "${all_datasets[@]}"; do
+        local full_dataset="$selected_pool/$dataset"
+        log_debug "Checking dataset: $dataset (full path: $full_dataset) on server: $selected_nfs_ip"
+        local pve_storage=$(get_pve_storage_for_dataset "$selected_nfs_ip" "$full_dataset")
+        
+        if [[ -z "$pve_storage" ]]; then
+            # Dataset is available (not attached to any PVE storage)
+            available_datasets+=("$dataset")
+            log_debug "Dataset $dataset is available (not attached to PVE)"
+        else
+            log_debug "Dataset $dataset already attached to PVE storage: $pve_storage"
+        fi
+    done
+    
+    if [[ ${#available_datasets[@]} -eq 0 ]]; then
+        dialog --msgbox "No available datasets found in pool $selected_pool\n\nAll datasets are already attached to PVE storage." 10 60
+        return 2  # Go back
+    fi
+    
+    # Build menu items with dataset name and status
+    for ((i=0; i<${#available_datasets[@]}; i++)); do
+        local dataset="${available_datasets[i]}"
+        # Format: dataset name padded to consistent width
+        menu_items+=("$i" "$(printf "%-30s (Available)" "$dataset")")
+    done
+    
+    local dialog_selected=$(mktemp)
+    local extra_button=""
+    if [[ -n "$selected_dataset_index" ]]; then
+        extra_button="--default-item $selected_dataset_index"
+    fi
+    
+    cmd=(dialog --keep-tite --title "Step 4/$nfs_new_total_steps: Select Dataset"
+         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Back" $extra_button
+         --menu "Choose existing dataset from pool $selected_pool:\n(Only showing datasets not attached to PVE)" 17 70 8)
+    options=("${menu_items[@]}")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Next
+            selected_dataset_index="$selected_option"
+            selected_dataset="${available_datasets[selected_option]}"
+            log_info "Selected existing dataset: $selected_dataset"
+            return 0
+            ;;
+        1)  # Back to Main
+            return 1
+            ;;
+        3)  # Back
+            return 2
+            ;;
+    esac
+}
+
+# Step 5: Summary and Confirmation
+nfs_new_step5_summary() {
+    # Generate storage name
+    new_storage_name=$(find_next_storage_name)
+    
+    if [[ $? -ne 0 ]]; then
+        dialog --msgbox "Failed to generate storage name!" 8 50
+        return 2  # Go back
+    fi
+    
+    local summary="Summary of NFS Storage Configuration:\n\n"
+    summary+="Server IP: $selected_nfs_ip\n"
+    summary+="Pool: $selected_pool\n"
+    
+    if [[ "$selected_dataset_option" == "create" ]]; then
+        summary+="Dataset: $new_dataset_name (NEW)\n"
+    else
+        summary+="Dataset: $selected_dataset (EXISTING)\n"
+    fi
+    
+    summary+="NFS Share: /$selected_dataset\n"
+    summary+="PVE Storage Name: $new_storage_name\n\n"
+    summary+="Do you want to proceed with this configuration?"
+    
+    dialog --keep-tite --title "Step 5/$nfs_new_total_steps: Confirm Configuration" \
+           --yes-label "Apply" --no-label "Back" \
+           --yesno "$summary" 14 65
+    
+    case $? in
+        0)  # Apply
+            return 0
+            ;;
+        1)  # Back
+            return 2
+            ;;
+    esac
+}
+
+# Perform the actual setup of new NFS storage
+perform_new_nfs_setup() {
+    log_info "Starting NFS storage setup"
+    
+    # Step 1: Create dataset if needed
+    if [[ "$selected_dataset_option" == "create" ]]; then
+        dialog --title "Processing..." --infobox "Creating dataset: $new_dataset_name..." 6 50
+        sleep 1
+        
+        if ! create_dataset "$selected_pool" "$new_dataset_name"; then
+            dialog --msgbox "Failed to create dataset!" 8 40
+            return 1
+        fi
+        
+        selected_dataset="$new_dataset_name"
+    fi
+    
+    # Step 2: Create NFS share
+    dialog --title "Processing..." --infobox "Creating NFS share..." 6 50
+    sleep 1
+    
+    if ! create_nfs_share_for_dataset "$selected_pool" "$selected_dataset"; then
+        dialog --msgbox "Failed to create NFS share!" 8 40
+        return 1
+    fi
+    
+    # Step 3: Add storage to Proxmox VE
+    dialog --title "Processing..." --infobox "Adding storage to Proxmox VE..." 6 50
+    sleep 1
+    
+    local nodes_csv=$(get_ha_nodes_csv)
+    log_debug "get_ha_nodes_csv returned: '$nodes_csv'"
+    
+    # NFS server exports datasets by name only, not including pool name
+    local export_path="/$selected_dataset"
+    
+    # Log all variables for debugging
+    log_debug "Variables before pvesh create:"
+    log_debug "  new_storage_name='$new_storage_name'"
+    log_debug "  selected_nfs_ip='$selected_nfs_ip'"
+    log_debug "  selected_pool='$selected_pool'"
+    log_debug "  selected_dataset='$selected_dataset'"
+    log_debug "  export_path='$export_path'"
+    log_debug "  nodes_csv='$nodes_csv'"
+    
+    # Check if mount point already exists and clean it up if needed
+    local mount_point="/mnt/pve/$new_storage_name"
+    if [[ -d "$mount_point" ]]; then
+        log_info "Mount point $mount_point already exists, attempting cleanup"
+        
+        # Check if it's mounted and unmount if needed
+        if mountpoint -q "$mount_point" 2>/dev/null; then
+            log_info "Unmounting existing mount at $mount_point"
+            umount "$mount_point" 2>/dev/null || {
+                log_error "Failed to unmount $mount_point"
+                dialog --msgbox "Cannot create storage: mount point $mount_point is in use.\n\nPlease manually unmount or remove it first." 12 60
+                return 1
+            }
+        fi
+        
+        # Remove the directory if it's empty
+        if rmdir "$mount_point" 2>/dev/null; then
+            log_info "Removed existing empty directory $mount_point"
+        else
+            log_error "Cannot remove $mount_point - directory not empty or permission denied"
+            dialog --msgbox "Cannot create storage: directory $mount_point exists and cannot be removed.\n\nPlease manually remove it first." 12 60
+            return 1
+        fi
+    fi
+    
+    # Add NFS storage to Proxmox using pvesh directly
+    log_info "Adding NFS storage: $new_storage_name with export: $export_path"
+    
+    # Build the pvesh command arguments
+    local pvesh_args=()
+    pvesh_args+=(create /storage)
+    pvesh_args+=(--storage "$new_storage_name")
+    pvesh_args+=(--type nfs)
+    pvesh_args+=(--server "$selected_nfs_ip")
+    pvesh_args+=(--export "$export_path")
+    pvesh_args+=(--content "images,iso,vztmpl,backup,rootdir,snippets")
+    
+    # Add nodes parameter only if nodes_csv is not empty
+    if [[ -n "$nodes_csv" ]]; then
+        pvesh_args+=(--nodes "$nodes_csv")
+        log_debug "Adding nodes parameter: $nodes_csv"
+    else
+        log_debug "No nodes parameter - nodes_csv is empty"
+    fi
+    
+    log_debug "Executing pvesh command with args: ${pvesh_args[*]}"
+    
+    local pvesh_output
+    local pvesh_exit_code
+    pvesh_output=$(pvesh "${pvesh_args[@]}" 2>&1)
+    pvesh_exit_code=$?
+    
+    log_debug "pvesh exit code: $pvesh_exit_code"
+    log_debug "pvesh output: $pvesh_output"
+    
+    if [[ $pvesh_exit_code -ne 0 ]]; then
+        log_error "Failed to add NFS storage to Proxmox VE (exit code: $pvesh_exit_code): $pvesh_output"
+        dialog --msgbox "Failed to add storage to Proxmox VE!\n\nError: $pvesh_output" 12 70
+        return 1
+    fi
+    
+    log_info "Successfully added NFS storage: $new_storage_name"
+    
+    # Step 4: Wait for storage to mount
+    dialog --title "Processing..." --infobox "Waiting for storage to become available..." 6 50
+    if ! wait_for_storage_mount "$new_storage_name"; then
+        dialog --msgbox "Storage was added but may take a few minutes to become available." 8 60
+        # Continue anyway - storage might be available soon
+    fi
+    
+    # Step 5: Refresh storage information
+    dialog --title "Processing..." --infobox "Refreshing storage information..." 6 50
+    refresh_storage_cache "$new_storage_name"
+    
+    # Rebuild storage IP mapping
+    build_storage_ip_map
+    
+    # Success message
+    dialog --msgbox "NFS storage setup completed successfully!\n\nStorage Name: $new_storage_name\nDataset: $selected_dataset\nServer: $selected_nfs_ip\nPath: /mnt/pve/$new_storage_name" 12 60
+    
+    log_info "NFS storage setup completed: $new_storage_name"
+    return 0
+}
+
+# Helper function: Create a new dataset via REST API
+create_dataset() {
+    local pool_name="$1"
+    local dataset_name="$2"
+    
+    log_info "Creating dataset: $dataset_name in pool: $pool_name"
+    
+    # Prepare JSON payload for dataset creation
+    # Based on API docs: only "name" is required
+    local json_input="{\"name\": \"${dataset_name}\"}"
+    
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        -d "$json_input" \
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes")
+    
+    local body=$(echo "$response" | sed '$d')
+    local status=$(echo "$response" | tail -n1)
+    
+    if [[ $status -eq 200 || $status -eq 201 ]]; then
+        log_info "Dataset '$dataset_name' created successfully"
+        return 0
+    else
+        log_error "Failed to create dataset. Status: $status"
+        log_error "Response: $body"
+        return 1
+    fi
+}
+
+# Helper function: Create NFS share for a dataset
+create_nfs_share_for_dataset() {
+    local pool_name="$1"
+    local dataset_name="$2"
+    local share_name="$dataset_name"
+    local path="${pool_name}/${dataset_name}"
+    
+    log_info "Creating NFS share for dataset: $dataset_name"
+    
+    # Create NFS share using the same structure as create_nfs_share_for_clone
+    local json_input
+    json_input=$(cat <<EOF
+{
+    "name": "$share_name",
+    "path": "$path",
+    "nfs": {
+        "enabled": true,
+        "synchronous_data_record": true,
+        "no_root_squash": true
+    }
+}
+EOF
+)
+    
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        -d "$json_input" \
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/shares")
+    
+    local body=$(echo "$response" | sed '$d')
+    local status=$(echo "$response" | tail -n1)
+    
+    if [[ $status -eq 201 ]]; then
+        log_info "NFS share '$share_name' created at: $path"
+        return 0
+    elif [[ $status -eq 409 ]]; then
+        # Share already exists
+        log_info "NFS share '$share_name' already exists"
+        return 0
+    else
+        log_error "Failed to create NFS share. Status: $status"
+        log_error "Response: $body"
+        return 1
+    fi
+}
+
+# Helper function: Find next available dataset number
+find_next_dataset_number() {
+    local pool_name="$1"
+    local max_number=0
+    
+    log_debug "Finding next dataset number for pool: $pool_name"
+    
+    # Get existing datasets and find highest number
+    while IFS= read -r dataset; do
+        if [[ "$dataset" =~ ^dataset-pve-([0-9]+)$ ]]; then
+            local num="${BASH_REMATCH[1]}"
+            # Remove leading zeros for comparison
+            num=$((10#$num))
+            if [[ $num -gt $max_number ]]; then
+                max_number=$num
+            fi
+        fi
+    done < <(get_datasets_in_pool "$pool_name" 2>/dev/null)
+    
+    # Increment and format with leading zero
+    local next_number=$((max_number + 1))
+    printf "%02d" "$next_number"
+}
+
+# Helper function: Find next available storage name
+find_next_storage_name() {
+    local prefix="${storage_vm_name_contains}-nfs"
+    local max_number=0
+    
+    log_debug "Finding next storage name with prefix: $prefix"
+    
+    # Check existing storage names in PVE
+    while IFS= read -r storage_name; do
+        if [[ "$storage_name" =~ ^${prefix}([0-9]+)$ ]]; then
+            local num="${BASH_REMATCH[1]}"
+            # Remove leading zeros for comparison
+            num=$((10#$num))
+            if [[ $num -gt $max_number ]]; then
+                max_number=$num
+            fi
+        fi
+    done < <(grep -Po '^nfs:\s*\K\S+' /etc/pve/storage.cfg 2>/dev/null)
+    
+    # Increment and format with leading zero
+    local next_number=$((max_number + 1))
+    echo "${prefix}$(printf "%02d" "$next_number")"
 }
 
 # DELETE CLONED NFS STORAGE FUNCTIONS

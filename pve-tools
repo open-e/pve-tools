@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.51"
+VERSION="0.52"
 RELEASE_DATE="2025-08-08"
 
 # Script mode flag
@@ -7626,6 +7626,7 @@ selected_nfs_ip=""
 selected_pool=""
 selected_dataset=""
 selected_snapshot=""
+selected_pve_storage=""
 selected_nfs_ip_index=""
 selected_pool_index=""
 selected_dataset_index=""
@@ -8479,6 +8480,10 @@ nfs_step3_select_dataset() {
         0)  # Next
             selected_dataset_index="$selected_option"
             selected_dataset="${datasets[selected_option]}"
+            # Get and store the PVE storage name for the selected dataset
+            local full_dataset="$selected_pool/$selected_dataset"
+            selected_pve_storage=$(get_pve_storage_for_dataset "$selected_nfs_ip" "$full_dataset")
+            log_debug "nfs_step3_select_dataset: Dataset '$selected_dataset' has PVE storage: '$selected_pve_storage'"
             return 0
             ;;
         1)  # Back to Main
@@ -8552,7 +8557,7 @@ nfs_step4_select_snapshot() {
 }
 
 nfs_step5_summary() {
-    local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot")
+    local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot" "$selected_pve_storage")
     local summary_text="Summary of selections:\n\n"
     summary_text+="NFS Server IP: $selected_nfs_ip\n"
     summary_text+="Pool: $selected_pool\n"
@@ -8631,9 +8636,23 @@ make_clone_name() {
     local pool_name="$1"
     local dataset_name="$2"
     local snapshot_name="$3"
+    local pve_storage_name="$4"  # New parameter for PVE storage name
+    
     local ts
     ts=$(extract_timestamp_from_snapname "$pool_name" "$dataset_name" "$snapshot_name")
-    echo "${dataset_name}_clone_${ts}"
+    
+    # Use PVE storage name if available, otherwise fall back to dataset name
+    local base_name="${pve_storage_name:-$dataset_name}"
+    
+    # Remove any leading/trailing whitespace
+    base_name=$(echo "$base_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    
+    # If still empty, use dataset name as fallback
+    if [[ -z "$base_name" ]]; then
+        base_name="$dataset_name"
+    fi
+    
+    echo "${base_name}_clone_${ts}"
 }
 
 create_clone_from_snapshot() {
@@ -8953,7 +8972,7 @@ handle_existing_clone_dialog() {
 }
 
 perform_clone_and_setup() {
-    local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot")
+    local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot" "$selected_pve_storage")
     local actual_clone_name="$clone_name"
 
     # Show progress
@@ -9048,6 +9067,7 @@ add_nfs_storage_wizard() {
     selected_pool=""
     selected_dataset=""
     selected_snapshot=""
+    selected_pve_storage=""
     selected_nfs_ip_index=""
     selected_pool_index=""
     selected_dataset_index=""

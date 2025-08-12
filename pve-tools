@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.54"
-RELEASE_DATE="2025-08-11"
+VERSION="0.55"
+RELEASE_DATE="2025-08-12"
 
 # Script mode flag
 VERSION_MODE=false
@@ -344,7 +344,7 @@ init_debug_error_capture() {
                 '".*cmd.*options.*2>'       # dialog command arrays (user cancel = exit 1)
                 '^read.*-t.*discard'        # timeout reads for buffer clearing
                 '^\(\('                     # arithmetic expressions ((var++))
-                '^return [0-9]+'            # explicit return statements
+                '^return( [0-9]+| \$[a-zA-Z_][a-zA-Z0-9_]*)?$'  # explicit return statements with numbers or variables
                 '=[^=]*\$\('               # command substitutions (var=$(cmd))
             )
             
@@ -3987,7 +3987,7 @@ perform_oodp_checkup() {
     if [[ -n "$test_ip" ]]; then
         # Test authentication with a simple API call
         local auth_test_response
-        auth_test_response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+        auth_test_response=$(curl -k -s --connect-timeout 1 --max-time 1 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
             -H 'Content-Type: application/json' \
             "https://$test_ip:$rest_api_port/api/v4/conn_test" 2>/dev/null)
         local auth_curl_exit=$?
@@ -7758,7 +7758,7 @@ rest_api_connection_test() {
     local url="https://$selected_nfs_ip:$rest_api_port/api/v4/conn_test"
     log_debug "rest_api_connection_test: Full URL: $url"
     
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s --connect-timeout 1 --max-time 1 -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
         "$url" 2>&1)
     local curl_exit=$?
     
@@ -7804,7 +7804,7 @@ get_jovian_product_info() {
     local url="https://$ip:$rest_api_port/api/v4/product"
     log_debug "get_jovian_product_info: Full URL: $url"
     
-    response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 5 --max-time 10 -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 1 --max-time 1 -u "$rest_api_user:$rest_api_password" \
         "$url" 2>&1)
     local curl_exit=$?
     
@@ -7845,9 +7845,8 @@ update_connected_storage_servers() {
         log_info "Created connected storage servers directory: $CONNECTED_STORAGE_SERVERS_DIR"
     fi
     
-    # Remove all existing connected files
-    rm -f "$CONNECTED_STORAGE_SERVERS_DIR"/* 2>/dev/null
-    log_debug "Removed existing connected server info files"
+    # Update existing files in place (don't remove them - preserves caching)
+    log_debug "Updating connected server info files in place"
     
     # Get all available IPs
     local available_ips=()
@@ -7874,7 +7873,29 @@ update_connected_storage_servers() {
         fi
         
         local product_info
-        if product_info=$(get_jovian_product_info "$ip" 2>/dev/null); then
+        local current_timestamp=$(date +%s)
+        local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$ip"
+        
+        # Check if we have recent connection state info to avoid unnecessary API calls
+        local skip_api_call=false
+        if [[ -f "$info_file" ]]; then
+            local last_check_timestamp
+            local connection_state
+            
+            # Read existing connection state and timestamp
+            if connection_state=$(grep "^connection_state=" "$info_file" 2>/dev/null | cut -d'=' -f2) && \
+               last_check_timestamp=$(grep "^last_check_timestamp=" "$info_file" 2>/dev/null | cut -d'=' -f2); then
+                
+                # If disconnected and checked within last 5 minutes (300 seconds), skip API call
+                local time_diff=$((current_timestamp - last_check_timestamp))
+                if [[ "$connection_state" == "disconnected" && $time_diff -lt 300 ]]; then
+                    log_debug "Skipping API call for $ip (disconnected $time_diff seconds ago)"
+                    skip_api_call=true
+                fi
+            fi
+        fi
+        
+        if [[ "$skip_api_call" == "false" ]] && product_info=$(get_jovian_product_info "$ip" 2>/dev/null); then
             # Parse JSON response and extract fields
             local vendor_name=$(echo "$product_info" | grep -o '"vendor_name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"vendor_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
             local name=$(echo "$product_info" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
@@ -7884,9 +7905,10 @@ update_connected_storage_servers() {
             local up=$(echo "$product_info" | grep -o '"up"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"up"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
             local release_date=$(echo "$product_info" | grep -o '"release_date"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"release_date"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
             
-            # Create info file for this IP
-            local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$ip"
+            # Create info file for this IP with connected state
             cat > "$info_file" << EOF
+connection_state=connected
+last_check_timestamp=$current_timestamp
 vendor_name=$vendor_name
 name=$name
 host_name=$host_name
@@ -7895,11 +7917,143 @@ serial_number=$serial_number
 up=$up
 release_date=$release_date
 EOF
-            log_info "Created server info file for IP $ip with hostname: $host_name"
+            log_info "Created server info file for IP $ip with hostname: $host_name (connected)"
         else
-            log_debug "Failed to get product info for IP: $ip"
+            # API call was attempted but failed OR was skipped due to recent failure
+            if [[ "$skip_api_call" == "false" ]]; then
+                # API call was attempted but failed - create/update info file for disconnected IP
+                cat > "$info_file" << EOF
+connection_state=disconnected
+last_check_timestamp=$current_timestamp
+vendor_name=
+name=
+host_name=disconnected
+version_name=
+serial_number=
+up=
+release_date=
+EOF
+                log_info "Created server info file for IP $ip (disconnected)"
+            else
+                # API call was skipped due to recent disconnected state - keep existing file unchanged
+                log_debug "Preserving existing disconnected state for IP $ip"
+            fi
         fi
     done
+    
+    # Clean up files for IPs that are no longer in available list
+    log_debug "Cleaning up orphaned connection files"
+    for info_file in "$CONNECTED_STORAGE_SERVERS_DIR"/*; do
+        [[ -f "$info_file" ]] || continue
+        local file_ip=$(basename "$info_file")
+        local found=false
+        for available_ip in "${available_ips[@]}"; do
+            if [[ "$available_ip" == "$file_ip" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == false ]]; then
+            log_debug "Removing orphaned connection file for IP: $file_ip"
+            rm -f "$info_file"
+        fi
+    done
+}
+
+# Function to check if an IP is in connected state
+# Returns: 0 if connected, 1 if disconnected or not found
+check_ip_connection_state() {
+    local ip="$1"
+    local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$ip"
+    
+    if [[ -f "$info_file" ]]; then
+        local connection_state=$(grep "^connection_state=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+        if [[ "$connection_state" == "connected" ]]; then
+            log_debug "IP $ip is connected"
+            return 0
+        else
+            log_debug "IP $ip is disconnected"
+            return 1
+        fi
+    else
+        log_debug "No connection info found for IP $ip"
+        return 1
+    fi
+}
+
+# Function to attempt reconnection to a disconnected IP
+# Returns: 0 if successful, 1 if failed
+attempt_reconnect_ip() {
+    local ip="$1"
+    local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$ip"
+    local current_timestamp=$(date +%s)
+    
+    log_info "Attempting to reconnect to IP: $ip"
+    
+    local product_info
+    if product_info=$(get_jovian_product_info "$ip" 2>/dev/null); then
+        # Parse JSON response and extract fields
+        local vendor_name=$(echo "$product_info" | grep -o '"vendor_name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"vendor_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        local name=$(echo "$product_info" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        local host_name=$(echo "$product_info" | grep -o '"host_name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"host_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        local version_name=$(echo "$product_info" | grep -o '"version_name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"version_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        local serial_number=$(echo "$product_info" | grep -o '"serial_number"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"serial_number"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        local up=$(echo "$product_info" | grep -o '"up"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"up"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        local release_date=$(echo "$product_info" | grep -o '"release_date"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"release_date"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        
+        # Update info file with connected state
+        cat > "$info_file" << EOF
+connection_state=connected
+last_check_timestamp=$current_timestamp
+vendor_name=$vendor_name
+name=$name
+host_name=$host_name
+version_name=$version_name
+serial_number=$serial_number
+up=$up
+release_date=$release_date
+EOF
+        log_info "Successfully reconnected to IP $ip with hostname: $host_name"
+        return 0
+    else
+        # Update timestamp for disconnected state
+        cat > "$info_file" << EOF
+connection_state=disconnected
+last_check_timestamp=$current_timestamp
+vendor_name=
+name=
+host_name=disconnected
+version_name=
+serial_number=
+up=
+release_date=
+EOF
+        log_info "Failed to reconnect to IP $ip"
+        return 1
+    fi
+}
+
+# Function to mark IP as disconnected
+mark_ip_as_disconnected() {
+    local ip="$1"
+    local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$ip"
+    local current_timestamp=$(date +%s)
+    
+    log_debug "Marking IP $ip as disconnected"
+    
+    # Update info file with disconnected state
+    cat > "$info_file" << EOF
+connection_state=disconnected
+last_check_timestamp=$current_timestamp
+vendor_name=
+name=
+host_name=disconnected
+version_name=
+serial_number=
+up=
+release_date=
+EOF
+    log_debug "IP $ip marked as disconnected"
 }
 
 # Function to get hostname for IP from connected servers
@@ -7981,7 +8135,7 @@ validate_ip_with_connectivity() {
         
         # Test if it's a basic network connectivity issue vs authentication
         local test_response
-        test_response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 5 --max-time 10 \
+        test_response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 1 --max-time 1 \
             "https://$ip:$rest_api_port/api/v4/product" 2>&1)
         local curl_exit=$?
         
@@ -8166,6 +8320,12 @@ get_current_storage_servers_ip() {
 get_pool_names() {
     local addr="$1"
     local response
+    
+    # Check connection state first
+    if ! check_ip_connection_state "$addr"; then
+        log_info "Skipping get_pool_names for disconnected IP: $addr"
+        return 1
+    fi
 
     response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
         "https://$addr:$rest_api_port/api/v4/pools")
@@ -8571,6 +8731,25 @@ nfs_step1_select_ip() {
                 return 2  # Retry same step
             else
                 selected_nfs_ip="${ips[selected_option]}"
+                
+                # Check if the selected IP is disconnected
+                if ! check_ip_connection_state "$selected_nfs_ip"; then
+                    log_info "Selected disconnected IP: $selected_nfs_ip, attempting reconnection"
+                    
+                    # Show attempting reconnection dialog
+                    dialog --infobox "Attempting to reconnect to $selected_nfs_ip..." 5 50
+                    
+                    if attempt_reconnect_ip "$selected_nfs_ip"; then
+                        # Reconnection successful
+                        dialog --msgbox "Successfully reconnected to $selected_nfs_ip" 6 50
+                        return 0
+                    else
+                        # Reconnection failed
+                        dialog --msgbox "Failed to connect to $selected_nfs_ip\n\nThe storage server appears to be offline or unreachable.\nReturning to IP selection menu." 10 60
+                        return 2  # Retry same step
+                    fi
+                fi
+                
                 return 0
             fi
             ;;
@@ -8605,8 +8784,10 @@ nfs_step2_select_pool() {
     done < <(get_pool_names "$selected_nfs_ip")
 
     if [ "${#pools[@]}" -eq 0 ]; then
-        dialog --msgbox "No pools found on server $selected_nfs_ip" 8 50
-        return 2  # Go back
+        # Mark server as disconnected when no pools found
+        log_info "No pools found on $selected_nfs_ip, marking as disconnected"
+        mark_ip_as_disconnected "$selected_nfs_ip"
+        return 2  # Go back silently to IP selection
     fi
 
     local i
@@ -9401,9 +9582,9 @@ add_new_nfs_storage_wizard() {
                 # Temporarily set the variable name that nfs_step1_select_ip expects
                 nfs_total_steps=$nfs_new_total_steps
                 nfs_step1_select_ip
+                local step1_result=$?  # Capture return code IMMEDIATELY
                 # Restore the variable name
                 nfs_total_steps=
-                local step1_result=$?
                 log_debug "add_new_nfs_storage_wizard: nfs_step1_select_ip returned: $step1_result"
                 case $step1_result in
                     0)  # Next
@@ -9518,8 +9699,10 @@ nfs_new_step2_select_pool() {
     done < <(get_pools)
     
     if [[ ${#pools[@]} -eq 0 ]]; then
-        dialog --msgbox "No pools found on $selected_nfs_ip" 8 50
-        return 2  # Go back
+        # Mark server as disconnected when no pools found
+        log_info "No pools found on $selected_nfs_ip, marking as disconnected"
+        mark_ip_as_disconnected "$selected_nfs_ip"
+        return 2  # Go back silently to IP selection
     fi
     
     local i
@@ -10308,6 +10491,12 @@ get_pools() {
         fi
         nfs_ip="$selected_nfs_ip"
         log_debug "get_pools: Using global selected_nfs_ip='$nfs_ip'"
+    fi
+    
+    # Check connection state first
+    if ! check_ip_connection_state "$nfs_ip"; then
+        log_info "Skipping get_pools for disconnected IP: $nfs_ip"
+        return 1
     fi
 
     # Make REST API call to get all pools

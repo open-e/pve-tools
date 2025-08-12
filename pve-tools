@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.55"
+VERSION="0.56"
 RELEASE_DATE="2025-08-12"
 
 # Script mode flag
@@ -4303,17 +4303,41 @@ checkup_summary() {
     ha_nodes_list=$(get_ha_nodes)
     log_debug "HA nodes list: '$ha_nodes_list'"
     
-    # Check if ha-nodes group actually exists using get_groups function
-    local ha_groups_exist
-    ha_groups_exist=$(get_groups | grep -c "^ha-nodes$")
-    log_debug "HA groups exist count: $ha_groups_exist"
+    # Check if ha-nodes placement constraint exists (version-aware)
+    local MAJOR
+    MAJOR="$(get_pve_major)"
+    local ha_placement_exists=0
     
-    if [ "$ha_groups_exist" -gt 0 ]; then
-        summary="${summary}   The ha-nodes group is present, checkup is done for group hosts\n"
-        log_info "HA-nodes group exists, checking only HA nodes: $(echo "$ha_nodes_list" | tr '\n' ',')"
+    if [ "$MAJOR" -ge 9 ]; then
+        # PVE 9+: Check for node-affinity rules
+        local existing_rules
+        existing_rules=$(ha-manager rules list --type node-affinity 2>/dev/null | tail -n +4 | head -n -1 | grep -v '^[[:space:]]*$' | sed 's/│//g' | awk '{print $1}')
+        if echo "$existing_rules" | grep -qx "ha-nodes"; then
+            ha_placement_exists=1
+        fi
+        log_debug "PVE $MAJOR: HA node-affinity rules exist: $ha_placement_exists"
     else
-        summary="${summary}   The ha-nodes group is not defined, checkup is done for all PVE hosts\n"
-        log_info "HA-nodes group does not exist, checking all nodes"
+        # PVE 8: Check for HA groups
+        ha_placement_exists=$(get_groups | grep -c "^ha-nodes$")
+        log_debug "PVE $MAJOR: HA groups exist count: $ha_placement_exists"
+    fi
+    
+    if [ "$ha_placement_exists" -gt 0 ]; then
+        if [ "$MAJOR" -ge 9 ]; then
+            summary="${summary}   The ha-nodes rule is present, checkup is done for rule hosts\n"
+            log_info "HA-nodes rule exists, checking only HA nodes: $(echo "$ha_nodes_list" | tr '\n' ',')"
+        else
+            summary="${summary}   The ha-nodes group is present, checkup is done for group hosts\n"
+            log_info "HA-nodes group exists, checking only HA nodes: $(echo "$ha_nodes_list" | tr '\n' ',')"
+        fi
+    else
+        if [ "$MAJOR" -ge 9 ]; then
+            summary="${summary}   The ha-nodes rule is not defined, checkup is done for all PVE hosts\n"
+            log_info "HA-nodes rule does not exist, checking all nodes"
+        else
+            summary="${summary}   The ha-nodes group is not defined, checkup is done for all PVE hosts\n"
+            log_info "HA-nodes group does not exist, checking all nodes"
+        fi
     fi
     
     # Get node list from corosync configuration
@@ -4347,8 +4371,8 @@ checkup_summary() {
             continue
         fi
         
-        # Check if node should be checked (if ha-nodes group exists, only check those)
-        if [ "$ha_groups_exist" -gt 0 ]; then
+        # Check if node should be checked (if ha-nodes placement constraint exists, only check those)
+        if [ "$ha_placement_exists" -gt 0 ]; then
             log_debug "Checking if node '$node' is in ha-nodes list: '$ha_nodes_list'"
             local grep_result
             grep_result=$(echo "$ha_nodes_list" | grep "$node")
@@ -4425,21 +4449,33 @@ checkup_summary() {
     
     summary="${summary}\n"
     
-    # 2. ha-nodes group STATUS
-    summary="${summary}3. HA Nodes Group Status:\n"
-    
-    # HA nodes group status
-    local ha_group_status="$PASSED"
-    local ha_group_info="ha-nodes group         PRESENT"
-    if [ "$ha_groups_exist" -eq 0 ]; then
-        ha_group_status="$MISSING"
-        ha_group_info="ha-nodes group         not defined yet"
+    # 3. ha-nodes placement constraint STATUS (version-aware)
+    if [ "$MAJOR" -ge 9 ]; then
+        summary="${summary}3. HA Nodes Rule Status:\n"
+        
+        # HA nodes rule status
+        local ha_placement_status="$PASSED"
+        local ha_placement_info="ha-nodes rule          PRESENT"
+        if [ "$ha_placement_exists" -eq 0 ]; then
+            ha_placement_status="$MISSING"
+            ha_placement_info="ha-nodes rule          not defined yet"
+        fi
+    else
+        summary="${summary}3. HA Nodes Group Status:\n"
+        
+        # HA nodes group status
+        local ha_placement_status="$PASSED"
+        local ha_placement_info="ha-nodes group         PRESENT"
+        if [ "$ha_placement_exists" -eq 0 ]; then
+            ha_placement_status="$MISSING"
+            ha_placement_info="ha-nodes group         not defined yet"
+        fi
     fi
     
-    # Format ha-nodes group line with right-aligned status
-    local info_text="   ${ha_group_info}"
+    # Format ha-nodes placement constraint line with right-aligned status
+    local info_text="   ${ha_placement_info}"
     local text_length=${#info_text}
-    local status_length=${#ha_group_status}
+    local status_length=${#ha_placement_status}
     local total_width=94
     local padding=$((total_width - text_length - status_length))
     
@@ -4447,7 +4483,7 @@ checkup_summary() {
         padding=1
     fi
     
-    printf "%s%*s%s\n" "$info_text" $padding "" "$ha_group_status" >> "$temp_file"
+    printf "%s%*s%s\n" "$info_text" $padding "" "$ha_placement_status" >> "$temp_file"
     
     if [ -f "$temp_file" ]; then
         summary="${summary}$(cat "$temp_file")\n"
@@ -5324,13 +5360,51 @@ EOF
 # RESTORE FROM CLONE WIZARD FUNCTIONS
 
 get_ha_nodes() {
-    local ha_nodes
-    ha_nodes=$(sed -n '/^group: ha-nodes$/,/^group:/p' /etc/pve/ha/groups.cfg | \
-        grep -E '\s+nodes\s' | \
-        cut -d' ' -f2 | tr ',' '\n' | sort)
+    local ha_nodes=""
+    local MAJOR
+    MAJOR="$(get_pve_major)"
+    
+    if [ "$MAJOR" -ge 9 ]; then
+        # PVE 9+: Extract nodes from node-affinity rule
+        log_debug "get_ha_nodes: Using PVE 9+ node-affinity rule method"
+        
+        # Check if rules.cfg exists and contains ha-nodes rule
+        if [ -f /etc/pve/ha/rules.cfg ]; then
+            # Extract nodes from the ha-nodes rule
+            # Format in file is like:
+            # node-affinity: ha-nodes
+            #     nodes pve1,pve2  (or nodes pve1:2,pve2:1)
+            local nodes_line
+            nodes_line=$(sed -n '/^node-affinity: ha-nodes$/,/^[^ \t]/p' /etc/pve/ha/rules.cfg | grep '^\s*nodes\s' | head -1)
+            
+            if [ -n "$nodes_line" ]; then
+                # Extract node names, removing priorities if present (pve1:2 -> pve1)
+                ha_nodes=$(echo "$nodes_line" | sed 's/^\s*nodes\s*//' | tr ',' '\n' | sed 's/:.*$//' | sort)
+                log_debug "get_ha_nodes: Extracted nodes from rules.cfg: $ha_nodes"
+            else
+                log_debug "get_ha_nodes: No nodes line found in ha-nodes rule"
+            fi
+        else
+            log_debug "get_ha_nodes: No rules.cfg file found"
+        fi
+    else
+        # PVE 8 and older: Extract from HA groups
+        log_debug "get_ha_nodes: Using PVE 8 HA groups method"
+        if [ -f /etc/pve/ha/groups.cfg ]; then
+            ha_nodes=$(sed -n '/^group: ha-nodes$/,/^group:/p' /etc/pve/ha/groups.cfg | \
+                grep -E '\s+nodes\s' | \
+                cut -d' ' -f2 | tr ',' '\n' | sed 's/:.*$//' | sort)
+            log_debug "get_ha_nodes: Extracted nodes from group: $ha_nodes"
+        else
+            log_debug "get_ha_nodes: No groups.cfg file found"
+        fi
+    fi
+    
+    # If no ha-nodes configuration exists, return all cluster nodes
     if [[ -n "$ha_nodes" ]]; then
         echo "$ha_nodes"
     else
+        log_debug "get_ha_nodes: No ha-nodes configuration, returning all cluster nodes"
         pvecm nodes 2>/dev/null | grep -E '\s+[0-9]+\s+[0-9]+\s+\S+' | awk '{print $3}' | sort
     fi
 }
@@ -5531,23 +5605,40 @@ is_mnt_conf_file_form_existing_vmct() {
 get_cloned_config_file_list() {
     local config_files=()
     
+    log_debug "get_cloned_config_file_list: Starting config file discovery"
+    
     for storage in $(get_cloned_storage_list); do
+        log_debug "get_cloned_config_file_list: Processing storage '$storage'"
+        
         # Find VM disk files and extract VM IDs
         for disk_file in /mnt/pve/"$storage"/images/*/vm-[0-9]*-disk-*; do
+            log_debug "get_cloned_config_file_list: Checking disk file '$disk_file'"
             if [[ -f "$disk_file" ]]; then
+                log_debug "get_cloned_config_file_list: Found valid disk file '$disk_file'"
                 # Extract VM ID from disk filename (vm-201-disk-0.qcow2 -> 201)
                 local vm_id=$(basename "$disk_file" | sed -n 's/vm-\([0-9]\+\)-disk-.*/\1/p')
+                log_debug "get_cloned_config_file_list: Extracted VM ID '$vm_id' from disk file"
                 if [[ -n "$vm_id" ]]; then
                     # Look for corresponding config file in the same directory
                     local vm_dir=$(dirname "$disk_file")
                     local config_file="$vm_dir/$vm_id.conf"
+                    log_debug "get_cloned_config_file_list: Looking for config file '$config_file'"
                     if [[ -f "$config_file" ]]; then
+                        log_debug "get_cloned_config_file_list: Adding config file '$config_file' to list"
                         config_files+=("$config_file")
+                    else
+                        log_debug "get_cloned_config_file_list: Config file '$config_file' not found"
                     fi
+                else
+                    log_debug "get_cloned_config_file_list: Could not extract VM ID from '$disk_file'"
                 fi
+            else
+                log_debug "get_cloned_config_file_list: Disk file '$disk_file' does not exist or is not a regular file"
             fi
         done
     done
+    
+    log_debug "get_cloned_config_file_list: Found ${#config_files[@]} config files before deduplication"
     
     # Remove duplicates and sort
     printf '%s\n' "${config_files[@]}" | sort | uniq
@@ -5784,7 +5875,7 @@ step1_select_config() {
         local total_name_width=$((max_vmct_name_len + 2))  # +2 for parentheses
         local padding_needed=$((total_name_width - ${#name_with_parens}))
         local padding=""
-        for ((i=0; i<padding_needed; i++)); do
+        for ((j=0; j<padding_needed; j++)); do
             padding="${padding}${nbsp}"
         done
         
@@ -6664,8 +6755,8 @@ move_storage_step2_select_mode() {
     if [[ "$selected_migration_type" == "vm" ]]; then
         # VM migration modes
         menu_options+=(
-            "preserve" "Preserve VM snapshots (VMs must be powered OFF)"
             "standard" "Delete VM snapshots (VMs can be ON or OFF)"
+            "preserve" "Preserve VM snapshots (VMs must be powered OFF)"
         )
     elif [[ "$selected_migration_type" == "ct" ]]; then
         # CT migration modes (only one option)
@@ -9210,6 +9301,13 @@ sync_storage_discovery() {
     
     # Rebuild storage IP mapping to ensure all storage is discovered
     build_storage_ip_map
+    
+    # Initialize API cache for optimal storage discovery and clone detection
+    log_info "Initializing API cache for storage discovery..."
+    if ! init_api_cache; then
+        log_error "Failed to initialize API cache for storage discovery"
+        # Continue anyway - fallback to non-cached methods
+    fi
     
     # Clear any cached storage information
     rm -f /tmp/pve-storage-* 2>/dev/null || true
@@ -12592,6 +12690,130 @@ vm_ct_manager_bulk_actions() {
 # Configuration
 GROUP="ha-nodes"
 
+# Returns PVE major version (e.g., 8 or 9)
+get_pve_major() {
+  pveversion | awk -F'[/ ]' '/pve-manager/{split($2,a,"."); print a[1]; exit}'
+}
+
+# Ensure placement constraint exists for a set of resources
+# Args:
+#   1: name (group name on v8, rule name on v9+)  e.g. "ha-nodes"
+#   2: nodes CSV "node1:2,node2:1,node3"          (same format old/new)
+#   3: resources CSV "vm:101,ct:202"              (required for v9+ rule)
+#   4: restricted flag "1|0"                      (1 -> strict on v9+)
+#   5: comment                                    (optional)
+ensure_ha_placement() {
+  local NAME="$1" NODES="$2" RESLIST="$3" RESTRICTED="$4" COMMENT="${5:-Auto-created by pve-tools}"
+  log_debug "DEBUG: ensure_ha_placement called with:"
+  log_debug "  - NAME: '$NAME'"
+  log_debug "  - NODES: '$NODES'"  
+  log_debug "  - RESLIST: '$RESLIST'"
+  log_debug "  - RESTRICTED: '$RESTRICTED'"
+  log_debug "  - COMMENT: '$COMMENT'"
+  
+  local MAJOR
+  MAJOR="$(get_pve_major)"
+
+  if [ -z "$MAJOR" ]; then
+    log_error "Failed to detect Proxmox VE version"
+    return 1
+  fi
+
+  log_debug "DEBUG: Proxmox VE major version detected: $MAJOR"
+
+  if [ "$MAJOR" -ge 9 ]; then
+    # Node Affinity Rule (PVE 9+)
+    log_info "Using PVE 9+ node affinity rules for placement constraint '$NAME'"
+    # create if missing (handle Unicode table format)
+    log_debug "DEBUG: Checking if rule '$NAME' exists..."
+    local existing_rules
+    existing_rules=$(ha-manager rules list --type node-affinity | tail -n +4 | head -n -1 | grep -v '^[[:space:]]*$' | sed 's/│//g' | awk '{print $1}')
+    log_debug "DEBUG: Existing rules found: '$existing_rules'"
+    
+    if ! echo "$existing_rules" | grep -qx "$NAME"; then
+      log_debug "DEBUG: Rule '$NAME' does not exist, creating new rule"
+      # --strict 1 behaves like old --restricted 1
+      local STRICT=0
+      [ "$RESTRICTED" = "1" ] && STRICT=1
+      log_info "Creating node affinity rule '$NAME' with strict=$STRICT"
+      log_debug "DEBUG: Rule creation command will be:"
+      log_debug "  ha-manager rules add node-affinity '$NAME' --resources '$RESLIST' --nodes '$NODES' --comment '$COMMENT' --strict '$STRICT'"
+      
+      if ha-manager rules add node-affinity "$NAME" \
+        --resources "$RESLIST" \
+        --nodes "$NODES" \
+        --comment "$COMMENT" \
+        --strict "$STRICT" 2>&1; then
+        log_info "Successfully created node affinity rule '$NAME'"
+      else
+        log_error "Failed to create node affinity rule '$NAME'"
+        # Let's capture the error output
+        local error_output
+        error_output=$(ha-manager rules add node-affinity "$NAME" \
+          --resources "$RESLIST" \
+          --nodes "$NODES" \
+          --comment "$COMMENT" \
+          --strict "$STRICT" 2>&1)
+        log_error "DEBUG: Rule creation error output: $error_output"
+        return 1
+      fi
+    else
+      log_debug "DEBUG: Rule '$NAME' already exists, updating existing rule"
+      # update existing rule (idempotent)
+      local STRICT=0
+      [ "$RESTRICTED" = "1" ] && STRICT=1
+      log_info "Updating existing node affinity rule '$NAME' with strict=$STRICT"
+      log_debug "DEBUG: Rule update command will be:"
+      log_debug "  ha-manager rules set node-affinity '$NAME' --resources '$RESLIST' --nodes '$NODES' --comment '$COMMENT' --strict '$STRICT'"
+      
+      if ha-manager rules set node-affinity "$NAME" \
+        --resources "$RESLIST" \
+        --nodes "$NODES" \
+        --comment "$COMMENT" \
+        --strict "$STRICT" 2>&1; then
+        log_info "Successfully updated node affinity rule '$NAME'"
+      else
+        log_error "Failed to update node affinity rule '$NAME'"
+        # Let's capture the error output for update too
+        local error_output
+        error_output=$(ha-manager rules set node-affinity "$NAME" \
+          --resources "$RESLIST" \
+          --nodes "$NODES" \
+          --comment "$COMMENT" \
+          --strict "$STRICT" 2>&1)
+        log_error "DEBUG: Rule update error output: $error_output"
+        return 1
+      fi
+    fi
+  else
+    # HA Group (PVE 8 and older)
+    log_info "Using PVE 8 HA groups for placement constraint '$NAME'"
+    if ! ha-manager groupconfig | awk '{print $1}' | grep -qx "$NAME"; then
+      log_info "Creating HA group '$NAME' with restricted=$RESTRICTED"
+      if ha-manager groupadd "$NAME" \
+        --nodes "$NODES" \
+        --restricted "$RESTRICTED" \
+        --comment "$COMMENT" 2>/dev/null; then
+        log_info "Successfully created HA group '$NAME'"
+      else
+        log_error "Failed to create HA group '$NAME'"
+        return 1
+      fi
+    else
+      log_info "Updating existing HA group '$NAME' with restricted=$RESTRICTED"
+      if ha-manager groupset "$NAME" \
+        --nodes "$NODES" \
+        --restricted "$RESTRICTED" \
+        --comment "$COMMENT" 2>/dev/null; then
+        log_info "Successfully updated HA group '$NAME'"
+      else
+        log_error "Failed to update HA group '$NAME'"
+        return 1
+      fi
+    fi
+  fi
+}
+
 # Function: get_groups
 get_groups() {
   ha-manager groupconfig 2>/dev/null | grep -E '^group:' | awk '{print $2}'
@@ -12969,27 +13191,34 @@ show_confirmation_dialog() {
     esac
 }
 
-# Process and add resources
+# Process and add resources (PVE 8: groups, PVE 9+: node-affinity rules)
 process_ha_resources() {
     local total_processed=0
     local total_added=0
     local total_skipped=0
     local results_text=""
-    
+    local MAJOR
+    MAJOR="$(get_pve_major)"
+
     # Get HA manager status once to avoid multiple calls
-    local ha_manager_status=$(ha-manager status)
-    
+    local ha_manager_status
+    ha_manager_status=$(ha-manager status)
+
     # Get type information for selected VMs/CTs
     local vm_type_map
     vm_type_map=$(get_all_vm_ct_info | awk -F'|' '{print $1":"$3}')
-    
+
+    # Will hold SIDs that end up HA-managed (already in HA or newly added)
+    # We'll use this to build the node-affinity rule on PVE >= 9
+    local -a RESOURCES_FOR_RULE=()
+
     # Count total selected resources for progress
     local total_resources=${#SELECTED_VMIDS[@]}
-    
+
     # Process each selected VM/CT
     for vmid in "${SELECTED_VMIDS[@]}"; do
         ((total_processed++))
-        
+
         # Get VM/CT type
         local vm_type
         vm_type=$(echo "$vm_type_map" | grep "^$vmid:" | cut -d':' -f2)
@@ -12998,13 +13227,13 @@ process_ha_resources() {
             results_text+="Failed to determine type for $vmid\n"
             continue
         fi
-        
+
         local sid="${vm_type}:${vmid}"
-        
+
         # Update progress
         local progress=$((total_processed * 100 / total_resources))
         echo "$progress" | dialog --gauge "Processing selected VM/CT resources...\nCurrent: $sid" 8 60 0
-        
+
         # Skip hostpci VMs
         if [[ "$vm_type" == "vm" ]] && [[ " ${HOSTPCI_VMS[*]} " == *" $vmid "* ]]; then
             log_info "Skipping vm:$vmid (hostpci present)"
@@ -13012,38 +13241,93 @@ process_ha_resources() {
             ((total_skipped++))
             continue
         fi
-        
-        # Skip if already in HA group
+
+        # Skip if already in HA (but remember for rule creation on PVE 9+)
         if echo "$ha_manager_status" | awk '{print $1}' | grep -qx "$sid"; then
             log_info "Skipping $sid (already in HA)"
+            log_debug "DEBUG: Adding already-HA resource '$sid' to RESOURCES_FOR_RULE array"
             results_text+="Skipped $sid (already in HA)\n"
             ((total_skipped++))
+            RESOURCES_FOR_RULE+=("$sid")
+            log_debug "DEBUG: RESOURCES_FOR_RULE array now contains: ${RESOURCES_FOR_RULE[*]}"
             continue
         fi
-        
-        # Add to HA group
-        if ha-manager add "$sid" --state started --group "$GROUP" \
-            --comment "HA ${vmid} on ${NODES_CSV}" 2>/dev/null; then
-            log_info "Added $sid to HA group \"$GROUP\""
-            results_text+="Added $sid to HA group\n"
-            ((total_added++))
+
+        # Add to HA
+        if [ "$MAJOR" -ge 9 ]; then
+            # PVE 9+: no --group, rules handle placement
+            if ha-manager add "$sid" --state started \
+                --comment "HA ${vmid} nodes=${NODES_CSV}" 2>/dev/null; then
+                log_info "Added $sid to HA (v9+)"
+                log_debug "DEBUG: Adding newly-added resource '$sid' to RESOURCES_FOR_RULE array"
+                results_text+="Added $sid to HA\n"
+                RESOURCES_FOR_RULE+=("$sid")
+                log_debug "DEBUG: RESOURCES_FOR_RULE array now contains: ${RESOURCES_FOR_RULE[*]}"
+                ((total_added++))
+            else
+                log_error "Failed to add $sid to HA"
+                results_text+="Failed to add $sid\n"
+            fi
         else
-            log_error "Failed to add $sid to HA group"
-            results_text+="Failed to add $sid\n"
+            # PVE 8: add to group
+            if ha-manager add "$sid" --state started --group "$GROUP" \
+                --comment "HA ${vmid} on ${NODES_CSV}" 2>/dev/null; then
+                log_info "Added $sid to HA group \"$GROUP\""
+                log_debug "DEBUG: Adding resource '$sid' to RESOURCES_FOR_RULE array (PVE 8 mode)"
+                results_text+="Added $sid to HA group\n"
+                RESOURCES_FOR_RULE+=("$sid")  # harmless if kept; ignored by groups
+                log_debug "DEBUG: RESOURCES_FOR_RULE array now contains: ${RESOURCES_FOR_RULE[*]}"
+                ((total_added++))
+            else
+                log_error "Failed to add $sid to HA group"
+                results_text+="Failed to add $sid\n"
+            fi
         fi
     done
-    
+
+    # DEBUG: Log rule creation decision parameters
+    log_debug "DEBUG: Rule creation check - MAJOR='$MAJOR', RESOURCES_FOR_RULE count=${#RESOURCES_FOR_RULE[@]}"
+    log_debug "DEBUG: RESOURCES_FOR_RULE content: ${RESOURCES_FOR_RULE[*]}"
+    log_debug "DEBUG: GROUP='$GROUP', NODES_CSV='$NODES_CSV'"
+
+    # On PVE 9+, create/update Node Affinity rule for the SIDs we actually manage
+    if [ "$MAJOR" -ge 9 ]; then
+        log_info "DEBUG: PVE version check passed (MAJOR=$MAJOR >= 9)"
+        if [ "${#RESOURCES_FOR_RULE[@]}" -gt 0 ]; then
+            log_info "DEBUG: Resources array not empty, proceeding with rule creation"
+            # Build resources CSV like "vm:100,ct:200"
+            local RESOURCES_CSV
+            RESOURCES_CSV="$(IFS=,; echo "${RESOURCES_FOR_RULE[*]}")"
+            log_info "Creating/updating node affinity rule for ${#RESOURCES_FOR_RULE[@]} resources: $RESOURCES_CSV"
+            log_debug "DEBUG: About to call ensure_ha_placement with parameters:"
+            log_debug "  - GROUP: '$GROUP'"
+            log_debug "  - NODES_CSV: '$NODES_CSV'" 
+            log_debug "  - RESOURCES_CSV: '$RESOURCES_CSV'"
+            log_debug "  - RESTRICTED: '1'"
+            log_debug "  - COMMENT: 'Auto-created by pve-tools'"
+            
+            # Map your old --restricted 1 to --strict 1 on rules
+            ensure_ha_placement "$GROUP" "$NODES_CSV" "$RESOURCES_CSV" "1" "Auto-created by pve-tools"
+            local ensure_result=$?
+            log_debug "DEBUG: ensure_ha_placement returned exit code: $ensure_result"
+        else
+            log_info "DEBUG: Resources array is empty, skipping rule creation"
+        fi
+    else
+        log_info "DEBUG: PVE version check failed (MAJOR=$MAJOR < 9), not creating node affinity rules"
+    fi
+
     # Show results
     local summary="Operation completed:\n\n"
     summary+="Total processed: $total_processed\n"
     summary+="Successfully added: $total_added\n"
     summary+="Skipped: $total_skipped\n\n"
     summary+="Details:\n$results_text"
-    
+
     dialog --keep-tite --title "HA Resources Addition Results" \
            --ok-label "OK" \
            --msgbox "$summary" 20 80
-    
+
     log_info "HA resources processing completed: $total_added added, $total_skipped skipped"
 }
 
@@ -13110,13 +13394,19 @@ add_vmct_to_ha_resources() {
                 show_confirmation_dialog
                 case $? in
                     0) # Execute
-                        # Ensure HA group exists
-                        if ! get_groups | grep -qw "$GROUP"; then
-                            log_info "Group '$GROUP' does not exist. Creating restricted group on nodes: $NODES_CSV"
-                            ha-manager groupadd "$GROUP" \
-                                --nodes "$NODES_CSV" \
-                                --restricted 1 \
-                                --comment "Auto-created by pve-tools"
+                        # Ensure HA placement constraint exists (group on PVE 8, rule on PVE 9+)
+                        local MAJOR
+                        MAJOR="$(get_pve_major)"
+                        if [ "$MAJOR" -ge 9 ]; then
+                            # For PVE 9+, we'll create the rule inside process_ha_resources with actual resource list
+                            log_info "PVE 9+ detected: Node affinity rule will be created after resource processing"
+                        else
+                            # For PVE 8, ensure group exists before processing
+                            if ! get_groups | grep -qw "$GROUP"; then
+                                log_info "PVE 8 Group '$GROUP' does not exist. Creating via ensure_ha_placement function"
+                                # Note: resources CSV is empty for groups (not needed), but we pass it for compatibility
+                                ensure_ha_placement "$GROUP" "$NODES_CSV" "" "1" "Auto-created by pve-tools"
+                            fi
                         fi
                         
                         # Process resources

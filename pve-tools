@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.57"
+VERSION="0.58"
 RELEASE_DATE="2025-08-12"
 
 # Script mode flag
@@ -3997,7 +3997,7 @@ perform_oodp_checkup() {
     if [[ -n "$test_ip" ]]; then
         # Test authentication with a simple API call
         local auth_test_response
-        auth_test_response=$(curl -k -s --connect-timeout 1 --max-time 1 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+        auth_test_response=$(curl -k -s --connect-timeout 2 --max-time 5 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
             -H 'Content-Type: application/json' \
             "https://$test_ip:$rest_api_port/api/v4/conn_test" 2>/dev/null)
         local auth_curl_exit=$?
@@ -7922,7 +7922,7 @@ rest_api_connection_test() {
     local url="https://$selected_nfs_ip:$rest_api_port/api/v4/conn_test"
     log_debug "rest_api_connection_test: Full URL: $url"
     
-    response=$(curl -k -s --connect-timeout 1 --max-time 1 -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s --connect-timeout 2 --max-time 5 -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
         "$url" 2>&1)
     local curl_exit=$?
     
@@ -7968,7 +7968,7 @@ get_jovian_product_info() {
     local url="https://$ip:$rest_api_port/api/v4/product"
     log_debug "get_jovian_product_info: Full URL: $url"
     
-    response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 1 --max-time 1 -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 2 --max-time 5 -u "$rest_api_user:$rest_api_password" \
         "$url" 2>&1)
     local curl_exit=$?
     
@@ -8069,6 +8069,13 @@ update_connected_storage_servers() {
             local up=$(echo "$product_info" | grep -o '"up"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"up"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
             local release_date=$(echo "$product_info" | grep -o '"release_date"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"release_date"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
             
+            # Preserve existing node_role if it exists
+            local existing_node_role=""
+            if [[ -f "$info_file" ]]; then
+                existing_node_role=$(grep "^node_role=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+                log_debug "update_connected_storage_servers: Preserving existing role '$existing_node_role' for IP '$ip'"
+            fi
+            
             # Create info file for this IP with connected state
             cat > "$info_file" << EOF
 connection_state=connected
@@ -8081,10 +8088,23 @@ serial_number=$serial_number
 up=$up
 release_date=$release_date
 EOF
+            
+            # Append node_role if it existed
+            if [[ -n "$existing_node_role" ]]; then
+                echo "node_role=$existing_node_role" >> "$info_file"
+                log_debug "update_connected_storage_servers: Preserved role '$existing_node_role' for IP '$ip'"
+            fi
             log_info "Created server info file for IP $ip with hostname: $host_name (connected)"
         else
             # API call was attempted but failed OR was skipped due to recent failure
             if [[ "$skip_api_call" == "false" ]]; then
+                # Preserve existing node_role for disconnected IP as well
+                local existing_node_role=""
+                if [[ -f "$info_file" ]]; then
+                    existing_node_role=$(grep "^node_role=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+                    log_debug "update_connected_storage_servers: Preserving existing role '$existing_node_role' for disconnected IP '$ip'"
+                fi
+                
                 # API call was attempted but failed - create/update info file for disconnected IP
                 cat > "$info_file" << EOF
 connection_state=disconnected
@@ -8097,6 +8117,13 @@ serial_number=
 up=
 release_date=
 EOF
+                
+                # Append node_role if it existed
+                if [[ -n "$existing_node_role" ]]; then
+                    echo "node_role=$existing_node_role" >> "$info_file"
+                    log_debug "update_connected_storage_servers: Preserved role '$existing_node_role' for disconnected IP '$ip'"
+                fi
+                
                 log_info "Created server info file for IP $ip (disconnected)"
             else
                 # API call was skipped due to recent disconnected state - keep existing file unchanged
@@ -8165,6 +8192,13 @@ attempt_reconnect_ip() {
         local up=$(echo "$product_info" | grep -o '"up"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"up"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
         local release_date=$(echo "$product_info" | grep -o '"release_date"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"release_date"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
         
+        # Preserve existing node_role if it exists  
+        local existing_node_role=""
+        if [[ -f "$info_file" ]]; then
+            existing_node_role=$(grep "^node_role=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+            log_debug "attempt_reconnect_ip: Preserving existing role '$existing_node_role' for IP '$ip'"
+        fi
+        
         # Update info file with connected state
         cat > "$info_file" << EOF
 connection_state=connected
@@ -8177,9 +8211,22 @@ serial_number=$serial_number
 up=$up
 release_date=$release_date
 EOF
+        
+        # Append node_role if it existed
+        if [[ -n "$existing_node_role" ]]; then
+            echo "node_role=$existing_node_role" >> "$info_file"
+            log_debug "attempt_reconnect_ip: Preserved role '$existing_node_role' for IP '$ip'"
+        fi
         log_info "Successfully reconnected to IP $ip with hostname: $host_name"
         return 0
     else
+        # Preserve existing node_role for failed reconnection as well
+        local existing_node_role=""
+        if [[ -f "$info_file" ]]; then
+            existing_node_role=$(grep "^node_role=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+            log_debug "attempt_reconnect_ip: Preserving existing role '$existing_node_role' for failed reconnection to IP '$ip'"
+        fi
+        
         # Update timestamp for disconnected state
         cat > "$info_file" << EOF
 connection_state=disconnected
@@ -8192,6 +8239,12 @@ serial_number=
 up=
 release_date=
 EOF
+        
+        # Append node_role if it existed
+        if [[ -n "$existing_node_role" ]]; then
+            echo "node_role=$existing_node_role" >> "$info_file"
+            log_debug "attempt_reconnect_ip: Preserved role '$existing_node_role' for failed reconnection to IP '$ip'"
+        fi
         log_info "Failed to reconnect to IP $ip"
         return 1
     fi
@@ -8205,6 +8258,13 @@ mark_ip_as_disconnected() {
     
     log_debug "Marking IP $ip as disconnected"
     
+    # Preserve existing node_role if it exists
+    local existing_node_role=""
+    if [[ -f "$info_file" ]]; then
+        existing_node_role=$(grep "^node_role=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+        log_debug "mark_ip_as_disconnected: Preserving existing role '$existing_node_role' for IP '$ip'"
+    fi
+    
     # Update info file with disconnected state
     cat > "$info_file" << EOF
 connection_state=disconnected
@@ -8217,6 +8277,13 @@ serial_number=
 up=
 release_date=
 EOF
+    
+    # Append node_role if it existed
+    if [[ -n "$existing_node_role" ]]; then
+        echo "node_role=$existing_node_role" >> "$info_file"
+        log_debug "mark_ip_as_disconnected: Preserved role '$existing_node_role' for IP '$ip'"
+    fi
+    
     log_debug "IP $ip marked as disconnected"
 }
 
@@ -8236,6 +8303,127 @@ get_hostname_for_ip() {
     # Return "Unknown" if no hostname found
     echo "Unknown"
     return 1
+}
+
+# Function to get node role for IP from connected servers
+get_node_role_for_ip() {
+    local ip="$1"
+    local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$ip"
+    
+    log_debug "get_node_role_for_ip: Looking up role for IP '$ip'"
+    
+    if [[ -f "$info_file" ]]; then
+        local node_role=$(grep "^node_role=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+        if [[ -n "$node_role" ]]; then
+            log_debug "get_node_role_for_ip: Found role '$node_role' for IP '$ip'"
+            echo "$node_role"
+            return 0
+        fi
+    fi
+    
+    # Return "unassigned" if no role found
+    log_debug "get_node_role_for_ip: No role found for IP '$ip', returning 'unassigned'"
+    echo "unassigned"
+    return 1
+}
+
+# Function to set node role for IP in connected servers
+set_node_role_for_ip() {
+    local ip="$1"
+    local role="$2"
+    local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$ip"
+    
+    log_info "set_node_role_for_ip: Setting role '$role' for IP '$ip'"
+    
+    if [[ ! -f "$info_file" ]]; then
+        log_error "set_node_role_for_ip: Info file not found for IP '$ip'"
+        return 1
+    fi
+    
+    # Check if node_role line already exists
+    if grep -q "^node_role=" "$info_file" 2>/dev/null; then
+        # Update existing role
+        log_debug "set_node_role_for_ip: Updating existing role for IP '$ip'"
+        sed -i "s/^node_role=.*/node_role=$role/" "$info_file"
+    else
+        # Add new role line
+        log_debug "set_node_role_for_ip: Adding new role for IP '$ip'"
+        echo "node_role=$role" >> "$info_file"
+    fi
+    
+    log_info "set_node_role_for_ip: Successfully set role '$role' for IP '$ip'"
+    return 0
+}
+
+# Function to select node role with dialog
+select_node_role() {
+    local ip="$1"
+    local current_role
+    current_role=$(get_node_role_for_ip "$ip")
+    
+    log_info "select_node_role: Starting role selection for IP '$ip', current role: '$current_role'"
+    
+    local temp_output=$(mktemp)
+    local default_item=""
+    
+    # Set default selection based on current role
+    case "$current_role" in
+        "ha-cluster-node")
+            default_item="--default-item 1"
+            ;;
+        "backup-dr-node")
+            default_item="--default-item 2"
+            ;;
+        *)
+            default_item="--default-item 1"  # Default to ha-cluster-node
+            ;;
+    esac
+    
+    log_debug "select_node_role: Displaying role selection dialog for IP '$ip'"
+    
+    dialog --keep-tite --title "Select Node Role" \
+        --ok-label "Select" --cancel-label "Skip" $default_item \
+        --menu "Select the role for storage node $ip:" 12 60 5 \
+        "1" "ha-cluster-node    (High Availability Cluster Node)" \
+        "2" "backup-dr-node     (Backup/Disaster Recovery Node)" 2>"$temp_output"
+    
+    local dialog_result=$?
+    local selected_option=$(< "$temp_output")
+    rm -f "$temp_output"
+    
+    log_debug "select_node_role: Dialog result: $dialog_result, selected: '$selected_option'"
+    
+    if [[ $dialog_result -eq 0 && -n "$selected_option" ]]; then
+        local selected_role=""
+        case "$selected_option" in
+            "1")
+                selected_role="ha-cluster-node"
+                ;;
+            "2")
+                selected_role="backup-dr-node"
+                ;;
+            *)
+                log_error "select_node_role: Invalid selection: '$selected_option'"
+                return 1
+                ;;
+        esac
+        
+        log_info "select_node_role: User selected role '$selected_role' for IP '$ip'"
+        
+        # Set the role
+        if set_node_role_for_ip "$ip" "$selected_role"; then
+            log_info "select_node_role: Successfully set role '$selected_role' for IP '$ip'"
+            dialog --msgbox "Node role set to: $selected_role" 6 50
+            return 0
+        else
+            log_error "select_node_role: Failed to set role '$selected_role' for IP '$ip'"
+            dialog --msgbox "Failed to set node role. Please try again." 8 50
+            return 1
+        fi
+    else
+        log_info "select_node_role: User cancelled or skipped role selection for IP '$ip'"
+        return 2  # User cancelled or skipped
+    fi
 }
 
 get_custom_ips() {
@@ -8299,7 +8487,7 @@ validate_ip_with_connectivity() {
         
         # Test if it's a basic network connectivity issue vs authentication
         local test_response
-        test_response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 1 --max-time 1 \
+        test_response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 2 --max-time 5 \
             "https://$ip:$rest_api_port/api/v4/product" 2>&1)
         local curl_exit=$?
         
@@ -8790,19 +8978,93 @@ nfs_step1_select_ip() {
         return 1
     fi
 
+    # Separate actual IPs from special menu options
+    local actual_ips=()
+    local special_options=()
+    local ip_data=()  # Array to store IP info for sorting
+    
+    for ip in "${ips[@]}"; do
+        if [[ "$ip" == "Enter new IP" || "$ip" == "Manage custom IPs" ]]; then
+            special_options+=("$ip")
+        else
+            actual_ips+=("$ip")
+            local hostname=$(get_hostname_for_ip "$ip")
+            local node_role=$(get_node_role_for_ip "$ip")
+            log_debug "nfs_step1_select_ip: IP '$ip' has hostname '$hostname' and role '$node_role'"
+            
+            # Store IP data with role priority for sorting
+            # Format: "role_priority|ip|hostname|role"
+            local role_priority
+            case "$node_role" in
+                "ha-cluster-node")
+                    role_priority="1"  # Highest priority (will appear first)
+                    ;;
+                "backup-dr-node")
+                    role_priority="2"  # Second priority
+                    ;;
+                *)
+                    role_priority="3"  # Lowest priority (unassigned)
+                    ;;
+            esac
+            
+            # Convert IP to sortable format (pad octets with zeros)
+            local sortable_ip=$(printf "%03d.%03d.%03d.%03d" $(echo "$ip" | tr '.' ' '))
+            
+            ip_data+=("${role_priority}|${sortable_ip}|${ip}|${hostname}|${node_role}")
+        fi
+    done
+    
+    # Sort IP data by role priority (ascending) and then by IP
+    IFS=$'\n' sorted_ip_data=($(printf '%s\n' "${ip_data[@]}" | sort))
+    unset IFS
+    
+    log_debug "nfs_step1_select_ip: Sorted ${#sorted_ip_data[@]} IPs by role and IP address"
+    
+    # Build sorted IP array with special options at the end
+    local sorted_ips=()
+    for data in "${sorted_ip_data[@]}"; do
+        local ip=$(echo "$data" | cut -d'|' -f3)
+        sorted_ips+=("$ip")
+    done
+    
+    # Add special options at the end
+    for option in "${special_options[@]}"; do
+        sorted_ips+=("$option")
+    done
+    
+    # Replace original ips array with sorted one
+    ips=("${sorted_ips[@]}")
+    
+    # Build menu items with proper display formatting
     local i
     for ((i=0; i<${#ips[@]}; i++)); do
         local ip="${ips[i]}"
         local hostname
-        if [[ "$ip" == "Enter new IP" ]]; then
-            hostname=""
+        local node_role
+        
+        # Check if this is a special menu option (not an actual IP)
+        if [[ "$ip" == "Enter new IP" || "$ip" == "Manage custom IPs" ]]; then
+            # Special menu options - don't show role
+            menu_items+=("$i" "$ip")
         else
+            # Regular IP addresses - show hostname and role
             hostname=$(get_hostname_for_ip "$ip")
-        fi
-        if [[ -n "$hostname" && "$hostname" != "Unknown" ]]; then
-            menu_items+=("$i" "$(printf "%-16s - %s" "$ip" "$hostname")")
-        else
-            menu_items+=("$i" "$(printf "%-16s" "$ip")")
+            node_role=$(get_node_role_for_ip "$ip")
+            
+            # Build display string with IP, hostname, and role
+            if [[ -n "$hostname" && "$hostname" != "Unknown" ]]; then
+                if [[ -n "$node_role" && "$node_role" != "unassigned" ]]; then
+                    menu_items+=("$i" "$(printf "%-16s - %-20s [%s]" "$ip" "$hostname" "$node_role")")
+                else
+                    menu_items+=("$i" "$(printf "%-16s - %-20s [unassigned]" "$ip" "$hostname")")
+                fi
+            else
+                if [[ -n "$node_role" && "$node_role" != "unassigned" ]]; then
+                    menu_items+=("$i" "$(printf "%-16s [%s]" "$ip" "$node_role")")
+                else
+                    menu_items+=("$i" "$(printf "%-16s [unassigned]" "$ip")")
+                fi
+            fi
         fi
     done
 
@@ -8815,7 +9077,7 @@ nfs_step1_select_ip() {
     log_debug "nfs_step1_select_ip: About to display dialog menu with ${#menu_items[@]} items"
     cmd=(dialog --keep-tite --title "Step 1/$nfs_total_steps: Select $PRODUCT NFS Storage IP (VIP)"
          --ok-label "Next" --cancel-label "Back to Main" $extra_button
-         --menu "Choose $PRODUCT NFS Storage IP (VIP):" 15 80 8)
+         --menu "Choose $PRODUCT NFS Storage IP (VIP):" 15 95 8)
     options=("${menu_items[@]}")
     dialog_menu
     log_debug "nfs_step1_select_ip: dialog_menu returned, exit code: $dialog_exit_code, selected: $selected_option"
@@ -8888,6 +9150,14 @@ nfs_step1_select_ip() {
                 # Ask if user wants to save this IP (only for manually entered IPs)
                 if dialog --yesno "Save this IP ($input_ip) for future use?" 8 50; then
                     add_custom_ip "$input_ip"
+                    log_info "nfs_step1_select_ip: Added custom IP '$input_ip', now prompting for role selection"
+                    
+                    # Update connected storage servers to create info file for new IP
+                    update_connected_storage_servers
+                    
+                    # Prompt for node role selection
+                    select_node_role "$input_ip"
+                    log_info "nfs_step1_select_ip: Role selection completed for IP '$input_ip'"
                 fi
                 return 0
             elif [[ "${ips[selected_option]}" == "Manage custom IPs" ]]; then
@@ -8906,12 +9176,29 @@ nfs_step1_select_ip() {
                     if attempt_reconnect_ip "$selected_nfs_ip"; then
                         # Reconnection successful
                         dialog --msgbox "Successfully reconnected to $selected_nfs_ip" 6 50
+                        
+                        # Prompt for node role selection after successful reconnection
+                        log_info "nfs_step1_select_ip: Successfully reconnected to '$selected_nfs_ip', prompting for role selection"
+                        select_node_role "$selected_nfs_ip"
+                        log_info "nfs_step1_select_ip: Role selection completed for reconnected IP '$selected_nfs_ip'"
+                        
                         return 0
                     else
                         # Reconnection failed
                         dialog --msgbox "Failed to connect to $selected_nfs_ip\n\nThe storage server appears to be offline or unreachable.\nReturning to IP selection menu." 10 60
                         return 2  # Retry same step
                     fi
+                fi
+                
+                # Prompt for node role selection for connected IP (if role is unassigned)
+                local current_role
+                current_role=$(get_node_role_for_ip "$selected_nfs_ip")
+                if [[ "$current_role" == "unassigned" ]]; then
+                    log_info "nfs_step1_select_ip: Selected IP '$selected_nfs_ip' has unassigned role, prompting for role selection"
+                    select_node_role "$selected_nfs_ip"
+                    log_info "nfs_step1_select_ip: Role selection completed for connected IP '$selected_nfs_ip'"
+                else
+                    log_debug "nfs_step1_select_ip: Selected IP '$selected_nfs_ip' already has role '$current_role', skipping role selection"
                 fi
                 
                 return 0

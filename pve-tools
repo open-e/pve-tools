@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.56"
+VERSION="0.57"
 RELEASE_DATE="2025-08-12"
 
 # Script mode flag
@@ -753,6 +753,7 @@ storage_vm_startup_deleay=300
 storage_vm_shutdown_timeout=180
 storage_vm_boot_order=scsi0
 concurrent_vm_disk_move_count=2
+NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER=2
 EOF
         log_info "Created default config file: $CONFIG_FILE"
     fi
@@ -772,6 +773,7 @@ storage_vm_startup_deleay=300
 storage_vm_shutdown_timeout=180
 storage_vm_boot_order=scsi0
 concurrent_vm_disk_move_count=2
+NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER=2
 EOF
         log_info "Created factory defaults file: $FACTORY_DEFAULTS_FILE"
     else
@@ -785,6 +787,13 @@ EOF
                 echo "storage_vm_boot_order=scsi0" >> "$FACTORY_DEFAULTS_FILE"
             fi
             log_info "Factory defaults file updated with boot_order field"
+        fi
+        
+        # Check if factory defaults file is missing HA cluster size field and update it
+        if ! grep -q "^NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER=" "$FACTORY_DEFAULTS_FILE" 2>/dev/null; then
+            log_info "Updating factory defaults file with missing HA cluster size field"
+            echo "NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER=2" >> "$FACTORY_DEFAULTS_FILE"
+            log_info "Factory defaults file updated with HA cluster size field"
         fi
     fi
 
@@ -840,6 +849,7 @@ EOF
         storage_vm_shutdown_timeout="${storage_vm_shutdown_timeout:-180}"
         storage_vm_boot_order="${storage_vm_boot_order:-scsi0}"
         concurrent_vm_disk_move_count="${concurrent_vm_disk_move_count:-2}"
+        NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER="${NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER:-2}"
         custom_ips="${custom_ips:-}"
         
         log_debug "init_config: storage_vm_name_contains='$storage_vm_name_contains'"
@@ -5022,10 +5032,11 @@ setup_dialog() {
     
     cmd=(dialog --keep-tite --title "Setup Configuration"
          --ok-label "Select" --cancel-label "Back" 
-         --menu "Choose setup option:" 14 70 3)
+         --menu "Choose setup option:" 16 70 4)
     options=("1" "REST API Configuration"
              "2" "Storage VM Startup Settings"
-             "3" "Move Storage: Concurrent VM Disk Move Count")
+             "3" "Move Storage: Concurrent VM Disk Move Count"
+             "4" "Number of Proxmox VE hosts in HA cluster")
 
     dialog_menu
     rm -f "$dialog_selected"
@@ -5041,6 +5052,9 @@ setup_dialog() {
                     ;;
                 3)  # Move Storage: Concurrent VM Disk Move Count
                     setup_disk_move_dialog
+                    ;;
+                4)  # Number of Proxmox VE hosts in HA cluster
+                    setup_ha_cluster_size_dialog
                     ;;
             esac
             ;;
@@ -5261,6 +5275,64 @@ setup_custom_ips_dialog() {
     return 0
 }
 
+# Display setup dialog for HA cluster size configuration
+setup_ha_cluster_size_dialog() {
+    log_info "Starting HA cluster size configuration dialog"
+    
+    # Get current cluster size
+    local all_nodes
+    all_nodes=$(get_all_nodes)
+    if [ -z "$all_nodes" ]; then
+        dialog --msgbox "Error: No PVE cluster nodes found.\n\nPlease ensure this node is part of a Proxmox VE cluster." 10 60
+        return 1
+    fi
+    
+    # Count total nodes in cluster
+    local total_cluster_nodes
+    total_cluster_nodes=$(echo "$all_nodes" | wc -w)
+    log_info "Detected $total_cluster_nodes nodes in PVE cluster: $all_nodes"
+    
+    if [ "$total_cluster_nodes" -lt 2 ]; then
+        dialog --msgbox "Error: At least 2 nodes are required for HA configuration.\n\nCurrent cluster has only $total_cluster_nodes node(s)." 10 60
+        return 1
+    fi
+    
+    # Build menu options (2 to total_cluster_nodes)
+    local menu_items=()
+    local i
+    for ((i=2; i<=total_cluster_nodes; i++)); do
+        if [ "$i" -eq "$NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER" ]; then
+            menu_items+=("$i" "$i nodes (current)")
+        else
+            menu_items+=("$i" "$i nodes")
+        fi
+    done
+    
+    local dialog_selected=$(mktemp)
+    local cmd=(dialog --keep-tite --title "HA Cluster Size Configuration"
+           --ok-label "Save" --cancel-label "Back"
+           --menu "Select number of Proxmox VE hosts to include in HA cluster:" 15 60 $((total_cluster_nodes-1)))
+    local options=("${menu_items[@]}")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Save
+            if [ -n "$selected_option" ]; then
+                NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER="$selected_option"
+                log_info "User changed HA cluster size to: $NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER hosts"
+                save_config_file
+                dialog --msgbox "HA cluster size configuration saved successfully!\n\nNumber of HA hosts: $NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER" 8 60
+            fi
+            ;;
+        1)  # Back
+            ;;
+    esac
+    
+    return 0
+}
+
 # Restore factory defaults for storage VM configuration
 restore_factory_defaults_storage_vm() {
     log_info "Restoring factory defaults for storage VM configuration"
@@ -5353,6 +5425,7 @@ storage_vm_startup_deleay=${storage_vm_startup_deleay:-300}
 storage_vm_shutdown_timeout=${storage_vm_shutdown_timeout:-180}
 storage_vm_boot_order=${storage_vm_boot_order:-scsi0}
 concurrent_vm_disk_move_count=${concurrent_vm_disk_move_count:-2}
+NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER=${NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER:-2}
 EOF
     log_info "Configuration saved to $CONFIG_FILE"
 }
@@ -7902,7 +7975,7 @@ get_jovian_product_info() {
     log_debug "get_jovian_product_info: curl exit code: $curl_exit"
     
     if [[ $curl_exit -ne 0 ]]; then
-        log_error "get_jovian_product_info: curl failed for IP $ip"
+        log_info "get_jovian_product_info: Server $ip is disconnected (curl exit code: $curl_exit)"
         return 1
     fi
     
@@ -7916,7 +7989,7 @@ get_jovian_product_info() {
         echo "$body"
         return 0
     else
-        log_error "get_jovian_product_info: Failed to get product info for $ip (HTTP $status)"
+        log_info "get_jovian_product_info: Server $ip returned HTTP $status (may be disconnected or unreachable)"
         return 1
     fi
 }
@@ -12847,118 +12920,27 @@ except:
     fi
 }
 
-# Select first HA node
-select_first_ha_node() {
-    local nodes=() menu_items=()
-    local line
-    
-    # Get available nodes
-    local all_nodes
-    all_nodes=$(get_all_nodes)
-    if [ -z "$all_nodes" ]; then
-        dialog --msgbox "No PVE nodes found." 8 40
-        return 1
-    fi
-    
-    # Split nodes into array
-    readarray -t nodes <<< "$(echo "$all_nodes" | tr ' ' '\n')"
-    
-    if [ "${#nodes[@]}" -eq 0 ]; then
-        dialog --msgbox "No PVE nodes found." 8 40
-        return 1
-    fi
-    
-    # Build menu items
-    local i
-    for ((i=0; i<${#nodes[@]}; i++)); do
-        menu_items+=("$i" "${nodes[i]}")
-    done
-    
-    local dialog_selected=$(mktemp)
-    local cmd=(dialog --keep-tite --title "Step $current_step/$total_steps: Select First HA Node"
-           --ok-label "Next" --cancel-label "Back to Main"
-           --menu "Choose first PVE node for HA group \"$GROUP\":" 15 60 8)
-    local options=("${menu_items[@]}")
-    
-    dialog_menu
-    rm -f "$dialog_selected"
-    
-    if [ $dialog_exit_code -eq 0 ] && [ -n "$selected_option" ]; then
-        FIRST_NODE="${nodes[selected_option]}"
-        log_info "User selected first HA node: $FIRST_NODE"
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Select second HA node
-select_second_ha_node() {
-    local nodes=() menu_items=()
-    local line
-    
-    # Get available nodes
-    local all_nodes
-    all_nodes=$(get_all_nodes)
-    if [ -z "$all_nodes" ]; then
-        dialog --msgbox "No PVE nodes found." 8 40
-        return 1
-    fi
-    
-    # Split nodes into array
-    readarray -t nodes <<< "$(echo "$all_nodes" | tr ' ' '\n')"
-    
-    if [ "${#nodes[@]}" -eq 0 ]; then
-        dialog --msgbox "No PVE nodes found." 8 40
-        return 1
-    fi
-    
-    # Build menu items excluding first node
-    local i
-    for ((i=0; i<${#nodes[@]}; i++)); do
-        if [ "${nodes[i]}" != "$FIRST_NODE" ]; then
-            menu_items+=("$i" "${nodes[i]}")
-        fi
-    done
-    
-    if [ "${#menu_items[@]}" -eq 0 ]; then
-        dialog --msgbox "No additional nodes available for HA group." 8 50
-        return 1
-    fi
-    
-    local dialog_selected=$(mktemp)
-    local cmd=(dialog --keep-tite --title "Step $current_step/$total_steps: Select Second HA Node"
-           --ok-label "Next" --cancel-label "Back"
-           --menu "Choose second PVE node for HA group \"$GROUP\":" 15 60 8)
-    local options=("${menu_items[@]}")
-    
-    dialog_menu
-    rm -f "$dialog_selected"
-    
-    case $dialog_exit_code in
-        0)  # Next
-            if [ -n "$selected_option" ]; then
-                SECOND_NODE="${nodes[selected_option]}"
-                log_info "User selected second HA node: $SECOND_NODE"
-                return 0
-            else
-                return 1
-            fi
-            ;;
-        1)  # Back
-            return 1
-            ;;
-    esac
-}
 
 # Confirm HA node selection
 confirm_ha_nodes() {
-    local nodes_text="First node:  $FIRST_NODE\nSecond node: $SECOND_NODE"
+    # Build dynamic nodes text
+    local nodes_text=""
+    local ordinals=("First" "Second" "Third" "Fourth" "Fifth" "Sixth" "Seventh" "Eighth")
+    
+    for ((i=0; i<${#SELECTED_HA_NODES[@]}; i++)); do
+        local ordinal
+        if [ $i -lt ${#ordinals[@]} ]; then
+            ordinal="${ordinals[i]}"
+        else
+            ordinal="$((i+1))th"
+        fi
+        nodes_text+="$ordinal node: ${SELECTED_HA_NODES[i]}\n"
+    done
     
     local dialog_selected=$(mktemp)
     local cmd=(dialog --keep-tite --title "Step $current_step/$total_steps: Confirm HA Node Selection"
            --yes-label "Next" --no-label "Back"
-           --yesno "Selected nodes for HA group \"$GROUP\":\n\n$nodes_text\n\nProceed with these nodes?" 12 60)
+           --yesno "Selected nodes for HA group \"$GROUP\":\n\n$nodes_text\nProceed with these nodes?" 12 60)
     local options=()
     
     dialog_menu
@@ -12966,7 +12948,8 @@ confirm_ha_nodes() {
     
     case $dialog_exit_code in
         0)  # Next
-            GROUP_NODES=("$FIRST_NODE" "$SECOND_NODE")
+            # Copy SELECTED_HA_NODES to GROUP_NODES for compatibility
+            GROUP_NODES=("${SELECTED_HA_NODES[@]}")
             NODES_CSV=$(IFS=, ; echo "${GROUP_NODES[*]}")
             log_info "Confirmed HA nodes: $NODES_CSV"
             return 0
@@ -13159,7 +13142,14 @@ show_confirmation_dialog() {
     
     local info_text="Summary of VM/CT selection for HA resources:\n\n"
     info_text+="Selected VM/CT count: $selected_count\n"
-    info_text+="Target HA group: $GROUP\n"
+    # Use version-appropriate terminology (group for PVE <9, rule for PVE 9+)
+    local MAJOR
+    MAJOR="$(get_pve_major)"
+    if [ "$MAJOR" -ge 9 ]; then
+        info_text+="Target HA rule: $GROUP\n"
+    else
+        info_text+="Target HA group: $GROUP\n"
+    fi
     info_text+="Target HA nodes: $NODES_CSV\n\n"
     
     if [ $skip_count -gt 0 ]; then
@@ -13331,66 +13321,154 @@ process_ha_resources() {
     log_info "HA resources processing completed: $total_added added, $total_skipped skipped"
 }
 
+# Select HA node (dynamic function for any node position)
+select_ha_node() {
+    local node_position=$1  # 1, 2, 3, etc.
+    local nodes=() menu_items=()
+    
+    # Get available nodes
+    local all_nodes
+    all_nodes=$(get_all_nodes)
+    if [ -z "$all_nodes" ]; then
+        dialog --msgbox "No PVE nodes found." 8 40
+        return 1
+    fi
+    
+    # Split nodes into array
+    readarray -t nodes <<< "$(echo "$all_nodes" | tr ' ' '\n')"
+    
+    if [ "${#nodes[@]}" -eq 0 ]; then
+        dialog --msgbox "No PVE nodes found." 8 40
+        return 1
+    fi
+    
+    # Build menu items excluding already selected nodes
+    local i
+    for ((i=0; i<${#nodes[@]}; i++)); do
+        local node_already_selected=false
+        # Check if this node is already in SELECTED_HA_NODES array
+        for selected_node in "${SELECTED_HA_NODES[@]}"; do
+            if [ "${nodes[i]}" = "$selected_node" ]; then
+                node_already_selected=true
+                break
+            fi
+        done
+        
+        if [ "$node_already_selected" = false ]; then
+            menu_items+=("$i" "${nodes[i]}")
+        fi
+    done
+    
+    if [ "${#menu_items[@]}" -eq 0 ]; then
+        dialog --msgbox "No additional nodes available for HA group." 8 50
+        return 1
+    fi
+    
+    local dialog_selected=$(mktemp)
+    local ordinal
+    case $node_position in
+        1) ordinal="first" ;;
+        2) ordinal="second" ;;
+        3) ordinal="third" ;;
+        4) ordinal="fourth" ;;
+        5) ordinal="fifth" ;;
+        6) ordinal="sixth" ;;
+        7) ordinal="seventh" ;;
+        8) ordinal="eighth" ;;
+        *) ordinal="${node_position}th" ;;
+    esac
+    
+    local cancel_label
+    if [ $node_position -eq 1 ]; then
+        cancel_label="Back to Main"
+    else
+        cancel_label="Back"
+    fi
+    
+    local cmd=(dialog --keep-tite --title "Step $current_step/$total_steps: Select ${ordinal^} HA Node"
+           --ok-label "Next" --cancel-label "$cancel_label"
+           --menu "Choose $ordinal PVE node for HA group \"$GROUP\":" 15 60 8)
+    local options=("${menu_items[@]}")
+    
+    dialog_menu
+    rm -f "$dialog_selected"
+    
+    case $dialog_exit_code in
+        0)  # Next
+            if [ -n "$selected_option" ]; then
+                local selected_node="${nodes[selected_option]}"
+                # Store selected node in array at correct position (0-indexed)
+                SELECTED_HA_NODES[$((node_position - 1))]="$selected_node"
+                log_info "User selected HA node $node_position: $selected_node"
+                return 0
+            else
+                return 1
+            fi
+            ;;
+        1)  # Back
+            return 1
+            ;;
+    esac
+}
+
 # Main wizard function
 add_vmct_to_ha_resources() {
     log_info "Starting Add VM/CT to HA Resources wizard"
     
     # Initialize wizard variables
     SELECTED_VMIDS=()
+    SELECTED_HA_NODES=()  # Dynamic array for selected nodes
     current_step=1
-    total_steps=5
+    # Calculate total steps: number of HA nodes + 3 (confirm + select_vm/ct + execute)
+    total_steps=$((NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER + 3))
     select_all_mode=false
     
     # Collect VMIDs using PCI passthrough (needed for selection display)
     readarray -t HOSTPCI_VMS < <(get_vms_with_hostpci)
     
     while true; do
-        case $current_step in
-            1)
-                # Step 1: Select first HA node
-                log_info "Wizard: Starting step 1 - Select first HA node"
-                select_first_ha_node
-                case $? in
-                    0) 
-                        log_info "Wizard: Step 1 completed successfully, moving to step 2"
-                        current_step=2
-                        ;;
-                    1) 
+        # Dynamic node selection steps (1 to NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER)
+        if [ $current_step -le $NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER ]; then
+            # Node selection step
+            log_info "Wizard: Starting step $current_step - Select HA node $current_step"
+            select_ha_node $current_step
+            case $? in
+                0) 
+                    log_info "Wizard: Step $current_step completed successfully, moving to step $((current_step + 1))"
+                    current_step=$((current_step + 1))
+                    ;;
+                1) 
+                    if [ $current_step -eq 1 ]; then
                         log_info "User canceled first node selection"
                         return 0
-                        ;;
-                esac
-                ;;
-            2)
-                # Step 2: Select second HA node
-                log_info "Wizard: Starting step 2 - Select second HA node"
-                select_second_ha_node
-                local step2_result=$?
-                log_info "Wizard: Step 2 returned code: $step2_result"
-                case $step2_result in
-                    0) current_step=3 ;;  # Next
-                    1) current_step=1 ;;  # Back
-                esac
-                ;;
-            3)
-                # Step 3: Confirm node selection
-                confirm_ha_nodes
-                case $? in
-                    0) current_step=4 ;;  # Next
-                    1) current_step=2 ;;  # Back
-                esac
-                ;;
-            4)
-                # Step 4: Select VM/CT
-                select_vm_ct_for_ha
-                case $? in
-                    0) current_step=5 ;;  # Next
-                    1) current_step=3 ;;  # Back
-                    2) ;;                 # Stay on same step
-                esac
-                ;;
-            5)
-                # Step 5: Show confirmation dialog and execute
+                    else
+                        log_info "User went back from step $current_step to step $((current_step - 1))"
+                        current_step=$((current_step - 1))
+                    fi
+                    ;;
+            esac
+        else
+            # Fixed steps after node selection
+            case $current_step in
+                $((NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER + 1)))
+                    # Confirm node selection
+                    confirm_ha_nodes
+                    case $? in
+                        0) current_step=$((current_step + 1)) ;;  # Next
+                        1) current_step=$NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER ;;  # Back to last node selection
+                    esac
+                    ;;
+                $((NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER + 2)))
+                    # Select VM/CT
+                    select_vm_ct_for_ha
+                    case $? in
+                        0) current_step=$((current_step + 1)) ;;  # Next
+                        1) current_step=$((current_step - 1)) ;;  # Back
+                        2) ;;                 # Stay on same step
+                    esac
+                    ;;
+                $((NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER + 3)))
+                    # Show confirmation dialog and execute
                 show_confirmation_dialog
                 case $? in
                     0) # Execute
@@ -13415,10 +13493,11 @@ add_vmct_to_ha_resources() {
                         log_info "Add VM/CT to HA Resources wizard completed"
                         return 0
                         ;;
-                    1) current_step=4 ;;  # Back
+                    1) current_step=$((current_step - 1)) ;;  # Back
                 esac
                 ;;
-        esac
+            esac
+        fi
     done
 }
 

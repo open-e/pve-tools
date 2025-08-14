@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.58"
-RELEASE_DATE="2025-08-12"
+VERSION="0.59"
+RELEASE_DATE="2025-08-14"
 
 # Script mode flag
 VERSION_MODE=false
@@ -80,7 +80,9 @@ selected_pool_index=""
 selected_dataset_index=""
 selected_snapshot_index=""
 nfs_current_step=1
-nfs_total_steps=5
+nfs_total_steps=6
+oodp_destinations_json=""
+oodp_destination_datasets=()
 
 # NFS tuning variables
 selected_nfs_storages=""
@@ -243,7 +245,6 @@ get_storage_ip() {
     if [[ -n "${storage_ip_map[$storage_name]}" ]]; then
         local ip="${storage_ip_map[$storage_name]}"
         log_debug "get_storage_ip: Found IP '$ip' for storage '$storage_name'"
-        echo "$ip"
         selected_nfs_ip="$ip"
         return 0
     else
@@ -421,7 +422,7 @@ cache_pools_for_ip() {
     local response
     local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
     
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "$url" 2>/dev/null)
     
@@ -473,7 +474,7 @@ except:
             local response
             local url="https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes"
             
-            response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "${rest_api_user}:${rest_api_password}" \
+            response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" \
                 -H 'Content-Type: application/json' \
                 "$url" 2>/dev/null)
             
@@ -745,6 +746,9 @@ init_config() {
 rest_api_user=admin
 rest_api_password='admin'
 rest_api_port=82
+storage_server_web_gui_password=''
+rest_api_dest_user=admin
+rest_api_dest_password='admin'
 custom_ips=
 storage_vm_name_contains=$(lower "$PRODUCT")
 storage_vm_start_at_boot=yes
@@ -753,7 +757,10 @@ storage_vm_startup_deleay=300
 storage_vm_shutdown_timeout=180
 storage_vm_boot_order=scsi0
 concurrent_vm_disk_move_count=2
-NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER=2
+number_of_pve_hosts_in_ha_cluster=2
+oodp_backup_destination_port=40000
+oodp_src_default_plan='1hour=>1minute,3days=>15minutes,2weeks=>1hour'
+oodp_dst_default_plan='12hours=>5minutes,1week=>15minutes,3weeks=>1hour,12hours=>3months'
 EOF
         log_info "Created default config file: $CONFIG_FILE"
     fi
@@ -765,6 +772,9 @@ EOF
 rest_api_user=admin
 rest_api_password='admin'
 rest_api_port=82
+storage_server_web_gui_password=''
+rest_api_dest_user=admin
+rest_api_dest_password='admin'
 custom_ips=
 storage_vm_name_contains=$(lower "$PRODUCT")
 storage_vm_start_at_boot=yes
@@ -773,7 +783,10 @@ storage_vm_startup_deleay=300
 storage_vm_shutdown_timeout=180
 storage_vm_boot_order=scsi0
 concurrent_vm_disk_move_count=2
-NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER=2
+number_of_pve_hosts_in_ha_cluster=2
+oodp_backup_destination_port=40000
+oodp_src_default_plan='1hour=>1minute,3days=>15minutes,2weeks=>1hour'
+oodp_dst_default_plan='12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months'
 EOF
         log_info "Created factory defaults file: $FACTORY_DEFAULTS_FILE"
     else
@@ -790,10 +803,29 @@ EOF
         fi
         
         # Check if factory defaults file is missing HA cluster size field and update it
-        if ! grep -q "^NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER=" "$FACTORY_DEFAULTS_FILE" 2>/dev/null; then
+        if ! grep -q "^number_of_pve_hosts_in_ha_cluster=" "$FACTORY_DEFAULTS_FILE" 2>/dev/null; then
             log_info "Updating factory defaults file with missing HA cluster size field"
-            echo "NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER=2" >> "$FACTORY_DEFAULTS_FILE"
+            echo "number_of_pve_hosts_in_ha_cluster=2" >> "$FACTORY_DEFAULTS_FILE"
             log_info "Factory defaults file updated with HA cluster size field"
+        fi
+        
+        # Check if factory defaults file is missing OODP fields and update them
+        if ! grep -q "^oodp_backup_destination_port=" "$FACTORY_DEFAULTS_FILE" 2>/dev/null; then
+            log_info "Updating factory defaults file with missing OODP backup destination port field"
+            echo "oodp_backup_destination_port=40000" >> "$FACTORY_DEFAULTS_FILE"
+            log_info "Factory defaults file updated with OODP backup destination port field"
+        fi
+        
+        if ! grep -q "^oodp_src_default_plan=" "$FACTORY_DEFAULTS_FILE" 2>/dev/null; then
+            log_info "Updating factory defaults file with missing OODP source plan field"
+            echo "oodp_src_default_plan='1hour=>1minute,3days=>15minutes,2weeks=>1hour'" >> "$FACTORY_DEFAULTS_FILE"
+            log_info "Factory defaults file updated with OODP source plan field"
+        fi
+        
+        if ! grep -q "^oodp_dst_default_plan=" "$FACTORY_DEFAULTS_FILE" 2>/dev/null; then
+            log_info "Updating factory defaults file with missing OODP destination plan field"
+            echo "oodp_dst_default_plan='12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months'" >> "$FACTORY_DEFAULTS_FILE"
+            log_info "Factory defaults file updated with OODP destination plan field"
         fi
     fi
 
@@ -849,8 +881,11 @@ EOF
         storage_vm_shutdown_timeout="${storage_vm_shutdown_timeout:-180}"
         storage_vm_boot_order="${storage_vm_boot_order:-scsi0}"
         concurrent_vm_disk_move_count="${concurrent_vm_disk_move_count:-2}"
-        NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER="${NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER:-2}"
+        number_of_pve_hosts_in_ha_cluster="${number_of_pve_hosts_in_ha_cluster:-2}"
         custom_ips="${custom_ips:-}"
+        oodp_backup_destination_port="${oodp_backup_destination_port:-40000}"
+        oodp_src_default_plan="${oodp_src_default_plan:-1hour=>1minute,3days=>15minutes,2weeks=>1hour}"
+        oodp_dst_default_plan="${oodp_dst_default_plan:-12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months}"
         
         log_debug "init_config: storage_vm_name_contains='$storage_vm_name_contains'"
         log_debug "init_config: storage_vm_start_at_boot='$storage_vm_start_at_boot'"
@@ -2800,6 +2835,148 @@ fix_watchdog_module() {
     fi
 }
 
+# Check for missing OODP tasks for existing NFS storage
+check_missing_oodp_tasks() {
+    log_info "Checking for missing OODP tasks"
+    
+    # Get all regular NFS storage
+    local storages=$(get_regular_nfs_storage)
+    if [[ -z "$storages" ]]; then
+        log_info "No regular NFS storage found"
+        return 1
+    fi
+    
+    local missing_count=0
+    
+    # Check each storage for OODP task
+    while IFS='|' read -r storage_name path server _; do
+        local ip_addr="${storage_ip_map[$storage_name]}"
+        
+        if [[ -z "$ip_addr" ]]; then
+            log_debug "No IP mapping found for storage: $storage_name"
+            continue
+        fi
+        
+        # Extract pool and dataset from path
+        local pool_name="Pool-0"  # Default pool
+        local dataset_name="${path#/}"  # Remove leading slash
+        
+        # Check if path contains pool name (format: /pool-name/dataset-name)
+        if [[ "$path" =~ ^/([^/]+)/(.+)$ ]]; then
+            pool_name="${BASH_REMATCH[1]}"
+            dataset_name="${BASH_REMATCH[2]}"
+        fi
+        
+        log_debug "Checking OODP task for $storage_name: $pool_name/$dataset_name on $ip_addr"
+        
+        # Check if OODP task exists
+        if ! check_oodp_task_exists "$pool_name" "$dataset_name" "$ip_addr"; then
+            log_info "Missing OODP task for storage: $storage_name ($pool_name/$dataset_name)"
+            ((missing_count++))
+        fi
+    done <<< "$storages"
+    
+    if [[ $missing_count -gt 0 ]]; then
+        log_info "Found $missing_count storage(s) with missing OODP tasks"
+        return 0  # Return 0 to indicate fixes are needed
+    else
+        log_info "All NFS storage have OODP tasks configured"
+        return 1  # Return 1 to indicate no fixes needed
+    fi
+}
+
+# Fix missing OODP tasks for existing NFS storage
+fix_missing_oodp_tasks() {
+    log_info "Fixing missing OODP tasks"
+    
+    # Check if REST API credentials are configured
+    if [[ -z "${rest_api_user}" ]] || [[ -z "${rest_api_password}" ]] || [[ -z "${rest_api_port}" ]]; then
+        log_error "REST API credentials not configured. Please configure them in Setup menu."
+        return 1
+    fi
+    
+    # Get all regular NFS storage
+    local storages=$(get_regular_nfs_storage)
+    if [[ -z "$storages" ]]; then
+        log_info "No regular NFS storage found"
+        return 1
+    fi
+    
+    local fixed_count=0
+    local failed_count=0
+    
+    # Process each storage
+    while IFS='|' read -r storage_name path server _; do
+        local ip_addr="${storage_ip_map[$storage_name]}"
+        
+        if [[ -z "$ip_addr" ]]; then
+            log_debug "No IP mapping found for storage: $storage_name"
+            continue
+        fi
+        
+        # Extract pool and dataset from path
+        local pool_name="Pool-0"  # Default pool
+        local dataset_name="${path#/}"  # Remove leading slash
+        
+        # Check if path contains pool name (format: /pool-name/dataset-name)
+        if [[ "$path" =~ ^/([^/]+)/(.+)$ ]]; then
+            pool_name="${BASH_REMATCH[1]}"
+            dataset_name="${BASH_REMATCH[2]}"
+        fi
+        
+        log_debug "Processing $storage_name: $pool_name/$dataset_name on $ip_addr"
+        
+        # Check if OODP task exists
+        if ! check_oodp_task_exists "$pool_name" "$dataset_name" "$ip_addr"; then
+            log_info "Creating OODP task for $storage_name"
+            
+            # Check if backup destinations are available
+            local backup_servers=$(get_backup_dr_servers)
+            local destinations_json=""
+            
+            if [[ -n "$backup_servers" ]]; then
+                # Create destinations JSON for backup servers
+                local dest_array=()
+                while read -r backup_ip; do
+                    # Get destination pool for this backup server
+                    local dest_pool="Pool-DR-node-a"  # Default destination pool
+                    local dest_port="${oodp_dst_port:-40000}"
+                    local dest_dataset="${dataset_name}-backup"
+                    
+                    dest_array+=("{\"plan\":\"${oodp_dst_default_plan:-12hours=>5minutes,1week=>15minutes,3weeks=>1hour,12hours=>3months}\",\"dataset\":\"$backup_ip:$dest_port/$dest_pool/$dest_dataset\"}")
+                done <<< "$backup_servers"
+                
+                if [[ ${#dest_array[@]} -gt 0 ]]; then
+                    destinations_json="[$(IFS=,; echo "${dest_array[*]}")]"
+                    log_debug "Created destinations JSON for ${#dest_array[@]} backup server(s)"
+                fi
+            fi
+            
+            # Create OODP task
+            if create_oodp_task "$pool_name" "$dataset_name" "$storage_name" "$ip_addr" "$destinations_json"; then
+                log_info "Successfully created OODP task for $storage_name"
+                ((fixed_count++))
+            else
+                log_error "Failed to create OODP task for $storage_name"
+                ((failed_count++))
+            fi
+        else
+            log_debug "OODP task already exists for $storage_name"
+        fi
+    done <<< "$storages"
+    
+    if [[ $fixed_count -gt 0 ]]; then
+        log_info "Successfully created $fixed_count OODP task(s)"
+    fi
+    
+    if [[ $failed_count -gt 0 ]]; then
+        log_error "Failed to create $failed_count OODP task(s)"
+        return 1
+    fi
+    
+    return 0
+}
+
 # Main function for post known issues fixes and tuning
 post_known_issues_fixes() {
     local dialog_selected=$(mktemp)
@@ -2863,6 +3040,28 @@ post_known_issues_fixes() {
         fi
     else
         dialog --msgbox "Hardware Watchdog Configuration Fix Already Applied\n\nThe WATCHDOG_MODULE is already configured." 10 60
+    fi
+    
+    # Missing OODP Tasks Fix
+    if check_missing_oodp_tasks; then
+        # Missing OODP tasks found, offer to fix them
+        dialog --title "Missing OODP Tasks Fix" \
+               --yes-label "Confirm" \
+               --no-label "Skip" \
+               --yesno "Missing OODP Tasks for NFS Storage\n\nDescription:\nSome NFS storage entries in Proxmox VE do not have corresponding OODP (On/Off-site Data Protection) tasks configured in $VENDOR $PRODUCT. Without OODP tasks, automatic snapshots and replication will not work for these datasets.\n\nThis can happen when:\n- NFS storage was added manually without using pve-tools\n- OODP task creation failed during initial setup\n- OODP tasks were deleted from $PRODUCT\n\nThis fix will automatically create the missing OODP tasks with default snapshot schedules.\n\nDo you want to apply this fix?" 20 80
+        
+        if [ $? -eq 0 ]; then
+            dialog --title "Creating OODP Tasks" --infobox "Creating missing OODP tasks...\nThis may take a moment." 8 60
+            
+            if fix_missing_oodp_tasks; then
+                dialog --msgbox "Missing OODP Tasks Fix Applied Successfully!\n\nOODP tasks have been created for all NFS storage." 10 60
+                fixes_applied=$((fixes_applied + 1))
+            else
+                dialog --msgbox "Error: Failed to create some OODP tasks.\nCheck the log file for details.\n\nYou may need to:\n1. Verify REST API credentials in Setup menu\n2. Check network connectivity to $PRODUCT\n3. Ensure datasets exist in $PRODUCT" 14 70
+            fi
+        fi
+    else
+        dialog --msgbox "OODP Tasks Fix Already Applied\n\nAll NFS storage have OODP tasks configured." 10 60
     fi
     
     # Summary
@@ -3649,7 +3848,7 @@ get_oodp_details() {
     log_debug "get_oodp_details: Making request to: $url"
     
     local response
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "$url" 2>/dev/null)
     local curl_exit=$?
@@ -3832,11 +4031,14 @@ get_regular_nfs_storage() {
         if [[ "$line" =~ ^nfs:[[:space:]]*([^[:space:]]+) ]]; then
             local storage_name="${BASH_REMATCH[1]}"
             local storage_path=""
+            local storage_server=""
             
             # Read the configuration block for this storage
             while IFS= read -r config_line; do
                 if [[ "$config_line" =~ ^[[:space:]]*export[[:space:]]+([^[:space:]]+) ]]; then
                     storage_path="${BASH_REMATCH[1]}"
+                elif [[ "$config_line" =~ ^[[:space:]]*server[[:space:]]+([^[:space:]]+) ]]; then
+                    storage_server="${BASH_REMATCH[1]}"
                 elif [[ "$config_line" =~ ^[[:space:]]*$ ]] || [[ "$config_line" =~ ^[a-zA-Z]+: ]]; then
                     # Empty line or start of new section, stop looking
                     break
@@ -3846,11 +4048,11 @@ get_regular_nfs_storage() {
             # Check if this is NOT a cloned storage (cloned storage typically has "clone" in path or name)
             if [[ ! "$storage_name" =~ clone ]] && [[ ! "$storage_path" =~ clone ]]; then
                 if [ -n "$regular_storage" ]; then
-                    regular_storage="${regular_storage}\n${storage_name}"
+                    regular_storage="${regular_storage}\n${storage_name}|${storage_path}|${storage_server}"
                 else
-                    regular_storage="$storage_name"
+                    regular_storage="${storage_name}|${storage_path}|${storage_server}"
                 fi
-                log_debug "get_regular_nfs_storage: Found regular NFS storage: $storage_name (path: $storage_path)"
+                log_debug "get_regular_nfs_storage: Found regular NFS storage: $storage_name (path: $storage_path, server: $storage_server)"
             else
                 log_debug "get_regular_nfs_storage: Skipping cloned storage: $storage_name (path: $storage_path)"
             fi
@@ -4117,8 +4319,13 @@ perform_oodp_checkup() {
     fi
     
     # Process each NFS storage
-    echo -e "$nfs_storage_list" | while IFS= read -r storage_name; do
+    echo -e "$nfs_storage_list" | while IFS='|' read -r storage_name storage_path storage_server; do
         [ -z "$storage_name" ] && continue
+        
+        # For backward compatibility, if no separator found, treat whole line as storage_name
+        if [[ -z "$storage_path" ]]; then
+            storage_name="$(echo "$storage_name" | tr -d '|')"
+        fi
         
         log_info "perform_oodp_checkup: Processing storage $storage_name"
         
@@ -4141,17 +4348,22 @@ perform_oodp_checkup() {
             continue
         fi
         
-        # Get dataset path from storage.cfg
+        # Get dataset path - use passed value or fall back to storage.cfg
         local dataset_path
-        dataset_path=$(awk -v storage="$storage_name" '
-            $0 ~ "^nfs: " storage "$" { in_storage=1; next }
-            in_storage && /^[[:space:]]*export[[:space:]]/ { 
-                gsub(/^[[:space:]]*export[[:space:]]+/, ""); 
-                print; 
-                exit 
-            }
-            in_storage && (/^[[:space:]]*$/ || /^[a-zA-Z]+:/) { exit }
-        ' /etc/pve/storage.cfg)
+        if [[ -n "$storage_path" ]]; then
+            dataset_path="$storage_path"
+        else
+            # Fallback to reading from storage.cfg for backward compatibility
+            dataset_path=$(awk -v storage="$storage_name" '
+                $0 ~ "^nfs: " storage "$" { in_storage=1; next }
+                in_storage && /^[[:space:]]*export[[:space:]]/ { 
+                    gsub(/^[[:space:]]*export[[:space:]]+/, ""); 
+                    print; 
+                    exit 
+                }
+                in_storage && (/^[[:space:]]*$/ || /^[a-zA-Z]+:/) { exit }
+            ' /etc/pve/storage.cfg)
+        fi
         
         # Extract pool and dataset names from path
         # Handle two formats: /Pool-0/datastore00 or /datastore00
@@ -4855,6 +5067,9 @@ checkup_summary() {
     log_info "System checkup summary completed"
 }
 
+# Global variable to remember main menu selection across calls
+MAIN_MENU_LAST_SELECTED="0"
+
 # Display main menu and handle user selections
 main_menu() {
     local dialog_selected=$(mktemp)
@@ -4867,6 +5082,7 @@ main_menu() {
 
     cmd=(dialog --keep-tite --title "$menu_title"
          --ok-label "Select" --cancel-label "Exit" --extra-button --extra-label "Setup"
+         --default-item "$MAIN_MENU_LAST_SELECTED"
          --menu "Choose an option:" 22 85 13)
     options=("0" "Add new NFS storage from $PRODUCT pool"
              "1" "Add cloned NFS storage from $PRODUCT datastore-snapshot"
@@ -4889,6 +5105,7 @@ main_menu() {
 
     case $dialog_exit_code in
         0)  # Select
+            MAIN_MENU_LAST_SELECTED="$selected_option"  # Remember the selected option
             case "$selected_option" in
                 0)  # Add new NFS storage from $PRODUCT pool
                     add_new_nfs_storage_wizard
@@ -5018,50 +5235,69 @@ help_about_dialog() {
     help_text+="- Automatic pve-config-backup daemon detection on startup\n"
     help_text+="- Auto-installation of pve-config-backup from GitHub when not found\n"
     help_text+="- Background status monitoring of cluster backup daemons\n"
+    help_text+="\n"
+    help_text+="SETUP CONFIGURATION:\n"
+    help_text+="--------------------\n"
+    help_text+="- REST API credentials and connection settings\n"
+    help_text+="- Storage VM startup and shutdown configuration\n"
+    help_text+="- Concurrent VM disk move count optimization\n"
+    help_text+="- HA cluster size settings\n"
+    help_text+="- OODP backup destination and scheduling configuration\n"
     
     dialog --keep-tite --title "Help & About pve-tools" \
            --ok-label "Close" \
-           --msgbox "$help_text" 30 80
+           --msgbox "$help_text" 35 80
     
     return 0
 }
 
 # Display setup dialog menu
 setup_dialog() {
-    local dialog_selected=$(mktemp)
+    local last_selected_option="1"  # Default to first option initially
     
-    cmd=(dialog --keep-tite --title "Setup Configuration"
-         --ok-label "Select" --cancel-label "Back" 
-         --menu "Choose setup option:" 16 70 4)
-    options=("1" "REST API Configuration"
-             "2" "Storage VM Startup Settings"
-             "3" "Move Storage: Concurrent VM Disk Move Count"
-             "4" "Number of Proxmox VE hosts in HA cluster")
+    while true; do
+        local dialog_selected=$(mktemp)
+        
+        cmd=(dialog --keep-tite --title "Setup Configuration"
+             --ok-label "Select" --cancel-label "Back" 
+             --default-item "$last_selected_option"
+             --menu "Choose setup option:" 18 70 5)
+        options=("1" "REST API Configuration"
+                 "2" "Storage VM Startup Settings"
+                 "3" "Move Storage: Concurrent VM Disk Move Count"
+                 "4" "Number of Proxmox VE hosts in HA cluster"
+                 "5" "OODP Configuration")
 
-    dialog_menu
-    rm -f "$dialog_selected"
+        dialog_menu
+        rm -f "$dialog_selected"
 
-    case $dialog_exit_code in
-        0)  # Select
-            case "$selected_option" in
-                1)  # REST API Configuration
-                    setup_rest_api_dialog
-                    ;;
-                2)  # Storage VM Startup Settings
-                    setup_storage_vm_dialog
-                    ;;
-                3)  # Move Storage: Concurrent VM Disk Move Count
-                    setup_disk_move_dialog
-                    ;;
-                4)  # Number of Proxmox VE hosts in HA cluster
-                    setup_ha_cluster_size_dialog
-                    ;;
-            esac
-            ;;
-        1)  # Back
-            return 0
-            ;;
-    esac
+        case $dialog_exit_code in
+            0)  # Select
+                last_selected_option="$selected_option"  # Remember the selected option
+                case "$selected_option" in
+                    1)  # REST API Configuration
+                        setup_rest_api_dialog
+                        ;;
+                    2)  # Storage VM Startup Settings
+                        setup_storage_vm_dialog
+                        ;;
+                    3)  # Move Storage: Concurrent VM Disk Move Count
+                        setup_disk_move_dialog
+                        ;;
+                    4)  # Number of Proxmox VE hosts in HA cluster
+                        setup_ha_cluster_size_dialog
+                        ;;
+                    5)  # OODP Configuration
+                        setup_oodp_dialog
+                        ;;
+                esac
+                # After any setup function completes, loop back to setup menu with last option highlighted
+                ;;
+            1)  # Back
+                return 0
+                ;;
+        esac
+    done
 }
 
 # Display setup dialog for REST API configuration
@@ -5069,7 +5305,7 @@ setup_rest_api_dialog() {
     local dialog_selected=$(mktemp)
     local form_data=$(mktemp)
     local temp_user="$rest_api_user"
-    local temp_password="$rest_api_password"
+    local temp_password="${rest_api_password}"
     local temp_port="$rest_api_port"
 
     # Step 1: Get username and port
@@ -5106,9 +5342,9 @@ setup_rest_api_dialog() {
             temp_password=$(cat "$form_data")
             
             # Only update if password is not empty
-            if [ -n "$temp_password" ]; then
+            if [ -n "${temp_password}" ]; then
                 rest_api_user="$temp_user"
-                rest_api_password="$temp_password"
+                rest_api_password="${temp_password}"
                 rest_api_port="$temp_port"
 
                 log_info "User saved REST API configuration changes"
@@ -5301,7 +5537,7 @@ setup_ha_cluster_size_dialog() {
     local menu_items=()
     local i
     for ((i=2; i<=total_cluster_nodes; i++)); do
-        if [ "$i" -eq "$NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER" ]; then
+        if [ "$i" -eq "$number_of_pve_hosts_in_ha_cluster" ]; then
             menu_items+=("$i" "$i nodes (current)")
         else
             menu_items+=("$i" "$i nodes")
@@ -5320,13 +5556,145 @@ setup_ha_cluster_size_dialog() {
     case $dialog_exit_code in
         0)  # Save
             if [ -n "$selected_option" ]; then
-                NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER="$selected_option"
-                log_info "User changed HA cluster size to: $NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER hosts"
+                number_of_pve_hosts_in_ha_cluster="$selected_option"
+                log_info "User changed HA cluster size to: $number_of_pve_hosts_in_ha_cluster hosts"
                 save_config_file
-                dialog --msgbox "HA cluster size configuration saved successfully!\n\nNumber of HA hosts: $NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER" 8 60
+                dialog --msgbox "HA cluster size configuration saved successfully!\n\nNumber of HA hosts: $number_of_pve_hosts_in_ha_cluster" 8 60
             fi
             ;;
         1)  # Back
+            ;;
+    esac
+    
+    return 0
+}
+
+# Display setup dialog for OODP configuration
+setup_oodp_dialog() {
+    local last_selected_option="1"  # Default to first option initially
+    
+    while true; do
+        local dialog_selected=$(mktemp)
+        
+        cmd=(dialog --keep-tite --title "OODP Configuration"
+             --ok-label "Select" --cancel-label "Back" 
+             --default-item "$last_selected_option"
+             --menu "Choose OODP setting to configure:" 14 70 3)
+        options=("1" "Backup Destination Port (Current: ${oodp_backup_destination_port:-40000})"
+                 "2" "Source Default Plan"
+                 "3" "Destination Default Plan")
+        
+        dialog_menu
+        rm -f "$dialog_selected"
+        
+        case $dialog_exit_code in
+            0)  # Select
+                last_selected_option="$selected_option"  # Remember the selected option
+                case "$selected_option" in
+                    1)  # Backup Destination Port
+                        setup_oodp_port_dialog
+                        ;;
+                    2)  # Source Default Plan
+                        setup_oodp_src_plan_dialog
+                        ;;
+                    3)  # Destination Default Plan
+                        setup_oodp_dst_plan_dialog
+                        ;;
+                esac
+                # After any OODP setup function completes, loop back to OODP setup menu with last option highlighted
+                ;;
+            1)  # Back
+                return 0
+                ;;
+        esac
+    done
+}
+
+# Setup OODP backup destination port
+setup_oodp_port_dialog() {
+    local temp_input=$(mktemp)
+    local current_port="${oodp_backup_destination_port:-40000}"
+    
+    dialog --keep-tite --title "OODP Backup Destination Port" \
+           --inputbox "Enter the OODP backup destination port:\n\nThis port is used for communication with backup/DR nodes.\n\nDefault: 40000" 12 60 "$current_port" 2>"$temp_input"
+    
+    local result=$?
+    local new_port=$(< "$temp_input")
+    rm -f "$temp_input"
+    
+    case $result in
+        0)  # OK
+            # Validate port number
+            if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ $new_port -ge 1 && $new_port -le 65535 ]]; then
+                oodp_backup_destination_port="$new_port"
+                log_info "User changed OODP backup destination port to: $oodp_backup_destination_port"
+                save_config_file
+                dialog --msgbox "OODP backup destination port saved successfully!\n\nPort: $oodp_backup_destination_port" 8 60
+            else
+                dialog --msgbox "Invalid port number!\n\nPort must be between 1 and 65535." 8 60
+            fi
+            ;;
+        1)  # Cancel
+            ;;
+    esac
+    
+    return 0
+}
+
+# Setup OODP source default plan
+setup_oodp_src_plan_dialog() {
+    local temp_input=$(mktemp)
+    local current_plan="${oodp_src_default_plan:-1hour=>1minute,3days=>15minutes,2weeks=>1hour}"
+    
+    dialog --keep-tite --title "OODP Source Default Plan" \
+           --inputbox "Enter the OODP source default plan:\n\nFormat: retention=>interval,retention=>interval,...\nExample: 1hour=>1minute,3days=>15minutes,2weeks=>1hour\n\nThis defines the snapshot schedule for source datasets." 14 70 "$current_plan" 2>"$temp_input"
+    
+    local result=$?
+    local new_plan=$(< "$temp_input")
+    rm -f "$temp_input"
+    
+    case $result in
+        0)  # OK
+            if [[ -n "$new_plan" ]]; then
+                oodp_src_default_plan="$new_plan"
+                log_info "User changed OODP source default plan to: $oodp_src_default_plan"
+                save_config_file
+                dialog --msgbox "OODP source default plan saved successfully!\n\nPlan: $oodp_src_default_plan" 10 70
+            else
+                dialog --msgbox "Plan cannot be empty!" 8 60
+            fi
+            ;;
+        1)  # Cancel
+            ;;
+    esac
+    
+    return 0
+}
+
+# Setup OODP destination default plan
+setup_oodp_dst_plan_dialog() {
+    local temp_input=$(mktemp)
+    local current_plan="${oodp_dst_default_plan:-12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months}"
+    
+    dialog --keep-tite --title "OODP Destination Default Plan" \
+           --inputbox "Enter the OODP destination default plan:\n\nFormat: retention=>interval,retention=>interval,...\nExample: 12hours=>5minute,1week=>15minutes,3weeks=>1hour\n\nThis defines the retention policy for backup destinations." 14 70 "$current_plan" 2>"$temp_input"
+    
+    local result=$?
+    local new_plan=$(< "$temp_input")
+    rm -f "$temp_input"
+    
+    case $result in
+        0)  # OK
+            if [[ -n "$new_plan" ]]; then
+                oodp_dst_default_plan="$new_plan"
+                log_info "User changed OODP destination default plan to: $oodp_dst_default_plan"
+                save_config_file
+                dialog --msgbox "OODP destination default plan saved successfully!\n\nPlan: $oodp_dst_default_plan" 10 70
+            else
+                dialog --msgbox "Plan cannot be empty!" 8 60
+            fi
+            ;;
+        1)  # Cancel
             ;;
     esac
     
@@ -5425,7 +5793,10 @@ storage_vm_startup_deleay=${storage_vm_startup_deleay:-300}
 storage_vm_shutdown_timeout=${storage_vm_shutdown_timeout:-180}
 storage_vm_boot_order=${storage_vm_boot_order:-scsi0}
 concurrent_vm_disk_move_count=${concurrent_vm_disk_move_count:-2}
-NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER=${NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER:-2}
+number_of_pve_hosts_in_ha_cluster=${number_of_pve_hosts_in_ha_cluster:-2}
+oodp_backup_destination_port=${oodp_backup_destination_port:-40000}
+oodp_src_default_plan='${oodp_src_default_plan:-1hour=>1minute,3days=>15minutes,2weeks=>1hour}'
+oodp_dst_default_plan='${oodp_dst_default_plan:-12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months}'
 EOF
     log_info "Configuration saved to $CONFIG_FILE"
 }
@@ -7878,7 +8249,9 @@ selected_pool_index=""
 selected_dataset_index=""
 selected_snapshot_index=""
 nfs_current_step=1
-nfs_total_steps=5
+nfs_total_steps=6
+oodp_destinations_json=""
+oodp_destination_datasets=()
 
 # Helper function to check for REST API authentication failures
 # Returns: 0 if authenticated successfully, 1 if authentication failed, 2 for other errors
@@ -7922,7 +8295,7 @@ rest_api_connection_test() {
     local url="https://$selected_nfs_ip:$rest_api_port/api/v4/conn_test"
     log_debug "rest_api_connection_test: Full URL: $url"
     
-    response=$(curl -k -s --connect-timeout 2 --max-time 5 -w "\n%{http_code}" -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s --connect-timeout 2 --max-time 5 -w "\n%{http_code}" -u "${rest_api_user}:${rest_api_password}" \
         "$url" 2>&1)
     local curl_exit=$?
     
@@ -7968,7 +8341,7 @@ get_jovian_product_info() {
     local url="https://$ip:$rest_api_port/api/v4/product"
     log_debug "get_jovian_product_info: Full URL: $url"
     
-    response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 2 --max-time 5 -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 2 --max-time 5 -u "${rest_api_user}:${rest_api_password}" \
         "$url" 2>&1)
     local curl_exit=$?
     
@@ -7988,6 +8361,15 @@ get_jovian_product_info() {
         log_debug "get_jovian_product_info: Successfully got product info for $ip"
         echo "$body"
         return 0
+    elif [[ "$status" == "401" ]]; then
+        log_error "get_jovian_product_info: Authentication failed for server $ip (HTTP 401)"
+        log_error "get_jovian_product_info: Please check REST API credentials in /etc/pve-tools/config.conf"
+        log_error "get_jovian_product_info: Verify rest_api_user and rest_api_password are correct"
+        return 1
+    elif [[ "$status" == "403" ]]; then
+        log_error "get_jovian_product_info: Access forbidden for server $ip (HTTP 403)"
+        log_error "get_jovian_product_info: The REST API user may not have sufficient permissions"
+        return 1
     else
         log_info "get_jovian_product_info: Server $ip returned HTTP $status (may be disconnected or unreachable)"
         return 1
@@ -8245,7 +8627,15 @@ EOF
             echo "node_role=$existing_node_role" >> "$info_file"
             log_debug "attempt_reconnect_ip: Preserved role '$existing_node_role' for failed reconnection to IP '$ip'"
         fi
-        log_info "Failed to reconnect to IP $ip"
+        
+        # More specific error message based on what failed
+        # Check if it was an authentication issue by checking the last log messages
+        if grep -q "Authentication failed" /var/log/pve-tools/pve-tools.log 2>/dev/null | tail -n 5; then
+            log_error "Failed to reconnect to IP $ip: Authentication failed"
+            log_error "Please verify REST API credentials in /etc/pve-tools/config.conf"
+        else
+            log_info "Failed to reconnect to IP $ip: Server may be offline or unreachable"
+        fi
         return 1
     fi
 }
@@ -8679,7 +9069,7 @@ get_pool_names() {
         return 1
     fi
 
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
         "https://$addr:$rest_api_port/api/v4/pools")
 
     local curl_exit=$?
@@ -8712,10 +9102,11 @@ except Exception:
 
 get_datasets_in_pool() {
     local pool_name="$1"
+    local nfs_ip="${2:-$selected_nfs_ip}"  # Use provided IP or default to selected_nfs_ip
     local response
 
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes")
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
+        "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes")
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
@@ -8750,7 +9141,7 @@ get_snapshots_in_dataset() {
     local dataset_name="$2"
     local response
 
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
 
     local curl_exit=$?
@@ -8796,7 +9187,7 @@ get_snapshots_with_times() {
     local dataset_name="$2"
     local response
 
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
 
     local curl_exit=$?
@@ -9158,6 +9549,9 @@ nfs_step1_select_ip() {
                     # Prompt for node role selection
                     select_node_role "$input_ip"
                     log_info "nfs_step1_select_ip: Role selection completed for IP '$input_ip'"
+                    
+                    # Return to step 1 to allow selection of the newly added IP
+                    return 2  # Retry same step
                 fi
                 return 0
             elif [[ "${ips[selected_option]}" == "Manage custom IPs" ]]; then
@@ -9184,8 +9578,20 @@ nfs_step1_select_ip() {
                         
                         return 0
                     else
-                        # Reconnection failed
-                        dialog --msgbox "Failed to connect to $selected_nfs_ip\n\nThe storage server appears to be offline or unreachable.\nReturning to IP selection menu." 10 60
+                        # Reconnection failed - check if it was authentication
+                        local error_msg="Failed to connect to $selected_nfs_ip\n\n"
+                        if grep -q "Authentication failed" /var/log/pve-tools/pve-tools.log 2>/dev/null | tail -n 5; then
+                            error_msg="${error_msg}Authentication failed (HTTP 401)\n\n"
+                            error_msg="${error_msg}Please check REST API credentials in Main Menu -> Setup\n\n"
+                        elif grep -q "Access forbidden" /var/log/pve-tools/pve-tools.log 2>/dev/null | tail -n 5; then
+                            error_msg="${error_msg}Access forbidden (HTTP 403)\n\n"
+                            error_msg="${error_msg}The REST API user may not have sufficient permissions.\n\n"
+                        else
+                            error_msg="${error_msg}The storage server appears to be offline or unreachable.\n\n"
+                        fi
+                        error_msg="${error_msg}Returning to IP selection menu."
+                        
+                        dialog --msgbox "$error_msg" 12 65
                         return 2  # Retry same step
                     fi
                 fi
@@ -9342,7 +9748,7 @@ nfs_step4_select_snapshot() {
     done < <(get_snapshots_with_times "$selected_pool" "$selected_dataset")
 
     if [ "${#snapshots[@]}" -eq 0 ]; then
-        dialog --msgbox "No snapshots found in dataset $selected_dataset" 8 50
+        dialog --msgbox "No snapshots found in dataset $selected_dataset\n\nPool: $selected_pool\nDataset: $selected_dataset" 10 60
         return 2  # Go back
     fi
 
@@ -9435,7 +9841,7 @@ extract_timestamp_from_snapname() {
         echo "${day_part}-${hourmin}"
     else
         local response
-        response=$(curl -k -s --connect-timeout 5 --max-time 10 -X GET -u "$rest_api_user:$rest_api_password" -H 'Content-Type: application/json' \
+        response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
             "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
         local curl_exit=$?
         if [[ $curl_exit -ne 0 ]]; then
@@ -9504,7 +9910,7 @@ create_clone_from_snapshot() {
     local json_input="{\"name\": \"${clone_name}\"}"
 
     local response
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots/$snapshot_name/clones")
@@ -9552,7 +9958,7 @@ EOF
 )
 
     local response
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X POST -u "$rest_api_user:$rest_api_password" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/shares")
@@ -9805,8 +10211,8 @@ handle_existing_clone_dialog() {
     
     local message="A clone with the name '$existing_clone' already exists.\n\n"
     message+="Would you like to:\n"
-    message+="• Create another clone with name '$proposed_clone'\n"
-    message+="• Go back to select a different snapshot\n\n"
+    message+="  * Create another clone with name '$proposed_clone'\n"
+    message+="  * Go back to select a different snapshot\n\n"
     message+="Current clone: $existing_clone\n"
     message+="Proposed name: $proposed_clone"
     
@@ -9823,7 +10229,7 @@ perform_clone_and_setup() {
     local actual_clone_name="$clone_name"
 
     # Show progress
-    dialog --title "Processing..." --infobox "Creating clone: $clone_name..." 6 50
+    dialog --title "Creating Clone" --infobox "Creating clone from snapshot:\nPool: $selected_pool\nDataset: $selected_dataset\nSnapshot: $selected_snapshot\nClone: $clone_name" 12 70
     sleep 1
 
     # Try to create the clone
@@ -9843,11 +10249,11 @@ perform_clone_and_setup() {
         if handle_existing_clone_dialog "$clone_name" "$new_clone_name"; then
             # User chose to continue with new name
             actual_clone_name="$new_clone_name"
-            dialog --title "Processing..." --infobox "Creating clone: $actual_clone_name..." 6 50
+            dialog --title "Creating Clone" --infobox "Creating clone with new name:\nPool: $selected_pool\nDataset: $selected_dataset\nSnapshot: $selected_snapshot\nClone: $actual_clone_name" 12 70
             sleep 1
             
             if ! create_clone_from_snapshot "$selected_pool" "$selected_dataset" "$selected_snapshot" "$actual_clone_name"; then
-                dialog --msgbox "Failed to create clone with new name!" 8 40
+                dialog --msgbox "Failed to create clone with new name!\n\nPool: $selected_pool\nDataset: $selected_dataset\nSnapshot: $selected_snapshot\nClone: $actual_clone_name" 12 60
                 return 1
             fi
         else
@@ -9856,7 +10262,7 @@ perform_clone_and_setup() {
         fi
     elif [[ $create_result -ne 0 ]]; then
         # Other error occurred
-        dialog --msgbox "Failed to create clone!" 8 40
+        dialog --msgbox "Failed to create clone!\n\nPool: $selected_pool\nDataset: $selected_dataset\nSnapshot: $selected_snapshot\nClone: $clone_name" 12 60
         return 1
     fi
     
@@ -9902,7 +10308,7 @@ perform_clone_and_setup() {
 
     set_readonly_conf_files "$clone_name"
 
-    dialog --msgbox "Clone and NFS setup completed successfully!\n\nClone: $clone_name\nNFS Share: $clone_name\nProxmox VE Storage: $clone_name" 10 60
+    dialog --msgbox "Clone and NFS setup completed successfully!\n\nPool: $selected_pool\nDataset: $selected_dataset\nSnapshot: $selected_snapshot\nClone: $clone_name\nNFS Share: $clone_name\nProxmox VE Storage: $clone_name" 14 70
 }
 
 add_nfs_storage_wizard() {
@@ -10028,12 +10434,16 @@ add_new_nfs_storage_wizard() {
     selected_pool_index=""
     selected_dataset_index=""
     nfs_new_current_step=1
-    nfs_new_total_steps=5
+    nfs_new_total_steps=6
+    oodp_destinations_json=""
+    oodp_destination_datasets=()
     
     log_debug "add_new_nfs_storage_wizard: Reset wizard variables"
     
     while true; do
         log_debug "add_new_nfs_storage_wizard: Entering while loop, current step: $nfs_new_current_step"
+        log_debug "add_new_nfs_storage_wizard: selected_dataset_option='$selected_dataset_option'"
+        log_debug "add_new_nfs_storage_wizard: oodp_destinations_json='$oodp_destinations_json'"
         case $nfs_new_current_step in
             1)
                 log_debug "add_new_nfs_storage_wizard: About to call nfs_step1_select_ip"
@@ -10076,11 +10486,7 @@ add_new_nfs_storage_wizard() {
                 nfs_new_step3_dataset_choice
                 case $? in
                     0)  # Next
-                        if [[ "$selected_dataset_option" == "create" ]]; then
-                            nfs_new_current_step=4  # Go to create dataset
-                        else
-                            nfs_new_current_step=5  # Go to select existing dataset
-                        fi
+                        nfs_new_current_step=4  # Go to dataset handling (create or select)
                         ;;
                     1)  # Back to Main
                         return
@@ -10091,35 +10497,55 @@ add_new_nfs_storage_wizard() {
                 esac
                 ;;
             4)
-                nfs_new_step4a_create_dataset
-                case $? in
+                log_debug "add_new_nfs_storage_wizard: Step 4 - Dataset handling"
+                # Handle dataset creation or selection based on user choice
+                if [[ "$selected_dataset_option" == "create" ]]; then
+                    log_debug "add_new_nfs_storage_wizard: Calling nfs_new_step4a_create_dataset"
+                    nfs_new_step4a_create_dataset
+                else
+                    log_debug "add_new_nfs_storage_wizard: Calling nfs_new_step4b_select_dataset"
+                    nfs_new_step4b_select_dataset
+                fi
+                local step4_result=$?
+                log_debug "add_new_nfs_storage_wizard: Step 4 returned: $step4_result"
+                case $step4_result in
                     0)  # Next
-                        nfs_new_current_step=6  # Go to summary
+                        log_debug "add_new_nfs_storage_wizard: Moving to step 5 (OODP destinations)"
+                        nfs_new_current_step=5  # Go to OODP destinations
                         ;;
                     1)  # Back to Main
+                        log_debug "add_new_nfs_storage_wizard: User wants back to main from step 4"
                         return
                         ;;
                     2)  # Back
+                        log_debug "add_new_nfs_storage_wizard: Going back to step 3 from step 4"
                         nfs_new_current_step=3
                         ;;
                 esac
                 ;;
             5)
-                nfs_new_step4b_select_dataset
-                case $? in
+                log_debug "add_new_nfs_storage_wizard: Step 5 - OODP destinations"
+                nfs_new_step5_oodp_destinations
+                local step5_result=$?
+                log_debug "add_new_nfs_storage_wizard: Step 5 returned: $step5_result"
+                case $step5_result in
                     0)  # Next
+                        log_debug "add_new_nfs_storage_wizard: Moving to step 6 (summary)"
                         nfs_new_current_step=6  # Go to summary
                         ;;
                     1)  # Back to Main
+                        log_debug "add_new_nfs_storage_wizard: User wants back to main from step 5"
                         return
                         ;;
                     2)  # Back
-                        nfs_new_current_step=3
+                        log_debug "add_new_nfs_storage_wizard: Going back to step 4 from step 5"
+                        nfs_new_current_step=4
                         ;;
                 esac
                 ;;
             6)
-                nfs_new_step5_summary
+                log_debug "add_new_nfs_storage_wizard: Step 6 - Summary"
+                nfs_new_step6_summary
                 case $? in
                     0)  # Apply
                         perform_new_nfs_setup
@@ -10233,7 +10659,7 @@ nfs_new_step4a_create_dataset() {
     next_number=$(find_next_dataset_number "$selected_pool")
     
     if [[ $? -ne 0 ]]; then
-        dialog --msgbox "Failed to determine next dataset number!" 8 50
+        dialog --msgbox "Failed to determine next dataset number!\n\nPool: $selected_pool" 10 60
         return 2  # Go back
     fi
     
@@ -10318,8 +10744,226 @@ nfs_new_step4b_select_dataset() {
     esac
 }
 
-# Step 5: Summary and Confirmation
-nfs_new_step5_summary() {
+# Step 5: Configure OODP Backup Destinations
+nfs_new_step5_oodp_destinations() {
+    log_debug "nfs_new_step5_oodp_destinations: Starting OODP destinations configuration"
+    local backup_servers=()
+    local destinations=()
+    
+    # Get list of backup-dr-node servers
+    log_debug "nfs_new_step5_oodp_destinations: Calling get_backup_dr_servers"
+    while IFS= read -r server; do
+        [[ -n "$server" ]] && backup_servers+=("$server")
+    done < <(get_backup_dr_servers)
+    
+    log_debug "nfs_new_step5_oodp_destinations: Found ${#backup_servers[@]} backup servers: ${backup_servers[*]}"
+    
+    if [[ ${#backup_servers[@]} -eq 0 ]]; then
+        # No backup servers available, skip to summary
+        log_info "No backup-dr-node servers found, skipping destination configuration"
+        oodp_destinations_json=""
+        oodp_destination_datasets=()
+        return 0
+    fi
+    
+    # Ask if user wants to configure backup destinations
+    dialog --keep-tite --title "Step 5/$nfs_new_total_steps: OODP Backup Configuration" \
+           --yes-label "Configure" --no-label "Skip" \
+           --yesno "Found ${#backup_servers[@]} backup/DR server(s) available.\n\nDo you want to configure OODP backup destinations now?\n\n(You can also configure them later in JovianDSS GUI)" 12 65
+    
+    if [[ $? -ne 0 ]]; then
+        # User chose to skip
+        log_info "User skipped OODP backup destination configuration"
+        oodp_destinations_json=""
+        oodp_destination_datasets=()
+        return 0
+    fi
+    
+    # Collect destinations for each backup server
+    local dst_plan="${oodp_dst_default_plan:-12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months}"
+    local port="${oodp_backup_destination_port:-40000}"
+    
+    for backup_ip in "${backup_servers[@]}"; do
+        # Show server selection dialog
+        dialog --keep-tite --title "Configure Backup Destination" \
+               --yes-label "Configure" --no-label "Skip" \
+               --yesno "Configure backup destination on server:\n$backup_ip?" 10 60
+        
+        if [[ $? -ne 0 ]]; then
+            continue  # Skip this server
+        fi
+        
+        # Check if this destination needs to be registered (requires web GUI password)
+        log_info "nfs_new_step5_oodp_destinations: Checking if destination $backup_ip:$port needs registration"
+        if ! check_odp_destination_registered "$backup_ip" "$port" "$selected_nfs_ip"; then
+            log_info "nfs_new_step5_oodp_destinations: Destination $backup_ip:$port not registered, need web GUI password"
+            
+            # Prompt for storage server web GUI password
+            local temp_password=$(mktemp)
+            dialog --keep-tite --title "Backup Server Authentication" \
+                   --passwordbox "To register backup server $backup_ip, please provide the WEB GUI password for that server:" 12 70 2>"$temp_password"
+            local dialog_result=$?
+            
+            if [[ $dialog_result -ne 0 ]]; then
+                rm -f "$temp_password"
+                log_info "nfs_new_step5_oodp_destinations: User cancelled password input for $backup_ip"
+                continue  # Skip this server
+            fi
+            
+            storage_server_web_gui_password=$(< "$temp_password")
+            rm -f "$temp_password"
+            
+            if [[ -z "$storage_server_web_gui_password" ]]; then
+                dialog --title "Password Required" --msgbox "Web GUI password is required to register backup server.\n\nSkipping server $backup_ip" 10 60
+                log_error "nfs_new_step5_oodp_destinations: Empty password provided for $backup_ip"
+                continue  # Skip this server
+            fi
+            
+            log_info "nfs_new_step5_oodp_destinations: Web GUI password provided for $backup_ip (length: ${#storage_server_web_gui_password})"
+            
+            # NOW register the ODP destination immediately
+            log_info "nfs_new_step5_oodp_destinations: Registering ODP destination $backup_ip:$port now..."
+            dialog --title "Registering Backup Server" --infobox "Registering backup server $backup_ip...\n\nThis may take up to 90 seconds." 8 60
+            
+            if register_odp_destination_node "$backup_ip" "$port" "$selected_nfs_ip" "Backup DR Node for backup operations"; then
+                log_info "nfs_new_step5_oodp_destinations: ODP destination $backup_ip:$port registered successfully"
+                dialog --title "Registration Complete" --infobox "Backup server $backup_ip registered successfully!" 6 60
+                sleep 2
+            else
+                log_error "nfs_new_step5_oodp_destinations: Failed to register ODP destination $backup_ip:$port"
+                dialog --title "Registration Failed" --msgbox "Failed to register backup server $backup_ip!\n\nCheck logs for details.\nYou may need to register manually in JovianDSS GUI." 10 60
+                continue  # Skip this server
+            fi
+        else
+            log_info "nfs_new_step5_oodp_destinations: Destination $backup_ip:$port already registered, no password needed"
+        fi
+        
+        # Get pools from backup server
+        local backup_pools=()
+        while IFS= read -r pool; do
+            [[ -n "$pool" ]] && backup_pools+=("$pool")
+        done < <(get_pools "$backup_ip" 2>/dev/null | grep -v "^$")
+        
+        if [[ ${#backup_pools[@]} -eq 0 ]]; then
+            dialog --msgbox "No pools found on backup server $backup_ip" 8 60
+            continue
+        fi
+        
+        # Select pool on backup server
+        local menu_items=()
+        for ((i=0; i<${#backup_pools[@]}; i++)); do
+            menu_items+=("$i" "${backup_pools[i]}")
+        done
+        
+        local dialog_selected=$(mktemp)
+        cmd=(dialog --keep-tite --title "Select Backup Pool"
+             --ok-label "Select" --cancel-label "Skip"
+             --menu "Choose pool on backup server $backup_ip:" 15 60 7)
+        options=("${menu_items[@]}")
+        
+        dialog_menu
+        local result=$dialog_exit_code
+        rm -f "$dialog_selected"
+        
+        if [[ $result -ne 0 ]]; then
+            continue  # Skip this server
+        fi
+        
+        local selected_backup_pool="${backup_pools[selected_option]}"
+        
+        # Ask for dataset creation choice
+        local backup_dataset=""
+        dialog --keep-tite --title "Backup Dataset" \
+               --yes-label "Create New" --no-label "Select Existing" \
+               --yesno "Create new dataset for backup destination or select existing?\n\nPool: $selected_backup_pool" 10 60
+        
+        if [[ $? -eq 0 ]]; then
+            # Create new dataset with -backup suffix
+            backup_dataset="${selected_dataset}-backup"
+            log_info "Will create backup dataset: $backup_dataset on $backup_ip"
+        else
+            # Select existing dataset
+            local backup_datasets=()
+            while IFS= read -r dataset; do
+                [[ -n "$dataset" ]] && backup_datasets+=("$dataset")
+            done < <(get_datasets_in_pool "$selected_backup_pool" "$backup_ip" 2>/dev/null | grep -v "^$")
+            
+            if [[ ${#backup_datasets[@]} -eq 0 ]]; then
+                dialog --msgbox "No datasets found in pool $selected_backup_pool" 8 60
+                continue
+            fi
+            
+            # Build menu for existing datasets
+            menu_items=()
+            for ((i=0; i<${#backup_datasets[@]}; i++)); do
+                menu_items+=("$i" "${backup_datasets[i]}")
+            done
+            
+            dialog_selected=$(mktemp)
+            cmd=(dialog --keep-tite --title "Select Backup Dataset"
+                 --ok-label "Select" --cancel-label "Skip"
+                 --menu "Choose dataset for backup destination:" 15 60 7)
+            options=("${menu_items[@]}")
+            
+            dialog_menu
+            result=$dialog_exit_code
+            rm -f "$dialog_selected"
+            
+            if [[ $result -ne 0 ]]; then
+                continue  # Skip this server
+            fi
+            
+            backup_dataset="${backup_datasets[selected_option]}"
+        fi
+        
+        # Add this destination to the list
+        local destination_entry="{\"plan\": \"$dst_plan\", \"dataset\": \"${backup_ip}:${port}/${selected_backup_pool}/${backup_dataset}\"}"
+        destinations+=("$destination_entry")
+        
+        # ALSO store dataset info separately for dataset creation (without port!)
+        oodp_destination_datasets+=("${backup_ip}|${selected_backup_pool}|${backup_dataset}")
+        
+        log_info "nfs_new_step5_oodp_destinations: Added backup destination: ${backup_ip}:${port}/${selected_backup_pool}/${backup_dataset}"
+        log_debug "nfs_new_step5_oodp_destinations: Destination entry JSON: $destination_entry"
+        log_debug "nfs_new_step5_oodp_destinations: Dataset creation info: ${backup_ip}|${selected_backup_pool}|${backup_dataset}"
+        log_debug "nfs_new_step5_oodp_destinations: DEBUG - backup_ip='$backup_ip', port='$port', selected_backup_pool='$selected_backup_pool', backup_dataset='$backup_dataset'"
+    done
+    
+    # Build JSON array of destinations
+    if [[ ${#destinations[@]} -gt 0 ]]; then
+        log_info "nfs_new_step5_oodp_destinations: Building JSON array from ${#destinations[@]} destinations"
+        oodp_destinations_json="["
+        for ((i=0; i<${#destinations[@]}; i++)); do
+            if [[ $i -gt 0 ]]; then
+                oodp_destinations_json+=", "
+            fi
+            oodp_destinations_json+="${destinations[i]}"
+            log_debug "nfs_new_step5_oodp_destinations: Added destination $((i+1)): ${destinations[i]}"
+        done
+        oodp_destinations_json+="]"
+        log_info "nfs_new_step5_oodp_destinations: Final OODP destinations JSON: $oodp_destinations_json"
+        
+        # Log pretty-printed JSON for debugging
+        log_debug "=== FINAL DESTINATIONS JSON (PRETTY-PRINTED) ==="
+        if command -v python3 >/dev/null 2>&1; then
+            echo "$oodp_destinations_json" | python3 -m json.tool 2>/dev/null | while IFS= read -r line; do
+                log_debug "  $line"
+            done || log_debug "  (Could not pretty-print JSON)"
+        else
+            log_debug "  $oodp_destinations_json"
+        fi
+        log_debug "================================================"
+    else
+        oodp_destinations_json=""
+        oodp_destination_datasets=()
+        log_info "nfs_new_step5_oodp_destinations: No OODP backup destinations configured"
+    fi
+    
+    return 0
+}
+
+# Step 6: Summary and Confirmation (was Step 5)
+nfs_new_step6_summary() {
     # Generate storage name
     new_storage_name=$(find_next_storage_name)
     
@@ -10344,19 +10988,42 @@ nfs_new_step5_summary() {
     summary+="PVE Storage Name: $new_storage_name\n"
     
     summary+="\n--- OODP AUTO-SNAPSHOT CONFIGURATION ---\n"
-    summary+="Schedule: 1hr=>1min, 3days=>15min, 2weeks=>1hr\n"
-    summary+="Note: OODP backup destinations must be\n"
-    summary+="      configured in JovianDSS GUI\n\n"
-    summary+="Do you want to proceed with this configuration?"
+    local src_plan="${oodp_src_default_plan:-1hour=>1minute,3days=>15minutes,2weeks=>1hour}"
+    summary+="Source Schedule: $src_plan\n"
     
-    # Adjust dialog height based on whether creating new dataset
-    local dialog_height=23
-    if [[ "$selected_dataset_option" == "create" ]]; then
-        dialog_height=25
+    # Show backup destinations if configured
+    if [[ -n "$oodp_destinations_json" ]]; then
+        summary+="\n--- OODP BACKUP DESTINATIONS ---\n"
+        # Parse destinations from JSON for display
+        local dest_count=$(echo "$oodp_destinations_json" | grep -o '"dataset"' | wc -l)
+        summary+="Configured destinations: $dest_count\n"
+        
+        # Extract destination info for display (simplified parsing)
+        local dest_info=$(echo "$oodp_destinations_json" | sed -n 's/.*"dataset"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+        if [[ -n "$dest_info" ]]; then
+            while IFS= read -r dest; do
+                [[ -n "$dest" ]] && summary+="  * $dest\n"
+            done <<< "$dest_info"
+        fi
+        
+        # Also show destination plan
+        local dest_plan="${oodp_dst_default_plan:-12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months}"
+        summary+="Destination Schedule: $dest_plan\n"
+    else
+        summary+="Backup destinations: Not configured\n"
+        summary+="Note: Can be configured later in JovianDSS GUI\n"
     fi
-    local dialog_width=65
     
-    dialog --keep-tite --title "Step 5/$nfs_new_total_steps: Confirm Configuration" \
+    summary+="\nDo you want to proceed with this configuration?"
+    
+    # Adjust dialog height based on content
+    local dialog_height=25
+    if [[ -n "$oodp_destinations_json" ]]; then
+        dialog_height=28
+    fi
+    local dialog_width=70
+    
+    dialog --keep-tite --title "Step 6/$nfs_new_total_steps: Confirm Configuration" \
            --yes-label "Apply" --no-label "Back" \
            --yesno "$summary" $dialog_height $dialog_width    
     case $? in
@@ -10369,35 +11036,183 @@ nfs_new_step5_summary() {
     esac
 }
 
-# Perform the actual setup of new NFS storage
+# Perform the actual setup of new NFS storage with correct sequence
 perform_new_nfs_setup() {
-    log_info "Starting NFS storage setup"
+    log_info "Starting NFS storage setup with new sequence: destinations -> source -> ODP -> PVE"
     
-    # Step 1: Create dataset if needed
+    # STEP 1: Create DESTINATION datasets FIRST (fail fast if any fail)
+    if [[ -n "$oodp_destinations_json" ]]; then
+        log_info "perform_new_nfs_setup: STEP 1 - Creating destination datasets"
+        log_debug "perform_new_nfs_setup: Destinations JSON: '$oodp_destinations_json'"
+        
+        if ! create_destination_datasets; then
+            log_error "perform_new_nfs_setup: STEP 1 FAILED - Destination dataset creation failed, stopping process"
+            return 1  # Error dialog already shown by create_destination_datasets
+        fi
+        
+        log_info "perform_new_nfs_setup: STEP 1 SUCCESS - All destination datasets created"
+    else
+        log_info "perform_new_nfs_setup: STEP 1 SKIPPED - No destinations configured"
+    fi
+    
+    # STEP 2: Create SOURCE dataset + NFS share
+    log_info "perform_new_nfs_setup: STEP 2 - Creating source dataset and NFS share"
+    
     if [[ "$selected_dataset_option" == "create" ]]; then
-        dialog --title "Processing..." --infobox "Creating dataset: $new_dataset_name..." 6 50
-        sleep 1
+        log_info "perform_new_nfs_setup: Creating SOURCE dataset pool_name='$selected_pool' dataset_name='$new_dataset_name' on server='$selected_nfs_ip'"
+        dialog --title "Creating SOURCE Dataset" --infobox "Creating SOURCE dataset:\nServer: $selected_nfs_ip\nPool: $selected_pool\nDataset: $new_dataset_name" 10 70
         
         if ! create_dataset "$selected_pool" "$new_dataset_name"; then
-            dialog --msgbox "Failed to create dataset!" 8 40
+            log_error "perform_new_nfs_setup: STEP 2 FAILED - SOURCE dataset creation failed"
+            dialog --title "SOURCE Dataset Creation Failed" --msgbox \
+"Failed to create SOURCE dataset!\n\n\
+SERVER: $selected_nfs_ip\n\
+POOL: $selected_pool\n\
+DATASET: $new_dataset_name\n\n\
+SUMMARY:\n\
+Destination datasets: CREATED\n\
+Source dataset: FAILED\n\
+PVE storage: NOT CREATED\n\n\
+Please check server connectivity and credentials.\n\
+Check logs for detailed error information." \
+18 70
             return 1
         fi
         
+        log_info "perform_new_nfs_setup: SOURCE dataset created SUCCESS pool_name='$selected_pool' dataset_name='$new_dataset_name'"
         selected_dataset="$new_dataset_name"
     fi
     
-    # Step 2: Create NFS share
-    dialog --title "Processing..." --infobox "Creating NFS share..." 6 50
-    sleep 1
+    # Create NFS share for source dataset
+    dialog --title "Creating SOURCE NFS Share" --infobox "Creating NFS share for source dataset...\nServer: $selected_nfs_ip\nPool: $selected_pool\nDataset: $selected_dataset" 10 70
     
     if ! create_nfs_share_for_dataset "$selected_pool" "$selected_dataset"; then
-        dialog --msgbox "Failed to create NFS share!" 8 40
+        log_error "perform_new_nfs_setup: STEP 2 FAILED - SOURCE NFS share creation failed"
+        dialog --title "SOURCE NFS Share Creation Failed" --msgbox \
+"Failed to create SOURCE NFS share!\n\n\
+SERVER: $selected_nfs_ip\n\
+POOL: $selected_pool\n\
+DATASET: $selected_dataset\n\n\
+SUMMARY:\n\
+Destination datasets: CREATED\n\
+Source dataset: CREATED\n\
+Source NFS share: FAILED\n\
+PVE storage: NOT CREATED\n\n\
+Please check server NFS configuration.\n\
+Check logs for detailed error information." \
+18 70
         return 1
     fi
     
-    # Step 3: Add storage to Proxmox VE
-    dialog --title "Processing..." --infobox "Adding storage to Proxmox VE..." 6 50
-    sleep 1
+    log_info "perform_new_nfs_setup: STEP 2 SUCCESS - Source dataset and NFS share created"
+    dialog --title "Success" --infobox "SOURCE dataset and NFS share created successfully!\nServer: $selected_nfs_ip\nPool: $selected_pool\nDataset: $selected_dataset" 8 70
+    sleep 2
+    
+    # STEP 3: Register ODP destination nodes if needed (before ODP task creation)
+    if [[ -n "$oodp_destinations_json" ]]; then
+        log_info "perform_new_nfs_setup: STEP 3 - Registering ODP destination nodes"
+        dialog --title "Registering ODP Destinations" --infobox "Registering backup destination servers..." 8 60
+        
+        local registration_failed=false
+        for dest_info in "${oodp_destination_datasets[@]}"; do
+            # Parse format: IP|POOL|DATASET
+            IFS='|' read -r dst_ip dst_pool dst_dataset <<< "$dest_info"
+            
+            if [[ -z "$dst_ip" ]]; then
+                log_error "perform_new_nfs_setup: STEP 3 - Invalid destination info: $dest_info"
+                continue
+            fi
+            
+            local dst_port="${oodp_backup_destination_port:-40000}"
+            
+            # Check if destination is already registered
+            log_info "perform_new_nfs_setup: Checking ODP registration for destination $dst_ip:$dst_port"
+            if check_odp_destination_registered "$dst_ip" "$dst_port" "$selected_nfs_ip"; then
+                log_info "perform_new_nfs_setup: ODP destination already registered: $dst_ip:$dst_port"
+            else
+                log_info "perform_new_nfs_setup: Registering ODP destination: $dst_ip:$dst_port"
+                if ! register_odp_destination_node "$dst_ip" "$dst_port" "$selected_nfs_ip" "Backup DR Node for $dst_pool/$dst_dataset"; then
+                    log_error "perform_new_nfs_setup: STEP 3 FAILED - Could not register ODP destination $dst_ip:$dst_port"
+                    registration_failed=true
+                fi
+            fi
+        done
+        
+        if [[ "$registration_failed" == "true" ]]; then
+            log_error "perform_new_nfs_setup: STEP 3 PARTIAL FAILURE - Some ODP destinations could not be registered"
+            dialog --title "ODP Registration Warning" --msgbox \
+"Some backup destinations could not be registered!\n\n\
+This may affect ODP task creation.\n\
+Check logs for details.\n\n\
+Continuing with remaining setup..." \
+12 60
+        else
+            log_info "perform_new_nfs_setup: STEP 3 SUCCESS - All ODP destinations registered"
+        fi
+    else
+        log_info "perform_new_nfs_setup: STEP 3 SKIPPED - No ODP destinations configured"
+    fi
+    
+    log_info "perform_new_nfs_setup: STEP 3 COMPLETED - ODP destination registration"
+    
+    # STEP 4: Create ODP task (warning only if fails, not critical)
+    log_info "perform_new_nfs_setup: STEP 4 - Creating ODP task"
+    
+    local oodp_status="OODP auto-snapshot: Not configured"
+    
+    # Check if OODP task already exists
+    if check_oodp_task_exists "$selected_pool" "$selected_dataset" "$selected_nfs_ip"; then
+        log_info "perform_new_nfs_setup: OODP task already exists for $selected_pool/$selected_dataset"
+        
+        # Check if existing task has destinations when we want to add them
+        if [[ -n "$oodp_destinations_json" ]] && [[ -z "$OODP_TASK_DESTINATIONS" || "$OODP_TASK_DESTINATIONS" == "[]" ]]; then
+            log_info "perform_new_nfs_setup: Updating existing OODP task with destinations"
+            dialog --title "Creating ODP Task" --infobox "Updating existing OODP task with backup destinations..." 8 60
+            
+            if update_oodp_task_destinations "$selected_pool" "$selected_dataset" "$selected_nfs_ip" "$oodp_destinations_json"; then
+                log_info "perform_new_nfs_setup: OODP task updated successfully with destinations"
+                oodp_status="OODP auto-snapshot: Configured with backup destinations"
+            else
+                log_error "perform_new_nfs_setup: Failed to update OODP task with destinations (non-critical)"
+                oodp_status="OODP auto-snapshot: Configured (destinations need manual setup)"
+            fi
+        else
+            log_info "perform_new_nfs_setup: Existing OODP task already has proper configuration"
+            oodp_status="OODP auto-snapshot: Already configured"
+        fi
+    else
+        # Create new OODP task
+        log_info "perform_new_nfs_setup: Creating new OODP task"
+        
+        if [[ -n "$oodp_destinations_json" ]]; then
+            dialog --title "Creating ODP Task" --infobox "Creating OODP task with backup destinations..." 8 60
+            log_debug "perform_new_nfs_setup: Creating OODP task with destinations: $oodp_destinations_json"
+            
+            if create_oodp_task "$selected_pool" "$selected_dataset" "$new_storage_name" "$selected_nfs_ip" "$oodp_destinations_json"; then
+                log_info "perform_new_nfs_setup: OODP task created successfully with destinations"
+                oodp_status="OODP auto-snapshot: Configured with backup destinations"
+            else
+                log_error "perform_new_nfs_setup: Failed to create OODP task with destinations (non-critical)"
+                oodp_status="OODP auto-snapshot: Manual setup required"
+            fi
+        else
+            dialog --title "Creating ODP Task" --infobox "Creating OODP auto-snapshot task..." 8 60
+            
+            if create_oodp_task "$selected_pool" "$selected_dataset" "$new_storage_name" "$selected_nfs_ip"; then
+                log_info "perform_new_nfs_setup: OODP task created successfully"
+                oodp_status="OODP auto-snapshot: Configured"
+            else
+                log_error "perform_new_nfs_setup: Failed to create OODP task (non-critical)"
+                oodp_status="OODP auto-snapshot: Manual setup required"
+            fi
+        fi
+    fi
+    
+    log_info "perform_new_nfs_setup: STEP 4 COMPLETED - ODP task status: $oodp_status"
+    
+    # STEP 5: Add storage to Proxmox VE
+    log_info "perform_new_nfs_setup: STEP 5 - Adding storage to Proxmox VE"
+    dialog --title "Adding PVE Storage" --infobox "Adding storage to Proxmox VE...\nStorage: $new_storage_name\nServer: $selected_nfs_ip" 8 60
     
     local nodes_csv=$(get_ha_nodes_csv)
     log_debug "get_ha_nodes_csv returned: '$nodes_csv'"
@@ -10406,7 +11221,7 @@ perform_new_nfs_setup() {
     local export_path="/$selected_dataset"
     
     # Log all variables for debugging
-    log_debug "Variables before pvesh create:"
+    log_debug "Variables for PVE storage creation:"
     log_debug "  new_storage_name='$new_storage_name'"
     log_debug "  selected_nfs_ip='$selected_nfs_ip'"
     log_debug "  selected_pool='$selected_pool'"
@@ -10424,23 +11239,40 @@ perform_new_nfs_setup() {
             log_info "Unmounting existing mount at $mount_point"
             umount "$mount_point" 2>/dev/null || {
                 log_error "Failed to unmount $mount_point"
-                dialog --msgbox "Cannot create storage: mount point $mount_point is in use.\n\nPlease manually unmount or remove it first." 12 60
+                dialog --title "PVE Storage Creation Failed" --msgbox \
+"Cannot create PVE storage!\n\n\
+REASON: Mount point $mount_point is in use\n\n\
+SUMMARY:\n\
+Destination datasets: CREATED\n\
+Source dataset: CREATED\n\
+Source NFS share: CREATED\n\
+ODP task: $oodp_status\n\
+PVE storage: FAILED\n\n\
+Please manually unmount or remove $mount_point\n\
+and try adding the storage again." \
+18 70
                 return 1
             }
         fi
         
         # Remove the directory if it's empty
-        if rmdir "$mount_point" 2>/dev/null; then
-            log_info "Removed existing empty directory $mount_point"
-        else
+        if ! rmdir "$mount_point" 2>/dev/null; then
             log_error "Cannot remove $mount_point - directory not empty or permission denied"
-            dialog --msgbox "Cannot create storage: directory $mount_point exists and cannot be removed.\n\nPlease manually remove it first." 12 60
+            dialog --title "PVE Storage Creation Failed" --msgbox \
+"Cannot create PVE storage!\n\n\
+REASON: Directory $mount_point exists and cannot be removed\n\n\
+SUMMARY:\n\
+Destination datasets: CREATED\n\
+Source dataset: CREATED\n\
+Source NFS share: CREATED\n\
+ODP task: $oodp_status\n\
+PVE storage: FAILED\n\n\
+Please manually remove $mount_point\n\
+and try adding the storage again." \
+18 70
             return 1
         fi
     fi
-    
-    # Add NFS storage to Proxmox using pvesh directly
-    log_info "Adding NFS storage: $new_storage_name with export: $export_path"
     
     # Build the pvesh command arguments
     local pvesh_args=()
@@ -10455,8 +11287,6 @@ perform_new_nfs_setup() {
     if [[ -n "$nodes_csv" ]]; then
         pvesh_args+=(--nodes "$nodes_csv")
         log_debug "Adding nodes parameter: $nodes_csv"
-    else
-        log_debug "No nodes parameter - nodes_csv is empty"
     fi
     
     log_debug "Executing pvesh command with args: ${pvesh_args[*]}"
@@ -10470,91 +11300,147 @@ perform_new_nfs_setup() {
     log_debug "pvesh output: $pvesh_output"
     
     if [[ $pvesh_exit_code -ne 0 ]]; then
-        log_error "Failed to add NFS storage to Proxmox VE (exit code: $pvesh_exit_code): $pvesh_output"
-        dialog --msgbox "Failed to add storage to Proxmox VE!\n\nError: $pvesh_output" 12 70
+        log_error "perform_new_nfs_setup: STEP 4 FAILED - PVE storage creation failed"
+        dialog --title "PVE Storage Creation Failed" --msgbox \
+"Failed to add storage to Proxmox VE!\n\n\
+ERROR: $pvesh_output\n\n\
+SUMMARY:\n\
+Destination datasets: CREATED\n\
+Source dataset: CREATED\n\
+Source NFS share: CREATED\n\
+ODP task: $oodp_status\n\
+PVE storage: FAILED\n\n\
+The datasets and NFS shares are ready.\n\
+You can try manually adding the storage:\n\
+Server: $selected_nfs_ip\n\
+Export: $export_path" \
+20 80
         return 1
     fi
     
-    log_info "Successfully added NFS storage: $new_storage_name"
+    log_info "perform_new_nfs_setup: STEP 4 SUCCESS - PVE storage created successfully"
     
-    # Step 4: Wait for storage to mount
-    dialog --title "Processing..." --infobox "Waiting for storage to become available..." 6 50
-    if ! wait_for_storage_mount "$new_storage_name"; then
-        dialog --msgbox "Storage was added but may take a few minutes to become available." 8 60
-        # Continue anyway - storage might be available soon
-    fi
-    
-    # Step 5: Refresh storage information
-    dialog --title "Processing..." --infobox "Refreshing storage information..." 6 50
+    # Wait for storage to mount and refresh cache
+    dialog --title "Finalizing" --infobox "Waiting for storage to become available..." 6 50
+    wait_for_storage_mount "$new_storage_name" || true  # Non-critical
     refresh_storage_cache "$new_storage_name"
-    
-    # Rebuild storage IP mapping
     build_storage_ip_map
     
-    # Step 6: Check for existing OODP task or create new one
-    dialog --title "Processing..." --infobox "Checking OODP auto-snapshot task..." 6 50
+    # SUCCESS - All steps completed
+    log_info "perform_new_nfs_setup: ALL STEPS SUCCESS - NFS storage setup completed successfully"
     
-    # First check if OODP task already exists
-    if check_oodp_task_exists "$selected_pool" "$selected_dataset" "$selected_nfs_ip"; then
-        log_info "OODP task already exists for $selected_pool/$selected_dataset"
-        local oodp_status="OODP auto-snapshot: Already configured"
-    else
-        # Task doesn't exist, try to create it
-        dialog --title "Processing..." --infobox "Creating OODP auto-snapshot task..." 6 50
-        if create_oodp_task "$selected_pool" "$selected_dataset" "$new_storage_name" "$selected_nfs_ip"; then
-            log_info "OODP task created successfully for $selected_pool/$selected_dataset"
-            local oodp_status="OODP auto-snapshot: Configured"
-        else
-            log_warning "Failed to create OODP task - manual configuration required"
-            local oodp_status="OODP auto-snapshot: Manual setup required"
-        fi
+    # Final success message
+    local destinations_summary=""
+    if [[ -n "$oodp_destinations_json" ]]; then
+        local dest_count=$(echo "$oodp_destinations_json" | grep -o '"dataset"' | wc -l)
+        destinations_summary="\nDestination datasets: $dest_count created"
     fi
     
-    # Success message
-    dialog --msgbox "NFS storage setup completed successfully!\n\nStorage Name: $new_storage_name\nDataset: $selected_dataset\nServer: $selected_nfs_ip\nPath: /mnt/pve/$new_storage_name\n\n$oodp_status" 14 60
+    dialog --title "Setup Complete!" --msgbox \
+"NFS storage setup completed successfully!\n\n\
+STORAGE DETAILS:\n\
+Storage Name: $new_storage_name\n\
+Server: $selected_nfs_ip\n\
+Pool: $selected_pool\n\
+Dataset: $selected_dataset\n\
+Path: /mnt/pve/$new_storage_name$destinations_summary\n\n\
+ODP STATUS:\n\
+$oodp_status\n\n\
+The storage is now available for use in Proxmox VE." \
+18 70
     
     log_info "NFS storage setup completed: $new_storage_name"
     return 0
 }
 
-# Helper function: Create OODP task for automatic snapshots
+# Helper function: Create OODP task for automatic snapshots with destinations
 create_oodp_task() {
     local pool_name="$1"
     local dataset_name="$2"
     local storage_name="$3"
     local ip_address="$4"
+    local destinations_json="$5"  # Optional: JSON array of destinations
     
     log_info "Creating OODP task for dataset: $pool_name/$dataset_name"
     
-    # Prepare JSON payload for OODP task creation
-    local json_payload=$(cat <<EOF
+    # Check if REST API credentials are configured
+    if [[ -z "${rest_api_user}" ]] || [[ -z "${rest_api_password}" ]] || [[ -z "${rest_api_port}" ]]; then
+        log_error "create_oodp_task: REST API credentials not configured. User='${rest_api_user}', Port='${rest_api_port}', Password length=${#rest_api_password}"
+        return 1
+    fi
+    
+    # Use configured plan or default
+    local src_plan="${oodp_src_default_plan:-1hour=>1minute,3days=>15minutes,2weeks=>1hour}"
+    
+    # Build the JSON payload
+    local json_payload
+    if [[ -n "$destinations_json" ]]; then
+        # Include destinations in the payload
+        json_payload=$(cat <<EOF
 {
     "name": "$pool_name/$dataset_name",
-    "plan": "1hour=>1minute,3days=>15minutes,2weeks=>1hour",
+    "plan": "$src_plan",
+    "description": "$storage_name",
+    "dedup": false,
+    "granular_resync": true,
+    "mbuffer": false,
+    "destinations": $destinations_json,
+    "send_encrypted": false
+}
+EOF
+        )
+    else
+        # No destinations - original payload
+        json_payload=$(cat <<EOF
+{
+    "name": "$pool_name/$dataset_name",
+    "plan": "$src_plan",
     "description": "$storage_name",
     "dedup": false,
     "granular_resync": true,
     "mbuffer": false
 }
 EOF
-    )
+        )
+    fi
     
     log_debug "create_oodp_task: JSON payload: $json_payload"
     
     # Make REST API call to create OODP task
     local url="https://$ip_address:$rest_api_port/api/v4/odp/tasks"
     log_debug "create_oodp_task: Making POST request to: $url"
+    log_debug "create_oodp_task: Using REST API port: $rest_api_port"
+    log_debug "create_oodp_task: Using REST API user: ${rest_api_user}"
+    log_debug "create_oodp_task: REST API password length: ${#rest_api_password}"
+    
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR MANUAL TESTING ==============="
+    log_debug "curl -k -s -w '\\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
+    log_debug "====================================================================="
+    
+    # Also log a pretty-printed version of the JSON for easier reading
+    log_debug "=== FORMATTED JSON PAYLOAD ==="
+    if command -v python3 >/dev/null 2>&1; then
+        echo "$json_payload" | python3 -m json.tool 2>/dev/null | while IFS= read -r line; do
+            log_debug "  $line"
+        done || log_debug "  (Could not pretty-print JSON)"
+    else
+        log_debug "  $json_payload"
+    fi
+    log_debug "==============================="
     
     local response
+    log_debug "create_oodp_task: About to execute curl command"
     response=$(curl -k -s -w "\n%{http_code}" -X POST \
         -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_payload" \
         "$url" 2>/dev/null)
     local curl_exit=$?
+    log_debug "create_oodp_task: Curl completed with exit code: $curl_exit"
     
     if [[ $curl_exit -ne 0 ]]; then
-        log_error "create_oodp_task: Failed to connect to OODP API at $ip_address:$rest_api_port"
+        log_error "create_oodp_task: Failed to connect to OODP API at $ip_address:$rest_api_port (curl exit code: $curl_exit)"
         return 1
     fi
     
@@ -10570,10 +11456,63 @@ EOF
         log_info "Successfully created OODP task for $pool_name/$dataset_name"
         return 0
     else
-        log_error "Failed to create OODP task. HTTP status: $http_code, Response: $response_body"
+        # Check for specific destination configuration error
+        if [[ "$http_code" == "403" ]] && echo "$response_body" | grep -q "Destination.*not configured"; then
+            log_error "Failed to create OODP task: Backup destinations must be configured in JovianDSS GUI first"
+            log_error "Please configure destination servers in Data Protection > Off-Site Protection > Destinations"
+        else
+            log_error "Failed to create OODP task. HTTP status: $http_code, Response: $response_body"
+        fi
         return 1
     fi
 }
+# Helper function: Get list of backup-dr-node servers
+get_backup_dr_servers() {
+    log_info "get_backup_dr_servers: Starting function (INFO level for debugging)"
+    local backup_servers=()
+    local processed_files=0
+    
+    # Check connected storage servers directory
+    if [[ ! -d "$CONNECTED_STORAGE_SERVERS_DIR" ]]; then
+        log_info "get_backup_dr_servers: No connected servers directory found: $CONNECTED_STORAGE_SERVERS_DIR"
+        return 1
+    fi
+    
+    log_info "get_backup_dr_servers: Connected servers directory exists: $CONNECTED_STORAGE_SERVERS_DIR"
+    
+    # Read all server info files and find backup-dr-nodes
+    for info_file in "$CONNECTED_STORAGE_SERVERS_DIR"/*; do
+        log_info "get_backup_dr_servers: Checking file: $info_file"
+        [[ ! -f "$info_file" ]] && continue
+        
+        ((processed_files++))
+        
+        local ip=$(basename "$info_file")
+        log_info "get_backup_dr_servers: Processing IP: $ip"
+        
+        local node_role=$(grep "^node_role=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+        local connection_state=$(grep "^connection_state=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+        
+        log_info "get_backup_dr_servers: IP $ip - role='$node_role', connection_state='$connection_state'"
+        
+        # Include connected backup-dr-nodes
+        if [[ "$node_role" == "backup-dr-node" ]] && [[ "$connection_state" == "connected" ]]; then
+            backup_servers+=("$ip")
+            log_info "get_backup_dr_servers: Found backup-dr-node: $ip"
+        fi
+    done
+    
+    # Return the list
+    if [[ ${#backup_servers[@]} -gt 0 ]]; then
+        log_debug "get_backup_dr_servers: Found ${#backup_servers[@]} backup servers: ${backup_servers[*]}"
+        printf "%s\n" "${backup_servers[@]}"
+        return 0
+    else
+        log_info "get_backup_dr_servers: No backup-dr-nodes found (checked $processed_files files)"
+        return 1
+    fi
+}
+
 # Helper function: Check if OODP task already exists for dataset
 check_oodp_task_exists() {
     local pool_name="$1"
@@ -10581,10 +11520,13 @@ check_oodp_task_exists() {
     local ip_address="$3"
     
     log_info "Checking if OODP task exists for dataset: $pool_name/$dataset_name"
+    log_debug "check_oodp_task_exists: Called with pool_name='$pool_name', dataset_name='$dataset_name', ip_address='$ip_address'"
     
     # Use the existing get_oodp_details function to check for task
+    log_debug "check_oodp_task_exists: About to call get_oodp_details"
     get_oodp_details "$ip_address" "$pool_name" "$dataset_name"
     local get_result=$?
+    log_debug "check_oodp_task_exists: get_oodp_details returned exit code: $get_result"
     
     case $get_result in
         0)
@@ -10615,27 +11557,52 @@ create_dataset() {
     local pool_name="$1"
     local dataset_name="$2"
     
-    log_info "Creating dataset: $dataset_name in pool: $pool_name"
+    log_info "create_dataset: STARTING creation of SOURCE dataset pool_name='$pool_name' dataset_name='$dataset_name' on server='$selected_nfs_ip:$rest_api_port'"
+    log_info "create_dataset: SOURCE API endpoint: https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes"
+    
+    # Validate API credentials are configured
+    if [[ -z "$rest_api_user" || -z "$rest_api_password" ]]; then
+        log_error "create_dataset: API credentials not configured"
+        return 1
+    fi
     
     # Prepare JSON payload for dataset creation
     # Based on API docs: only "name" is required
     local json_input="{\"name\": \"${dataset_name}\"}"
+    log_info "create_dataset: JSON payload: $json_input for SOURCE pool_name='$pool_name' dataset_name='$dataset_name'"
     
+    log_info "create_dataset: Making API call to SOURCE server='$selected_nfs_ip:$rest_api_port' for pool_name='$pool_name' dataset_name='$dataset_name'"
     local response
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes")
+        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
+    
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "create_dataset: CURL FAILED to connect to SOURCE server='$selected_nfs_ip:$rest_api_port' for pool_name='$pool_name' dataset_name='$dataset_name' curl_exit='$curl_exit'"
+        return 1
+    fi
     
     local body=$(echo "$response" | sed '$d')
     local status=$(echo "$response" | tail -n1)
     
+    log_info "create_dataset: API response HTTP_STATUS='$status' for SOURCE pool_name='$pool_name' dataset_name='$dataset_name' on server='$selected_nfs_ip:$rest_api_port'"
+    log_debug "create_dataset: API response BODY='$body' for SOURCE pool_name='$pool_name' dataset_name='$dataset_name'"
+    
     if [[ $status -eq 200 || $status -eq 201 ]]; then
-        log_info "Dataset '$dataset_name' created successfully"
+        log_info "create_dataset: SOURCE dataset created SUCCESS pool_name='$pool_name' dataset_name='$dataset_name' on server='$selected_nfs_ip:$rest_api_port' HTTP_STATUS='$status'"
         return 0
     else
-        log_error "Failed to create dataset. Status: $status"
-        log_error "Response: $body"
+        log_error "create_dataset: SOURCE dataset creation FAILED pool_name='$pool_name' dataset_name='$dataset_name' on server='$selected_nfs_ip:$rest_api_port' HTTP_STATUS='$status'"
+        log_error "create_dataset: SOURCE dataset FAILED RESPONSE='$body' for pool_name='$pool_name' dataset_name='$dataset_name'"
+        
+        # Try to extract error message from response
+        if [[ -n "$body" ]]; then
+            local error_msg=$(echo "$body" | grep -o '"message":"[^"]*"' | sed 's/"message":"\([^"]*\)"/\1/' 2>/dev/null || echo "$body")
+            log_error "create_dataset: SOURCE dataset ERROR DETAILS='$error_msg' for pool_name='$pool_name' dataset_name='$dataset_name'"
+        fi
+        
         return 1
     fi
 }
@@ -10665,7 +11632,7 @@ EOF
 )
     
     local response
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/shares")
@@ -10733,6 +11700,782 @@ find_next_storage_name() {
     # Increment and format with leading zero
     local next_number=$((max_number + 1))
     echo "${prefix}$(printf "%02d" "$next_number")"
+}
+
+# Helper function: Get export path from PVE storage configuration
+# Example: joviandss-nfs03 -> /datastore-pve-03
+get_pve_storage_export_path() {
+    local pve_storage_name="$1"
+    
+    if [[ -z "$pve_storage_name" ]]; then
+        log_error "get_pve_storage_export_path: pve_storage_name is required"
+        return 1
+    fi
+    
+    log_debug "get_pve_storage_export_path: Looking for export path of storage '$pve_storage_name'"
+    
+    # Parse /etc/pve/storage.cfg to find export path
+    local in_storage_section=false
+    local export_path=""
+    
+    while IFS= read -r line; do
+        # Check if we're entering the target storage section
+        if [[ "$line" =~ ^nfs:[[:space:]]*${pve_storage_name}[[:space:]]*$ ]]; then
+            in_storage_section=true
+            log_debug "get_pve_storage_export_path: Found storage section for '$pve_storage_name'"
+            continue
+        fi
+        
+        # Check if we're entering a different storage section
+        if [[ "$line" =~ ^[a-zA-Z]+:[[:space:]]*[^[:space:]]+ ]] && [[ "$in_storage_section" == "true" ]]; then
+            # We've moved to a different storage section, stop processing
+            break
+        fi
+        
+        # If we're in the target storage section, look for export line
+        if [[ "$in_storage_section" == "true" ]] && [[ "$line" =~ ^[[:space:]]*export[[:space:]]+(.+)$ ]]; then
+            export_path="${BASH_REMATCH[1]}"
+            log_debug "get_pve_storage_export_path: Found export path '$export_path'"
+            break
+        fi
+    done < /etc/pve/storage.cfg
+    
+    if [[ -z "$export_path" ]]; then
+        log_error "get_pve_storage_export_path: No export path found for storage '$pve_storage_name'"
+        return 1
+    fi
+    
+    echo "$export_path"
+    return 0
+}
+
+# Helper function: Get dataset path from share name using REST API
+# Example: datastore-pve-03 -> Pool-0/datastore-pve-03
+get_dataset_from_share_name() {
+    local share_name="$1"
+    local nfs_ip="$2"
+    
+    if [[ -z "$share_name" ]]; then
+        log_error "get_dataset_from_share_name: share_name is required"
+        return 1
+    fi
+    
+    if [[ -z "$nfs_ip" ]]; then
+        log_error "get_dataset_from_share_name: nfs_ip is required"
+        return 1
+    fi
+    
+    log_debug "get_dataset_from_share_name: Looking for dataset containing share '$share_name' on IP '$nfs_ip'"
+    
+    # Make REST API call to get shares
+    local url="https://${nfs_ip}:${rest_api_port}/api/v4/shares?where=name==${share_name}"
+    
+    # Use temporary file for reliable parsing
+    local temp_response=$(mktemp)
+    local temp_status=$(mktemp)
+    
+    curl -k -s -X GET \
+        -u "${rest_api_user}:${rest_api_password}" \
+        -w "%{http_code}" \
+        -o "$temp_response" \
+        "$url" > "$temp_status" 2>/dev/null
+    
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "get_dataset_from_share_name: Failed to connect to server"
+        rm -f "$temp_response" "$temp_status"
+        return 1
+    fi
+    
+    # Parse response
+    local response_body=$(cat "$temp_response")
+    local http_status=$(cat "$temp_status")
+    rm -f "$temp_response" "$temp_status"
+    
+    log_debug "get_dataset_from_share_name: HTTP Status: $http_status"
+    log_debug "get_dataset_from_share_name: Response: $response_body"
+    
+    # Check for authentication failure
+    if check_rest_api_auth_failure "get_dataset_from_share_name" "$http_status" "$response_body"; then
+        local auth_result=$?
+        if [[ $auth_result -eq 10 ]]; then
+            log_error "get_dataset_from_share_name: REST API authentication failed (401)"
+            return 1
+        elif [[ $auth_result -eq 11 ]]; then
+            log_error "get_dataset_from_share_name: REST API access forbidden (403)"
+            return 1
+        fi
+    fi
+    
+    if [[ "$http_status" == "200" ]]; then
+        # Extract dataset path from JSON response
+        local dataset_path
+        dataset_path=$(echo "$response_body" | grep -Po '"path"\s*:\s*"\K[^"]+' | head -1)
+        
+        if [[ -n "$dataset_path" ]]; then
+            log_debug "get_dataset_from_share_name: Found dataset path '$dataset_path' for share '$share_name'"
+            echo "$dataset_path"
+            return 0
+        else
+            log_error "get_dataset_from_share_name: Share '$share_name' not found in API response"
+            return 1
+        fi
+    else
+        log_error "get_dataset_from_share_name: Failed to get shares. HTTP status: $http_status, Response: $response_body"
+        return 1
+    fi
+}
+
+# Helper function: Create backup datasets on destination servers
+create_backup_datasets() {
+    log_info "create_backup_datasets: Starting backup dataset creation"
+    
+    # Check if OODP destinations were configured in the wizard
+    if [[ -z "$oodp_destinations_json" ]]; then
+        log_debug "create_backup_datasets: No destinations configured, skipping"
+        return 0
+    fi
+    
+    log_debug "create_backup_datasets: Processing destinations JSON: $oodp_destinations_json"
+    
+    # Parse destinations from JSON and create datasets
+    local success_count=0
+    local total_count=0
+    local failed_destinations=()
+    
+    # Extract destination info from JSON
+    # Expected format: [{"plan":"...","dataset":"192.168.21.142:40000/poolname/datasetname"}]
+    while IFS= read -r destination_entry; do
+        ((total_count++))
+        
+        # Extract dataset field from JSON entry
+        local dataset_spec=$(echo "$destination_entry" | grep -Po '"dataset"\s*:\s*"\K[^"]+')
+        
+        if [[ -z "$dataset_spec" ]]; then
+            log_error "create_backup_datasets: Invalid destination format in JSON: $destination_entry"
+            failed_destinations+=("Invalid JSON format")
+            continue
+        fi
+        
+        log_debug "create_backup_datasets: Processing destination dataset: $dataset_spec"
+        
+        # Parse format: IP:PORT/POOL/DATASET
+        if [[ "$dataset_spec" =~ ^([0-9.]+):([0-9]+)/([^/]+)/(.+)$ ]]; then
+            local dst_ip="${BASH_REMATCH[1]}"
+            local dst_port="${BASH_REMATCH[2]}"
+            local dst_pool="${BASH_REMATCH[3]}"
+            local dst_dataset="${BASH_REMATCH[4]}"
+            
+            log_info "create_backup_datasets: Creating DESTINATION dataset pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$dst_port'"
+            
+            # Show progress for this specific destination
+            dialog --title "Creating DESTINATION Dataset" --infobox "Creating DESTINATION dataset:\nServer: $dst_ip:$dst_port\nPool: $dst_pool\nDataset: $dst_dataset" 10 70
+            
+            # Verify that the destination pool exists before creating dataset
+            # TEMPORARY: Skip pool verification due to credential issues
+            log_info "create_backup_datasets: Skipping pool verification (credential issue), attempting dataset creation"
+            # if verify_destination_pool_exists "$dst_ip" "$dst_port" "$dst_pool"; then
+                # Create the dataset on the destination server
+                if create_remote_backup_dataset "$dst_ip" "$dst_port" "$dst_pool" "$dst_dataset"; then
+                    log_info "create_backup_datasets: DESTINATION dataset created SUCCESS pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$dst_port'"
+                    ((success_count++))
+                else
+                    log_error "create_backup_datasets: DESTINATION dataset creation FAILED pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$dst_port'"
+                    failed_destinations+=("$dst_ip:$dst_port/$dst_pool/$dst_dataset")
+                fi
+            # else
+            #     log_error "create_backup_datasets: Destination pool '$dst_pool' does not exist on $dst_ip:$dst_port"
+            #     failed_destinations+=("$dst_ip:$dst_port/$dst_pool/$dst_dataset")
+            # fi
+        else
+            log_error "create_backup_datasets: Invalid dataset specification format: $dataset_spec"
+            failed_destinations+=("$dataset_spec")
+        fi
+        
+    done < <(echo "$oodp_destinations_json" | grep -Po '\{[^}]*"dataset"[^}]*\}')
+    
+    # Report results
+    log_info "create_backup_datasets: Created $success_count of $total_count backup datasets"
+    
+    if [[ ${#failed_destinations[@]} -gt 0 ]]; then
+        log_error "create_backup_datasets: Failed destinations: ${failed_destinations[*]}"
+        return 1
+    elif [[ $total_count -eq 0 ]]; then
+        log_info "create_backup_datasets: No destinations found in JSON"
+        return 0
+    else
+        log_info "create_backup_datasets: All backup datasets created successfully"
+        return 0
+    fi
+}
+
+# Helper function: Create a dataset on a remote backup server
+create_remote_backup_dataset() {
+    local dst_ip="$1"
+    local dst_port="$2"
+    local dst_pool="$3"
+    local dst_dataset="$4"
+    
+    log_info "create_remote_backup_dataset: STARTING creation of DESTINATION dataset pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$dst_port'"
+    
+    # Prepare JSON payload for dataset creation
+    local json_payload
+    json_payload=$(cat <<EOF
+{
+    "name": "$dst_dataset"
+}
+EOF
+)
+    
+    log_info "create_remote_backup_dataset: JSON payload: $json_payload for pool_name='$dst_pool' dataset_name='$dst_dataset'"
+    
+    # Make REST API call to create ZFS dataset (not NFS share) on destination server  
+    local url="https://$dst_ip:$rest_api_port/api/v4/pools/$dst_pool/datasets"
+    log_info "create_remote_backup_dataset: Making API call to DESTINATION server='$dst_ip:$rest_api_port' URL='$url' for pool_name='$dst_pool' dataset_name='$dst_dataset'"
+    
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X POST \
+        -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        -d "$json_payload" \
+        "$url" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "create_remote_backup_dataset: CURL FAILED to connect to DESTINATION server='$dst_ip:$rest_api_port' for pool_name='$dst_pool' dataset_name='$dst_dataset' curl_exit='$curl_exit'"
+        return 1
+    fi
+    
+    # Extract HTTP status code and response body
+    local http_code=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | head -n -1)
+    
+    log_info "create_remote_backup_dataset: API response HTTP_CODE='$http_code' for DESTINATION pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$rest_api_port'"
+    log_debug "create_remote_backup_dataset: API response BODY='$response_body' for pool_name='$dst_pool' dataset_name='$dst_dataset'"
+    
+    # Check if dataset was created successfully
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        log_info "create_remote_backup_dataset: DESTINATION dataset created SUCCESS pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$rest_api_port' HTTP_CODE='$http_code'"
+        return 0
+    elif [[ "$http_code" == "409" ]]; then
+        # Dataset already exists - this is acceptable
+        log_info "create_remote_backup_dataset: DESTINATION dataset ALREADY EXISTS pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$rest_api_port' HTTP_CODE='$http_code'"
+        return 0
+    else
+        log_error "create_remote_backup_dataset: DESTINATION dataset creation FAILED pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$rest_api_port' HTTP_CODE='$http_code'"
+        log_error "create_remote_backup_dataset: DESTINATION dataset FAILED RESPONSE='$response_body' for pool_name='$dst_pool' dataset_name='$dst_dataset'"
+        return 1
+    fi
+}
+
+# Helper function: Create dataset on remote server using same logic as source
+create_remote_dataset() {
+    local dst_ip="$1"
+    local dst_pool="$2"
+    local dst_dataset="$3"
+    
+    log_info "create_remote_dataset: Creating DESTINATION dataset pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$rest_api_port'"
+    log_info "create_remote_dataset: Using same logic as source dataset creation"
+    
+    # Validate API credentials are configured
+    if [[ -z "$rest_api_user" || -z "$rest_api_password" ]]; then
+        log_error "create_remote_dataset: API credentials not configured for destination"
+        return 1
+    fi
+    
+    # Prepare JSON payload for dataset creation (same as source)
+    local json_input="{\"name\": \"${dst_dataset}\"}"
+    log_info "create_remote_dataset: JSON payload: $json_input for DESTINATION pool_name='$dst_pool' dataset_name='$dst_dataset'"
+    
+    log_info "create_remote_dataset: Making API call to DESTINATION server='$dst_ip:$rest_api_port' for pool_name='$dst_pool' dataset_name='$dst_dataset'"
+    local response
+    response=$(curl -k -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        -d "$json_input" \
+        "https://$dst_ip:$rest_api_port/api/v4/pools/$dst_pool/nas-volumes" 2>/dev/null)
+    
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "create_remote_dataset: CURL FAILED to connect to DESTINATION server='$dst_ip:$rest_api_port' for pool_name='$dst_pool' dataset_name='$dst_dataset' curl_exit='$curl_exit'"
+        return 1
+    fi
+    
+    local body=$(echo "$response" | sed '$d')
+    local status=$(echo "$response" | tail -n1)
+    
+    log_info "create_remote_dataset: API response HTTP_STATUS='$status' for DESTINATION pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$rest_api_port'"
+    log_debug "create_remote_dataset: API response BODY='$body' for DESTINATION pool_name='$dst_pool' dataset_name='$dst_dataset'"
+    
+    if [[ $status -eq 200 || $status -eq 201 ]]; then
+        log_info "create_remote_dataset: DESTINATION dataset created SUCCESS pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$rest_api_port' HTTP_STATUS='$status'"
+        return 0
+    else
+        log_error "create_remote_dataset: DESTINATION dataset creation FAILED pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip:$rest_api_port' HTTP_STATUS='$status'"
+        log_error "create_remote_dataset: DESTINATION dataset FAILED RESPONSE='$body' for pool_name='$dst_pool' dataset_name='$dst_dataset'"
+        
+        # Try to extract error message from response
+        if [[ -n "$body" ]]; then
+            local error_msg=$(echo "$body" | grep -o '"message":"[^"]*"' | sed 's/"message":"\([^"]*\)"/\1/' 2>/dev/null || echo "$body")
+            log_error "create_remote_dataset: DESTINATION dataset ERROR DETAILS='$error_msg' for pool_name='$dst_pool' dataset_name='$dst_dataset'"
+        fi
+        
+        return 1
+    fi
+}
+
+# Helper function: Check if a destination dataset exists
+check_destination_dataset_exists() {
+    local dst_ip="$1"
+    local dst_pool="$2"
+    local dst_dataset="$3"
+    
+    log_debug "check_destination_dataset_exists: Checking if dataset exists - pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
+    
+    # Check if REST API credentials are configured
+    if [[ -z "${rest_api_user}" ]] || [[ -z "${rest_api_password}" ]] || [[ -z "${rest_api_port}" ]]; then
+        log_error "check_destination_dataset_exists: REST API credentials not configured"
+        return 2  # Return 2 for configuration error
+    fi
+    
+    # Make API call to get datasets in the pool
+    local url="https://$dst_ip:$rest_api_port/api/v4/pools/$dst_pool/nas-volumes"
+    log_debug "check_destination_dataset_exists: Making GET request to: $url"
+    
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X GET \
+        -u "${rest_api_user}:${rest_api_password}" \
+        "$url" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "check_destination_dataset_exists: Failed to connect to API at $dst_ip:$rest_api_port (curl exit code: $curl_exit)"
+        return 2  # Return 2 for connection error
+    fi
+    
+    # Extract HTTP status code (last line) and response body
+    local http_code=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | head -n -1)
+    
+    log_debug "check_destination_dataset_exists: HTTP status code: $http_code"
+    log_debug "check_destination_dataset_exists: Response length: ${#response_body} chars"
+    
+    # Check if API call was successful
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        # Check if dataset exists in the response
+        if echo "$response_body" | grep -q "\"name\": \"$dst_dataset\""; then
+            log_info "check_destination_dataset_exists: Dataset EXISTS - pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
+            return 0  # Dataset exists
+        else
+            log_debug "check_destination_dataset_exists: Dataset NOT found - pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
+            return 1  # Dataset does not exist
+        fi
+    else
+        log_error "check_destination_dataset_exists: API call failed. HTTP status: $http_code"
+        log_debug "check_destination_dataset_exists: Response: $response_body"
+        return 2  # Return 2 for API error
+    fi
+}
+
+# Helper function: Check if ODP destination node is registered
+check_odp_destination_registered() {
+    local dst_ip="$1"
+    local dst_port="$2"
+    local src_ip="$3"  # Source server IP where we check registration
+    
+    local dst_address="${dst_ip}:${dst_port}"
+    log_debug "check_odp_destination_registered: Checking if ODP destination is registered - address='$dst_address' on source='$src_ip'"
+    
+    # Check if REST API credentials are configured
+    if [[ -z "${rest_api_user}" ]] || [[ -z "${rest_api_password}" ]] || [[ -z "${rest_api_port}" ]]; then
+        log_error "check_odp_destination_registered: REST API credentials not configured"
+        return 2  # Return 2 for configuration error
+    fi
+    
+    # Make API call to get registered ODP nodes
+    local url="https://$src_ip:$rest_api_port/api/v4/odp/nodes"
+    log_debug "check_odp_destination_registered: Making GET request to: $url"
+    
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X GET \
+        --connect-timeout 5 --max-time 90 \
+        -u "${rest_api_user}:${rest_api_password}" \
+        "$url" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "check_odp_destination_registered: Failed to connect to API at $src_ip:$rest_api_port (curl exit code: $curl_exit)"
+        return 2  # Return 2 for connection error
+    fi
+    
+    # Extract HTTP status code (last line) and response body
+    local http_code=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | head -n -1)
+    
+    log_debug "check_odp_destination_registered: HTTP status code: $http_code"
+    log_debug "check_odp_destination_registered: Response: $response_body"
+    
+    # Check if API call was successful
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        # Check if destination is registered in the response
+        if echo "$response_body" | grep -q "\"address\": \"$dst_address\""; then
+            log_info "check_odp_destination_registered: ODP destination REGISTERED - address='$dst_address' on source='$src_ip'"
+            return 0  # Destination is registered
+        else
+            log_debug "check_odp_destination_registered: ODP destination NOT registered - address='$dst_address' on source='$src_ip'"
+            return 1  # Destination is not registered
+        fi
+    else
+        log_error "check_odp_destination_registered: API call failed. HTTP status: $http_code"
+        log_debug "check_odp_destination_registered: Response: $response_body"
+        return 2  # Return 2 for API error
+    fi
+}
+
+# Helper function: Register ODP destination node
+register_odp_destination_node() {
+    local dst_ip="$1"
+    local dst_port="$2"
+    local src_ip="$3"  # Source server IP where we register
+    local description="$4"  # Optional description
+    
+    local dst_address="${dst_ip}:${dst_port}"
+    log_info "register_odp_destination_node: Registering ODP destination - address='$dst_address' on source='$src_ip'"
+    
+    # Check if REST API credentials are configured
+    if [[ -z "${rest_api_user}" ]] || [[ -z "${rest_api_password}" ]] || [[ -z "${rest_api_port}" ]]; then
+        log_error "register_odp_destination_node: REST API credentials not configured"
+        return 1
+    fi
+    
+    # Build JSON payload for ODP node registration
+    local json_payload
+    json_payload=$(cat <<EOF
+{
+    "address": "$dst_address",
+    "description": "${description:-Backup DR Node via pve-tools}",
+    "password": "${storage_server_web_gui_password}"
+}
+EOF
+)
+    
+    log_debug "register_odp_destination_node: JSON payload: $json_payload"
+    
+    # Make API call to register ODP destination node
+    local url="https://$src_ip:$rest_api_port/api/v4/odp/nodes"
+    log_debug "register_odp_destination_node: Making POST request to: $url"
+    
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR ODP NODE REGISTRATION ==============="
+    log_debug "curl -k -s -w '\\n%{http_code}' -X POST --connect-timeout 5 --max-time 90 -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
+    log_debug "============================================================================"
+    
+    # Also log a pretty-printed version of the JSON for easier reading
+    log_debug "=== FORMATTED JSON PAYLOAD FOR ODP NODE REGISTRATION ==="
+    if command -v python3 >/dev/null 2>&1; then
+        echo "$json_payload" | python3 -m json.tool 2>/dev/null | while IFS= read -r line; do
+            log_debug "  $line"
+        done || log_debug "  (Could not pretty-print JSON)"
+    else
+        log_debug "  $json_payload"
+    fi
+    log_debug "========================================================="
+    
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X POST \
+        --connect-timeout 5 --max-time 90 \
+        -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        -d "$json_payload" \
+        "$url" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "register_odp_destination_node: Failed to connect to API at $src_ip:$rest_api_port (curl exit code: $curl_exit)"
+        return 1
+    fi
+    
+    # Extract HTTP status code (last line) and response body
+    local http_code=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | head -n -1)
+    
+    log_debug "register_odp_destination_node: HTTP status code: $http_code"
+    log_debug "register_odp_destination_node: Response: $response_body"
+    
+    # Check if registration was successful
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        log_info "register_odp_destination_node: ODP destination registered SUCCESS - address='$dst_address' on source='$src_ip'"
+        return 0
+    elif [[ "$http_code" == "409" ]]; then
+        # Node already registered - this is acceptable
+        log_info "register_odp_destination_node: ODP destination ALREADY registered - address='$dst_address' on source='$src_ip'"
+        return 0
+    else
+        log_error "register_odp_destination_node: Failed to register ODP destination. HTTP status: $http_code"
+        log_error "register_odp_destination_node: Response: $response_body"
+        return 1
+    fi
+}
+
+# Helper function: Create destination datasets with proper error handling
+create_destination_datasets() {
+    local failed_destinations=()
+    local success_count=0
+    local total_count=${#oodp_destination_datasets[@]}
+    
+    log_info "create_destination_datasets: Starting destination dataset creation"
+    log_debug "create_destination_datasets: Processing ${#oodp_destination_datasets[@]} destination datasets"
+    
+    # Check if destinations are configured
+    if [[ ${#oodp_destination_datasets[@]} -eq 0 ]]; then
+        log_debug "create_destination_datasets: No destinations configured, skipping"
+        return 0
+    fi
+    
+    # Process each destination dataset
+    local dest_index=0
+    for dest_info in "${oodp_destination_datasets[@]}"; do
+        ((dest_index++))
+        
+        # Parse format: IP|POOL|DATASET (simple pipe-separated, no port!)
+        IFS='|' read -r dst_ip dst_pool dst_dataset <<< "$dest_info"
+        
+        if [[ -z "$dst_ip" ]] || [[ -z "$dst_pool" ]] || [[ -z "$dst_dataset" ]]; then
+            log_error "create_destination_datasets: Invalid destination format: $dest_info"
+            failed_destinations+=("Invalid format: $dest_info")
+            continue
+        fi
+        
+        log_info "create_destination_datasets: Creating DESTINATION dataset $dest_index of $total_count - pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
+        log_debug "create_destination_datasets: Parsed - IP='$dst_ip', Pool='$dst_pool', Dataset='$dst_dataset'"
+        
+        # Check if destination dataset already exists
+        log_info "create_destination_datasets: Checking if destination dataset already exists..."
+        dialog --title "Creating Destination Datasets" --infobox "Checking destination dataset $dest_index of $total_count...\n\nServer: $dst_ip\nPool: $dst_pool\nDataset: $dst_dataset" 10 70
+        
+        check_destination_dataset_exists "$dst_ip" "$dst_pool" "$dst_dataset"
+        local exists_result=$?
+        
+        if [[ $exists_result -eq 0 ]]; then
+            # Dataset already exists - prompt user for confirmation
+            log_info "create_destination_datasets: DESTINATION dataset ALREADY EXISTS pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
+            
+            dialog --title "Destination Dataset Already Exists" --msgbox \
+"The destination dataset already exists!\n\n\
+Server: $dst_ip\n\
+Pool: $dst_pool\n\
+Dataset: $dst_dataset\n\n\
+This is acceptable for backup destinations.\n\
+The ODP task will use the existing dataset.\n\n\
+Click OK to continue with this destination." \
+16 60
+            
+            log_info "create_destination_datasets: User confirmed using existing DESTINATION dataset pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
+            ((success_count++))
+            
+        elif [[ $exists_result -eq 1 ]]; then
+            # Dataset does not exist - create it
+            log_info "create_destination_datasets: DESTINATION dataset does not exist, creating it now..."
+            dialog --title "Creating Destination Datasets" --infobox "Creating destination dataset $dest_index of $total_count...\n\nServer: $dst_ip\nPool: $dst_pool\nDataset: $dst_dataset" 10 70
+            
+            # Create the dataset on the destination server using same logic as source
+            if create_remote_dataset "$dst_ip" "$dst_pool" "$dst_dataset"; then
+                log_info "create_destination_datasets: DESTINATION dataset created SUCCESS pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
+                ((success_count++))
+            else
+                log_error "create_destination_datasets: DESTINATION dataset creation FAILED pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
+                failed_destinations+=("$dst_ip/$dst_pool/$dst_dataset")
+            fi
+            
+        else
+            # Error checking dataset existence
+            log_error "create_destination_datasets: Error checking if DESTINATION dataset exists pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
+            failed_destinations+=("$dst_ip/$dst_pool/$dst_dataset (connection error)")
+        fi
+    done
+    
+    # Report results
+    log_info "create_destination_datasets: Created $success_count of $total_count destination datasets"
+    
+    if [[ ${#failed_destinations[@]} -gt 0 ]]; then
+        log_error "create_destination_datasets: Failed destinations: ${failed_destinations[*]}"
+        
+        # Show detailed error dialog
+        local error_details=""
+        for failed_dest in "${failed_destinations[@]}"; do
+            error_details+="  * $failed_dest\n"
+        done
+        
+        dialog --title "DESTINATION Dataset Creation Failed" --msgbox \
+"Failed to create destination datasets!\n\n\
+FAILED DESTINATIONS:\n\
+$error_details\n\
+SUMMARY:\n\
+Created: $success_count of $total_count destination datasets\n\
+Source dataset: NOT CREATED\n\
+PVE storage: NOT CREATED\n\n\
+Please check destination server credentials,\n\
+network connectivity, and pool availability.\n\n\
+Check logs for detailed error information." \
+20 80
+        
+        return 1
+    elif [[ $total_count -eq 0 ]]; then
+        log_info "create_destination_datasets: No destinations found in JSON"
+        return 0
+    else
+        log_info "create_destination_datasets: All destination datasets created successfully"
+        
+        # Show success confirmation
+        dialog --title "Success" --infobox "All destination datasets created successfully!\n\nCreated: $success_count of $total_count datasets" 8 60
+        sleep 2
+        
+        return 0
+    fi
+}
+
+# Helper function: Update existing OODP task with destinations
+update_oodp_task_destinations() {
+    local pool_name="$1"
+    local dataset_name="$2"
+    local ip_address="$3"
+    local destinations_json="$4"
+    
+    log_info "update_oodp_task_destinations: Updating OODP task for $pool_name/$dataset_name with destinations"
+    log_debug "update_oodp_task_destinations: Destinations JSON: $destinations_json"
+    
+    # First, get the existing task details to preserve other settings
+    get_oodp_details "$ip_address" "$pool_name" "$dataset_name"
+    local get_result=$?
+    
+    if [[ $get_result -ne 0 ]]; then
+        log_error "update_oodp_task_destinations: Cannot retrieve existing task details"
+        return 1
+    fi
+    
+    # Parse destinations JSON into proper array format for API
+    local destinations_array="[]"
+    if [[ -n "$destinations_json" ]]; then
+        destinations_array="$destinations_json"
+    fi
+    
+    log_debug "update_oodp_task_destinations: Using destinations array: $destinations_array"
+    
+    # Prepare JSON payload for updating the task (only destinations field)
+    local json_payload
+    json_payload=$(cat <<EOF
+{
+    "destinations": $destinations_array
+}
+EOF
+)
+    
+    log_debug "update_oodp_task_destinations: Update JSON payload: $json_payload"
+    
+    # Make REST API call to update OODP task
+    local task_name="${pool_name}_${dataset_name}"
+    local url="https://$ip_address:$rest_api_port/api/v4/odp/tasks/$task_name"
+    log_debug "update_oodp_task_destinations: Making PUT request to: $url"
+    
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X PUT \
+        -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        -d "$json_payload" \
+        "$url" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "update_oodp_task_destinations: Failed to connect to OODP API at $ip_address:$rest_api_port"
+        return 1
+    fi
+    
+    # Extract HTTP status code and response body
+    local http_code=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | head -n -1)
+    
+    log_debug "update_oodp_task_destinations: HTTP status code: $http_code"
+    log_debug "update_oodp_task_destinations: Response body: $response_body"
+    
+    # Check if task was updated successfully
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        log_info "update_oodp_task_destinations: Successfully updated OODP task for $pool_name/$dataset_name"
+        return 0
+    else
+        log_error "update_oodp_task_destinations: Failed to update OODP task. HTTP status: $http_code"
+        log_error "update_oodp_task_destinations: Response: $response_body"
+        return 1
+    fi
+}
+
+
+# Function: get_remote_pools - Get list of available pools from destination server
+get_remote_pools() {
+    local dst_ip="$1"
+    local dst_port="$2"
+    
+    log_debug "get_remote_pools: Getting pools from $dst_ip:$dst_port"
+    
+    local url="https://$dst_ip:$rest_api_port/api/v4/pools"
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" -X GET \
+        -u "${rest_api_user}:${rest_api_password}" \
+        "$url" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "get_remote_pools: Failed to connect to API at $dst_ip:$dst_port"
+        return 1
+    fi
+    
+    # Extract HTTP status code and response body
+    local http_code=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | head -n -1)
+    
+    if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+        echo "$response_body"
+        return 0
+    else
+        log_error "get_remote_pools: Failed to get pools. HTTP status: $http_code"
+        log_debug "get_remote_pools: Response: $response_body"
+        return 1
+    fi
+}
+
+# Function: verify_destination_pool_exists - Verify that destination pool exists
+verify_destination_pool_exists() {
+    local dst_ip="$1"
+    local dst_port="$2" 
+    local dst_pool="$3"
+    
+    log_debug "verify_destination_pool_exists: Verifying pool '$dst_pool' exists on $dst_ip:$dst_port"
+    
+    local pools_response
+    pools_response=$(get_remote_pools "$dst_ip" "$dst_port")
+    local get_result=$?
+    
+    if [[ $get_result -ne 0 ]]; then
+        log_error "verify_destination_pool_exists: Cannot retrieve pools from $dst_ip:$dst_port"
+        return 1
+    fi
+    
+    # Parse JSON response to check if pool exists
+    if echo "$pools_response" | grep -q "\"name\"[[:space:]]*:[[:space:]]*\"$dst_pool\""; then
+        log_debug "verify_destination_pool_exists: Pool '$dst_pool' found on $dst_ip:$dst_port"
+        return 0
+    else
+        log_error "verify_destination_pool_exists: Pool '$dst_pool' not found on $dst_ip:$dst_port"
+        log_debug "verify_destination_pool_exists: Available pools response: $pools_response"
+        
+        # Extract available pool names for error message
+        local available_pools
+        available_pools=$(echo "$pools_response" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | cut -d'"' -f4 | tr '\n' ', ' | sed 's/,$//')
+        
+        if [[ -n "$available_pools" ]]; then
+            log_error "verify_destination_pool_exists: Available pools on $dst_ip: $available_pools"
+        fi
+        
+        return 1
+    fi
 }
 
 # DELETE CLONED NFS STORAGE FUNCTIONS
@@ -10962,7 +12705,7 @@ get_pools() {
     local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
     log_debug "get_pools: Making request to: $url"
     
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "$url" 2>/dev/null)
 
@@ -11102,7 +12845,7 @@ get_dataset_pool_name() {
 
         # Get nas-volumes for this pool
         local response
-        response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+        response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
             -H 'Content-Type: application/json' \
             "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
 
@@ -11202,7 +12945,7 @@ is_clone() {
 
     # Make REST API call to get nas-volumes for the pool
     local response
-    response=$(curl -k -s --connect-timeout 5 --max-time 10 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
 
@@ -11299,9 +13042,8 @@ delete_dataset() {
 
     local response
     response=$(curl -k -s -X DELETE \
-        -u "$rest_api_user:$rest_api_password" \
-        -H 'Content-Type: application/json' \
-        -d '{}' \
+        --connect-timeout 5 --max-time 120 \
+        -u "${rest_api_user}:${rest_api_password}" \
         -w "\n%{http_code}\n%{redirect_url}" \
         "$url" 2>/dev/null)
 
@@ -11381,7 +13123,8 @@ delete_cloned_dataset() {
 
     local response
     response=$(curl -k -s -X DELETE \
-        -u "$rest_api_user:$rest_api_password" \
+        --connect-timeout 5 --max-time 120 \
+        -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d '{}' \
         -w "\n%{http_code}\n%{redirect_url}" \
@@ -11513,12 +13256,12 @@ delete_pve_NFS_storage() {
     log_info "Confirmed: '$pve_storage_name' is a PVE NFS storage"
 
     # Step 2: Get the IP address for this storage
-    local storage_ip
-    storage_ip=$(get_storage_ip "$pve_storage_name")
+    get_storage_ip "$pve_storage_name"
     if [[ $? -ne 0 ]]; then
         log_error "delete_pve_NFS_storage: No IP mapping found for storage '$pve_storage_name'"
         return 1
     fi
+    local storage_ip="$selected_nfs_ip"
 
     log_info "Storage '$pve_storage_name' mapped to IP '$storage_ip'"
 
@@ -11606,21 +13349,22 @@ delete_unused_pve_nfs_storage() {
     log_info "Confirmed: '$pve_storage_name' is a PVE NFS storage"
 
     # Step 2: Get the IP address for this storage
-    local storage_ip
-    storage_ip=$(get_storage_ip "$pve_storage_name")
+    get_storage_ip "$pve_storage_name"
     if [[ $? -ne 0 ]]; then
         log_error "delete_unused_pve_nfs_storage: No IP mapping found for storage '$pve_storage_name'"
         return 1
     fi
+    local storage_ip="$selected_nfs_ip"
 
     log_info "Storage '$pve_storage_name' mapped to IP '$storage_ip'"
 
-    # Step 3: Find which pool this storage belongs to
-    local pool_name
-    pool_name=$(get_dataset_pool_name "$pve_storage_name" "$storage_ip")
-    local pool_result=$?
-    if [[ $pool_result -ne 0 ]]; then
-        log_error "delete_unused_pve_nfs_storage: Storage '$pve_storage_name' not found in any pool on JovianDSS"
+    # Step 3: Get export path from PVE storage configuration
+    local export_path
+    export_path=$(get_pve_storage_export_path "$pve_storage_name")
+    local export_result=$?
+    
+    if [[ $export_result -ne 0 ]]; then
+        log_error "delete_unused_pve_nfs_storage: Could not get export path for storage '$pve_storage_name'"
         log_info "This might be a storage configuration that exists in PVE but the dataset was already deleted from JovianDSS"
         log_info "Proceeding to remove only the PVE storage configuration"
         
@@ -11645,39 +13389,76 @@ delete_unused_pve_nfs_storage() {
         return 0
     fi
 
-    log_info "Storage '$pve_storage_name' found in pool '$pool_name'"
+    log_info "Storage '$pve_storage_name' has export path '$export_path'"
 
-    # Step 4: Check if this is a clone or regular dataset
-    local volume_name="$pool_name/$pve_storage_name"
+    # Step 4: Convert export path to share name (remove leading /)
+    local share_name="${export_path#/}"
+    log_info "Looking for share name '$share_name'"
+
+    # Step 5: Get dataset path from share using REST API
+    local dataset_path
+    dataset_path=$(get_dataset_from_share_name "$share_name" "$storage_ip")
+    local dataset_result=$?
+    
+    if [[ $dataset_result -ne 0 ]]; then
+        log_error "delete_unused_pve_nfs_storage: Could not find dataset for share '$share_name' on JovianDSS"
+        log_info "This might be a storage configuration that exists in PVE but the dataset was already deleted from JovianDSS"
+        log_info "Proceeding to remove only the PVE storage configuration"
+        
+        # Skip dataset deletion, only remove PVE storage configuration
+        log_info "Removing PVE storage configuration..."
+        if ! pvesm remove "$pve_storage_name"; then
+            log_error "Failed to remove PVE storage '$pve_storage_name'"
+            return 1
+        fi
+
+        log_info "Successfully removed PVE storage configuration '$pve_storage_name'"
+
+        # Run cleanup of inactive NFS storage
+        log_info "Running cleanup of inactive NFS storage..."
+        if ! cleanup_inactive_nfs_storage; then
+            log_error "cleanup_inactive_nfs_storage failed, but main deletion was successful"
+        else
+            log_info "NFS storage cleanup complete"
+        fi
+
+        log_info "Unused storage '$pve_storage_name' (PVE-only) deleted successfully"
+        return 0
+    fi
+
+    log_info "Storage '$pve_storage_name' corresponds to dataset path '$dataset_path'"
+
+    # Step 6: Check if this is a clone or regular dataset
     local is_clone_dataset=false
     
-    if is_clone "$volume_name" "$storage_ip"; then
+    if is_clone "$dataset_path" "$storage_ip"; then
         is_clone_dataset=true
         log_info "Storage '$pve_storage_name' is a clone dataset - will delete cloned dataset"
     else
         log_info "Storage '$pve_storage_name' is a regular dataset - will delete dataset"
     fi
 
-    # Step 5: Delete the dataset (clone or regular) via REST API
+    # Step 7: Delete the dataset (clone or regular) via REST API
     log_info "Deleting dataset..."
     
     if [[ "$is_clone_dataset" == "true" ]]; then
-        # Delete as cloned dataset
-        if ! delete_cloned_dataset "$pve_storage_name" "$storage_ip"; then
-            log_error "Failed to delete cloned dataset '$pve_storage_name'"
+        # Delete as cloned dataset - need to extract dataset name from path for this function
+        local dataset_name="${dataset_path##*/}"
+        if ! delete_cloned_dataset "$dataset_name" "$storage_ip"; then
+            log_error "Failed to delete cloned dataset '$dataset_name'"
             return 1
         fi
-        log_info "Successfully deleted cloned dataset '$pve_storage_name'"
+        log_info "Successfully deleted cloned dataset '$dataset_name'"
     else
         # Delete as regular dataset  
-        if ! delete_dataset "$volume_name" "$storage_ip"; then
-            log_error "Failed to delete dataset '$pve_storage_name'"
+        if ! delete_dataset "$dataset_path" "$storage_ip"; then
+            log_error "Failed to delete dataset '$dataset_path'"
             return 1
         fi
-        log_info "Successfully deleted dataset '$pve_storage_name'"
+        log_info "Successfully deleted dataset '$dataset_path'"
     fi
 
-    # Step 6: Remove PVE storage configuration
+    # Step 8: Remove PVE storage configuration
     log_info "Removing PVE storage configuration..."
     if ! pvesm remove "$pve_storage_name"; then
         log_error "Failed to remove PVE storage '$pve_storage_name'"
@@ -11686,7 +13467,7 @@ delete_unused_pve_nfs_storage() {
 
     log_info "Successfully removed PVE storage configuration '$pve_storage_name'"
 
-    # Step 7: Run cleanup of inactive NFS storage
+    # Step 9: Run cleanup of inactive NFS storage
     log_info "Running cleanup of inactive NFS storage..."
     if ! cleanup_inactive_nfs_storage; then
         log_error "cleanup_inactive_nfs_storage failed, but main deletion was successful"
@@ -12151,7 +13932,7 @@ show_storage_file_listing_and_confirm() {
 # Function: delete_cloned_nfs_storage_wizard
 delete_cloned_nfs_storage_wizard() {
     # Check if REST API is configured
-    if [[ -z "$rest_api_user" || -z "$rest_api_password" || -z "$rest_api_port" ]]; then
+    if [[ -z "${rest_api_user}" || -z "${rest_api_password}" || -z "${rest_api_port}" ]]; then
         dialog --msgbox "REST API configuration is incomplete. Please use Setup to configure it first." 8 60
         return 1
     fi
@@ -12310,7 +14091,7 @@ This may take a moment." 8 50
 # Function: delete_unused_nfs_storage_wizard
 delete_unused_nfs_storage_wizard() {
     # Check if REST API is configured
-    if [[ -z "$rest_api_user" || -z "$rest_api_password" || -z "$rest_api_port" ]]; then
+    if [[ -z "${rest_api_user}" || -z "${rest_api_password}" || -z "${rest_api_port}" ]]; then
         dialog --msgbox "REST API configuration is incomplete. Please use Setup to configure it first." 8 60
         return 1
     fi
@@ -13707,15 +15488,15 @@ add_vmct_to_ha_resources() {
     SELECTED_HA_NODES=()  # Dynamic array for selected nodes
     current_step=1
     # Calculate total steps: number of HA nodes + 3 (confirm + select_vm/ct + execute)
-    total_steps=$((NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER + 3))
+    total_steps=$((number_of_pve_hosts_in_ha_cluster + 3))
     select_all_mode=false
     
     # Collect VMIDs using PCI passthrough (needed for selection display)
     readarray -t HOSTPCI_VMS < <(get_vms_with_hostpci)
     
     while true; do
-        # Dynamic node selection steps (1 to NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER)
-        if [ $current_step -le $NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER ]; then
+        # Dynamic node selection steps (1 to number_of_pve_hosts_in_ha_cluster)
+        if [ $current_step -le $number_of_pve_hosts_in_ha_cluster ]; then
             # Node selection step
             log_info "Wizard: Starting step $current_step - Select HA node $current_step"
             select_ha_node $current_step
@@ -13737,15 +15518,15 @@ add_vmct_to_ha_resources() {
         else
             # Fixed steps after node selection
             case $current_step in
-                $((NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER + 1)))
+                $((number_of_pve_hosts_in_ha_cluster + 1)))
                     # Confirm node selection
                     confirm_ha_nodes
                     case $? in
                         0) current_step=$((current_step + 1)) ;;  # Next
-                        1) current_step=$NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER ;;  # Back to last node selection
+                        1) current_step=$number_of_pve_hosts_in_ha_cluster ;;  # Back to last node selection
                     esac
                     ;;
-                $((NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER + 2)))
+                $((number_of_pve_hosts_in_ha_cluster + 2)))
                     # Select VM/CT
                     select_vm_ct_for_ha
                     case $? in
@@ -13754,7 +15535,7 @@ add_vmct_to_ha_resources() {
                         2) ;;                 # Stay on same step
                     esac
                     ;;
-                $((NUMBER_OF_PVE_HOSTS_IN_HA_CLUSTER + 3)))
+                $((number_of_pve_hosts_in_ha_cluster + 3)))
                     # Show confirmation dialog and execute
                 show_confirmation_dialog
                 case $? in

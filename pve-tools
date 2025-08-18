@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.59"
-RELEASE_DATE="2025-08-14"
+VERSION="0.60"
+RELEASE_DATE="2025-08-18"
 
 # Script mode flag
 VERSION_MODE=false
@@ -422,6 +422,11 @@ cache_pools_for_ip() {
     local response
     local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
     
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR CACHE POOLS ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' '$url'"
+    log_debug "=================================================================="
+    
     response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         "$url" 2>/dev/null)
@@ -473,6 +478,11 @@ except:
         if [[ -n "$pool_name" ]]; then
             local response
             local url="https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes"
+            
+            # Log the FULL curl command for manual testing
+            log_debug "=============== FULL CURL COMMAND FOR CACHE NAS VOLUMES ==============="
+            log_debug "curl -k -s --connect-timeout 5 --max-time 30 -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' '$url'"
+            log_debug "========================================================================"
             
             response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" \
                 -H 'Content-Type: application/json' \
@@ -751,6 +761,7 @@ rest_api_dest_user=admin
 rest_api_dest_password='admin'
 custom_ips=
 storage_vm_name_contains=$(lower "$PRODUCT")
+new_NFS_storage_volume_running_number_starts_with=00
 storage_vm_start_at_boot=yes
 storage_vm_start_shutdown_order=1
 storage_vm_startup_deleay=300
@@ -777,6 +788,7 @@ rest_api_dest_user=admin
 rest_api_dest_password='admin'
 custom_ips=
 storage_vm_name_contains=$(lower "$PRODUCT")
+new_NFS_storage_volume_running_number_starts_with=00
 storage_vm_start_at_boot=yes
 storage_vm_start_shutdown_order=1
 storage_vm_startup_deleay=300
@@ -875,6 +887,7 @@ EOF
         
         # Set defaults for new configuration variables if not present
         storage_vm_name_contains="${storage_vm_name_contains:-$(lower "$PRODUCT")}"
+        new_NFS_storage_volume_running_number_starts_with="${new_NFS_storage_volume_running_number_starts_with:-00}"
         storage_vm_start_at_boot="${storage_vm_start_at_boot:-yes}"
         storage_vm_start_shutdown_order="${storage_vm_start_shutdown_order:-1}"
         storage_vm_startup_deleay="${storage_vm_startup_deleay:-300}"
@@ -888,6 +901,7 @@ EOF
         oodp_dst_default_plan="${oodp_dst_default_plan:-12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months}"
         
         log_debug "init_config: storage_vm_name_contains='$storage_vm_name_contains'"
+        log_debug "init_config: new_NFS_storage_volume_running_number_starts_with='$new_NFS_storage_volume_running_number_starts_with'"
         log_debug "init_config: storage_vm_start_at_boot='$storage_vm_start_at_boot'"
         log_debug "init_config: storage_vm_start_shutdown_order='$storage_vm_start_shutdown_order'"
         log_debug "init_config: storage_vm_startup_deleay='$storage_vm_startup_deleay'"
@@ -3847,6 +3861,11 @@ get_oodp_details() {
     local url="https://$ip_addr:$rest_api_port/api/v4/odp/tasks"
     log_debug "get_oodp_details: Making request to: $url"
     
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR GET OODP DETAILS ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -w '\\n%{http_code}' -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' '$url'"
+    log_debug "======================================================================"
+    
     local response
     response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
@@ -4198,10 +4217,17 @@ perform_oodp_checkup() {
     
     if [[ -n "$test_ip" ]]; then
         # Test authentication with a simple API call
+        local auth_url="https://$test_ip:$rest_api_port/api/v4/conn_test"
+        
+        # Log the FULL curl command for manual testing
+        log_debug "=============== FULL CURL COMMAND FOR AUTH TEST ==============="
+        log_debug "curl -k -s --connect-timeout 2 --max-time 5 -w '\\n%{http_code}' -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' '$auth_url'"
+        log_debug "==============================================================="
+        
         local auth_test_response
         auth_test_response=$(curl -k -s --connect-timeout 2 --max-time 5 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
             -H 'Content-Type: application/json' \
-            "https://$test_ip:$rest_api_port/api/v4/conn_test" 2>/dev/null)
+            "$auth_url" 2>/dev/null)
         local auth_curl_exit=$?
         
         if [[ $auth_curl_exit -eq 0 ]]; then
@@ -5240,6 +5266,7 @@ help_about_dialog() {
     help_text+="--------------------\n"
     help_text+="- REST API credentials and connection settings\n"
     help_text+="- Storage VM startup and shutdown configuration\n"
+    help_text+="- Storage server and NFS-storage naming rules\n"
     help_text+="- Concurrent VM disk move count optimization\n"
     help_text+="- HA cluster size settings\n"
     help_text+="- OODP backup destination and scheduling configuration\n"
@@ -5261,12 +5288,13 @@ setup_dialog() {
         cmd=(dialog --keep-tite --title "Setup Configuration"
              --ok-label "Select" --cancel-label "Back" 
              --default-item "$last_selected_option"
-             --menu "Choose setup option:" 18 70 5)
+             --menu "Choose setup option:" 18 70 6)
         options=("1" "REST API Configuration"
                  "2" "Storage VM Startup Settings"
-                 "3" "Move Storage: Concurrent VM Disk Move Count"
-                 "4" "Number of Proxmox VE hosts in HA cluster"
-                 "5" "OODP Configuration")
+                 "3" "Storage server and NFS-storage names rules"
+                 "4" "Move Storage: Concurrent VM Disk Move Count"
+                 "5" "Number of Proxmox VE hosts in HA cluster"
+                 "6" "OODP Configuration")
 
         dialog_menu
         rm -f "$dialog_selected"
@@ -5281,13 +5309,16 @@ setup_dialog() {
                     2)  # Storage VM Startup Settings
                         setup_storage_vm_dialog
                         ;;
-                    3)  # Move Storage: Concurrent VM Disk Move Count
+                    3)  # Storage server and NFS-storage names rules
+                        setup_storage_naming_dialog
+                        ;;
+                    4)  # Move Storage: Concurrent VM Disk Move Count
                         setup_disk_move_dialog
                         ;;
-                    4)  # Number of Proxmox VE hosts in HA cluster
+                    5)  # Number of Proxmox VE hosts in HA cluster
                         setup_ha_cluster_size_dialog
                         ;;
-                    5)  # OODP Configuration
+                    6)  # OODP Configuration
                         setup_oodp_dialog
                         ;;
                 esac
@@ -5369,14 +5400,12 @@ setup_rest_api_dialog() {
 setup_storage_vm_dialog() {
     local dialog_selected=$(mktemp)
     local form_data=$(mktemp)
-    local temp_name_contains="$storage_vm_name_contains"
     local temp_start_at_boot="$storage_vm_start_at_boot"
     local temp_start_order="$storage_vm_start_shutdown_order"
     local temp_startup_delay="$storage_vm_startup_deleay"
     local temp_shutdown_timeout="$storage_vm_shutdown_timeout"
     local temp_boot_order="$storage_vm_boot_order"
 
-    log_debug "setup_storage_vm_dialog: temp_name_contains='$temp_name_contains'"
     log_debug "setup_storage_vm_dialog: temp_start_at_boot='$temp_start_at_boot'"
     log_debug "setup_storage_vm_dialog: temp_start_order='$temp_start_order'"
     log_debug "setup_storage_vm_dialog: temp_startup_delay='$temp_startup_delay'"
@@ -5385,13 +5414,12 @@ setup_storage_vm_dialog() {
 
     dialog --keep-tite --title "Storage VM Startup Configuration" \
            --ok-label "Save" --cancel-label "Back" --extra-button --extra-label "Restore to Factory" \
-           --form "Configure storage VM startup settings:" 15 85 6 \
-           "$PRODUCT VM name contains (case insensitive):" 1 1 "$temp_name_contains" 1 50 30 0 \
-           "Start-at-boot (yes/no):" 2 1 "$temp_start_at_boot" 2 50 10 0 \
-           "Start/shutdown order:" 3 1 "$temp_start_order" 3 50 10 0 \
-           "Startup delay (sec):" 4 1 "$temp_startup_delay" 4 50 10 0 \
-           "Shutdown timeout (sec):" 5 1 "$temp_shutdown_timeout" 5 50 10 0 \
-           "Boot order (e.g., scsi0, ide0):" 6 1 "$temp_boot_order" 6 50 20 0 \
+           --form "Configure storage VM startup settings:" 14 85 5 \
+           "Start-at-boot (yes/no):" 1 1 "$temp_start_at_boot" 1 50 10 0 \
+           "Start/shutdown order:" 2 1 "$temp_start_order" 2 50 10 0 \
+           "Startup delay (sec):" 3 1 "$temp_startup_delay" 3 50 10 0 \
+           "Shutdown timeout (sec):" 4 1 "$temp_shutdown_timeout" 4 50 10 0 \
+           "Boot order (e.g., scsi0, ide0):" 5 1 "$temp_boot_order" 5 50 20 0 \
            2> "$form_data"
 
     local exit_code=$?
@@ -5401,12 +5429,11 @@ setup_storage_vm_dialog() {
         local line_count=1
         while IFS= read -r line; do
             case $line_count in
-                1) temp_name_contains="$line" ;;
-                2) temp_start_at_boot="$line" ;;
-                3) temp_start_order="$line" ;;
-                4) temp_startup_delay="$line" ;;
-                5) temp_shutdown_timeout="$line" ;;
-                6) temp_boot_order="$line" ;;
+                1) temp_start_at_boot="$line" ;;
+                2) temp_start_order="$line" ;;
+                3) temp_startup_delay="$line" ;;
+                4) temp_shutdown_timeout="$line" ;;
+                5) temp_boot_order="$line" ;;
             esac
             ((line_count++))
         done < "$form_data"
@@ -5426,7 +5453,6 @@ setup_storage_vm_dialog() {
             dialog --msgbox "Boot order must be a valid device (e.g., scsi0, ide0, sata0, virtio0, net0)." 6 60
         else
             # Update variables
-            storage_vm_name_contains="$temp_name_contains"
             storage_vm_start_at_boot="$temp_start_at_boot"
             storage_vm_start_shutdown_order="$temp_start_order"
             storage_vm_startup_deleay="$temp_startup_delay"
@@ -5442,6 +5468,69 @@ setup_storage_vm_dialog() {
         if restore_factory_defaults_storage_vm; then
             # Reload dialog with factory defaults
             setup_storage_vm_dialog
+            return $?
+        fi
+    fi
+    
+    rm -f "$form_data"
+    rm -f "$dialog_selected"
+    return 0
+}
+
+# Display setup dialog for storage server and NFS-storage names rules
+setup_storage_naming_dialog() {
+    local dialog_selected=$(mktemp)
+    local form_data=$(mktemp)
+    local temp_name_contains="$storage_vm_name_contains"
+    local temp_number_pattern="$new_NFS_storage_volume_running_number_starts_with"
+
+    log_debug "setup_storage_naming_dialog: temp_name_contains='$temp_name_contains'"
+    log_debug "setup_storage_naming_dialog: temp_number_pattern='$temp_number_pattern'"
+
+    # Step 1: Get JovianDSS VM name contains
+    dialog --keep-tite --title "Storage server and NFS-storage names rules" \
+           --ok-label "Next" --cancel-label "Back" --extra-button --extra-label "Restore to Factory" \
+           --inputbox "Configure storage server and NFS-storage naming rules:\n\n$PRODUCT VM name contains (case insensitive):" 12 70 "$temp_name_contains" \
+           2> "$form_data"
+
+    local exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        # Parse form data
+        temp_name_contains=$(< "$form_data")
+
+        # Step 2: Get NFS storage volume running number pattern
+        dialog --keep-tite --title "Storage server and NFS-storage names rules" \
+               --ok-label "Save" --cancel-label "Back" \
+               --default-item "$temp_number_pattern" \
+               --menu "Select NFS-storage volume running number starts with:" 15 60 6 \
+               "00" "Pattern: joviandss-nfs00, joviandss-nfs01, ..." \
+               "01" "Pattern: joviandss-nfs01, joviandss-nfs02, ..." \
+               "000" "Pattern: joviandss-nfs000, joviandss-nfs001, ..." \
+               "001" "Pattern: joviandss-nfs001, joviandss-nfs002, ..." \
+               "10" "Pattern: joviandss-nfs10, joviandss-nfs11, ..." \
+               "100" "Pattern: joviandss-nfs100, joviandss-nfs101, ..." \
+               2> "$dialog_selected"
+
+        local menu_exit_code=$?
+        local selected_pattern=$(< "$dialog_selected")
+
+        if [ $menu_exit_code -eq 0 ]; then
+            temp_number_pattern="$selected_pattern"
+
+            # Update variables
+            storage_vm_name_contains="$temp_name_contains"
+            new_NFS_storage_volume_running_number_starts_with="$temp_number_pattern"
+
+            log_info "User saved storage server and NFS-storage naming configuration changes"
+            save_config_file
+            dialog --msgbox "Storage server and NFS-storage naming rules saved successfully!" 6 70
+        fi
+    elif [ $exit_code -eq 3 ]; then
+        # Restore to Factory button pressed
+        if restore_factory_defaults_storage_vm; then
+            # Reload dialog with factory defaults
+            setup_storage_naming_dialog
             return $?
         fi
     fi
@@ -5723,6 +5812,7 @@ restore_factory_defaults_storage_vm() {
     
     # Load factory defaults for storage VM settings only
     local factory_storage_vm_name_contains=""
+    local factory_new_NFS_storage_volume_running_number_starts_with=""
     local factory_storage_vm_start_at_boot=""
     local factory_storage_vm_start_shutdown_order=""
     local factory_storage_vm_startup_deleay=""
@@ -5739,6 +5829,9 @@ restore_factory_defaults_storage_vm() {
             case "$key" in
                 storage_vm_name_contains)
                     factory_storage_vm_name_contains="$value"
+                    ;;
+                new_NFS_storage_volume_running_number_starts_with)
+                    factory_new_NFS_storage_volume_running_number_starts_with="$value"
                     ;;
                 storage_vm_start_at_boot)
                     factory_storage_vm_start_at_boot="$value"
@@ -5760,6 +5853,7 @@ restore_factory_defaults_storage_vm() {
         
         # Update current variables with factory defaults
         storage_vm_name_contains="${factory_storage_vm_name_contains:-$(lower "$PRODUCT")}"
+        new_NFS_storage_volume_running_number_starts_with="${factory_new_NFS_storage_volume_running_number_starts_with:-00}"
         storage_vm_start_at_boot="${factory_storage_vm_start_at_boot:-yes}"
         storage_vm_start_shutdown_order="${factory_storage_vm_start_shutdown_order:-1}"
         storage_vm_startup_deleay="${factory_storage_vm_startup_deleay:-300}"
@@ -5787,6 +5881,7 @@ rest_api_password='$rest_api_password'
 rest_api_port=$rest_api_port
 custom_ips=${custom_ips:-}
 storage_vm_name_contains=${storage_vm_name_contains:-$(lower "$PRODUCT")}
+new_NFS_storage_volume_running_number_starts_with=${new_NFS_storage_volume_running_number_starts_with:-00}
 storage_vm_start_at_boot=${storage_vm_start_at_boot:-yes}
 storage_vm_start_shutdown_order=${storage_vm_start_shutdown_order:-1}
 storage_vm_startup_deleay=${storage_vm_startup_deleay:-300}
@@ -8295,6 +8390,11 @@ rest_api_connection_test() {
     local url="https://$selected_nfs_ip:$rest_api_port/api/v4/conn_test"
     log_debug "rest_api_connection_test: Full URL: $url"
     
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR CONNECTION TEST ==============="
+    log_debug "curl -k -s --connect-timeout 2 --max-time 5 -w '\\n%{http_code}' -u '${rest_api_user}:${rest_api_password}' '$url'"
+    log_debug "====================================================================="
+    
     response=$(curl -k -s --connect-timeout 2 --max-time 5 -w "\n%{http_code}" -u "${rest_api_user}:${rest_api_password}" \
         "$url" 2>&1)
     local curl_exit=$?
@@ -9140,9 +9240,15 @@ get_snapshots_in_dataset() {
     local pool_name="$1"
     local dataset_name="$2"
     local response
+    local url="https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc"
+
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR GET SNAPSHOTS IN DATASET ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' '$url'"
+    log_debug "=============================================================================="
 
     response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
+        "$url")
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
@@ -9186,9 +9292,15 @@ get_snapshots_with_times() {
     local pool_name="$1"
     local dataset_name="$2"
     local response
+    local url="https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc"
+
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR GET SNAPSHOTS WITH TIMES ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' '$url'"
+    log_debug "=============================================================================="
 
     response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
+        "$url")
 
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
@@ -9908,12 +10020,18 @@ create_clone_from_snapshot() {
     local clone_name="$4"
 
     local json_input="{\"name\": \"${clone_name}\"}"
+    local url="https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots/$snapshot_name/clones"
+
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR CREATE CLONE FROM SNAPSHOT ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -w '\\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_input' '$url'"
+    log_debug "================================================================================="
 
     local response
     response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots/$snapshot_name/clones")
+        "$url")
 
     local body=$(echo "$response" | sed '$d')
     local status=$(echo "$response" | tail -n1)
@@ -9957,11 +10075,18 @@ create_nfs_share_for_clone() {
 EOF
 )
 
+    local url="https://$selected_nfs_ip:$rest_api_port/api/v4/shares"
+
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR CREATE NFS SHARE ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -w '\\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_input' '$url'"
+    log_debug "======================================================================"
+
     local response
     response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/shares")
+        "$url")
 
     local body=$(echo "$response" | sed '$d')
     local status=$(echo "$response" | tail -n1)
@@ -11572,11 +11697,18 @@ create_dataset() {
     log_info "create_dataset: JSON payload: $json_input for SOURCE pool_name='$pool_name' dataset_name='$dataset_name'"
     
     log_info "create_dataset: Making API call to SOURCE server='$selected_nfs_ip:$rest_api_port' for pool_name='$pool_name' dataset_name='$dataset_name'"
+    local url="https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes"
+
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR CREATE DATASET ==============="
+    log_debug "curl -k -s --connect-timeout 10 --max-time 30 -w '\\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_input' '$url'"
+    log_debug "===================================================================="
+
     local response
     response=$(curl -k -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes" 2>/dev/null)
+        "$url" 2>/dev/null)
     
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
@@ -11631,11 +11763,18 @@ create_nfs_share_for_dataset() {
 EOF
 )
     
+    local url="https://$selected_nfs_ip:$rest_api_port/api/v4/shares"
+
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR CREATE NFS SHARE FOR DATASET ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -w '\\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_input' '$url'"
+    log_debug "================================================================================="
+
     local response
     response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
-        "https://$selected_nfs_ip:$rest_api_port/api/v4/shares")
+        "$url")
     
     local body=$(echo "$response" | sed '$d')
     local status=$(echo "$response" | tail -n1)
@@ -11657,49 +11796,184 @@ EOF
 # Helper function: Find next available dataset number
 find_next_dataset_number() {
     local pool_name="$1"
-    local max_number=0
+    local start_pattern="$new_NFS_storage_volume_running_number_starts_with"
     
-    log_debug "Finding next dataset number for pool: $pool_name"
+    # Determine starting number and format from pattern (same logic as storage naming)
+    local start_number
+    local format_pattern
     
-    # Get existing datasets and find highest number
+    case "$start_pattern" in
+        "00")
+            start_number=0
+            format_pattern="%02d"
+            ;;
+        "01")
+            start_number=1
+            format_pattern="%02d"
+            ;;
+        "000")
+            start_number=0
+            format_pattern="%03d"
+            ;;
+        "001")
+            start_number=1
+            format_pattern="%03d"
+            ;;
+        "10")
+            start_number=10
+            format_pattern="%d"
+            ;;
+        "100")
+            start_number=100
+            format_pattern="%d"
+            ;;
+        *)
+            # Fallback to default
+            start_number=1
+            format_pattern="%02d"
+            log_error "Unknown number pattern '$start_pattern', using default %02d format"
+            ;;
+    esac
+    
+    local number=$start_number
+    
+    log_debug "Finding next available dataset number for pool: $pool_name, start_pattern: $start_pattern, start_number: $start_number, format: $format_pattern"
+    
+    # Get all existing datasets with the auto-prefix
+    local existing_datasets=()
     while IFS= read -r dataset; do
         if [[ "$dataset" =~ ^${DATASET_AUTO_PREFIX}-([0-9]+)$ ]]; then
-            local num="${BASH_REMATCH[1]}"
-            # Remove leading zeros for comparison
-            num=$((10#$num))
-            if [[ $num -gt $max_number ]]; then
-                max_number=$num
-            fi
+            existing_datasets+=("$dataset")
         fi
     done < <(get_datasets_in_pool "$pool_name" 2>/dev/null)
     
-    # Increment and format with leading zero
-    local next_number=$((max_number + 1))
-    printf "%02d" "$next_number"
+    # Find first available number starting from configured pattern
+    while true; do
+        local candidate="${DATASET_AUTO_PREFIX}-$(printf "$format_pattern" "$number")"
+        local exists=false
+        
+        for existing in "${existing_datasets[@]}"; do
+            if [[ "$existing" == "$candidate" ]]; then
+                exists=true
+                break
+            fi
+        done
+        
+        if [[ "$exists" == false ]]; then
+            printf "$format_pattern" "$number"
+            return 0
+        fi
+        
+        ((number++))
+        
+        # Safety check to prevent infinite loop - adjust limit based on format
+        local max_limit=999
+        if [[ "$format_pattern" == "%02d" ]]; then
+            max_limit=99
+        elif [[ "$format_pattern" == "%03d" ]]; then
+            max_limit=999
+        fi
+        
+        if [[ $number -gt $max_limit ]]; then
+            log_error "find_next_dataset_number: Reached maximum dataset number limit ($max_limit) for pattern $start_pattern"
+            return 1
+        fi
+    done
 }
 
 # Helper function: Find next available storage name
 find_next_storage_name() {
     local prefix="${storage_vm_name_contains}-nfs"
-    local max_number=0
+    local start_pattern="$new_NFS_storage_volume_running_number_starts_with"
     
-    log_debug "Finding next storage name with prefix: $prefix"
+    # Determine starting number and format from pattern
+    local start_number
+    local format_pattern
     
-    # Check existing storage names in PVE
+    case "$start_pattern" in
+        "00")
+            start_number=0
+            format_pattern="%02d"
+            ;;
+        "01")
+            start_number=1
+            format_pattern="%02d"
+            ;;
+        "000")
+            start_number=0
+            format_pattern="%03d"
+            ;;
+        "001")
+            start_number=1
+            format_pattern="%03d"
+            ;;
+        "10")
+            start_number=10
+            format_pattern="%d"
+            ;;
+        "100")
+            start_number=100
+            format_pattern="%d"
+            ;;
+        *)
+            # Fallback to default
+            start_number=1
+            format_pattern="%02d"
+            log_error "Unknown number pattern '$start_pattern', using default %02d format"
+            ;;
+    esac
+    
+    local number=$start_number
+    
+    log_debug "Finding next available storage name with prefix: $prefix, start_pattern: $start_pattern, start_number: $start_number, format: $format_pattern"
+    
+    # Get all existing storage names
+    local existing_storages=()
     while IFS= read -r storage_name; do
         if [[ "$storage_name" =~ ^${prefix}([0-9]+)$ ]]; then
-            local num="${BASH_REMATCH[1]}"
-            # Remove leading zeros for comparison
-            num=$((10#$num))
-            if [[ $num -gt $max_number ]]; then
-                max_number=$num
-            fi
+            existing_storages+=("$storage_name")
+            log_debug "find_next_storage_name: Found matching storage: $storage_name"
         fi
     done < <(grep -Po '^nfs:\s*\K\S+' /etc/pve/storage.cfg 2>/dev/null)
     
-    # Increment and format with leading zero
-    local next_number=$((max_number + 1))
-    echo "${prefix}$(printf "%02d" "$next_number")"
+    log_debug "find_next_storage_name: Total existing storages: ${#existing_storages[@]} [${existing_storages[*]}]"
+    
+    # Find first available number starting from configured pattern
+    while true; do
+        local candidate="${prefix}$(printf "$format_pattern" "$number")"
+        local exists=false
+        
+        log_debug "find_next_storage_name: Checking candidate: $candidate"
+        
+        for existing in "${existing_storages[@]}"; do
+            if [[ "$existing" == "$candidate" ]]; then
+                exists=true
+                log_debug "find_next_storage_name: Candidate $candidate already exists"
+                break
+            fi
+        done
+        
+        if [[ "$exists" == false ]]; then
+            log_debug "find_next_storage_name: Found available name: $candidate"
+            echo "$candidate"
+            return 0
+        fi
+        
+        ((number++))
+        
+        # Safety check to prevent infinite loop - adjust limit based on format
+        local max_limit=999
+        if [[ "$format_pattern" == "%02d" ]]; then
+            max_limit=99
+        elif [[ "$format_pattern" == "%03d" ]]; then
+            max_limit=999
+        fi
+        
+        if [[ $number -gt $max_limit ]]; then
+            log_error "find_next_storage_name: Reached maximum storage number limit ($max_limit) for pattern $start_pattern"
+            return 1
+        fi
+    done
 }
 
 # Helper function: Get export path from PVE storage configuration
@@ -11933,6 +12207,11 @@ EOF
     local url="https://$dst_ip:$rest_api_port/api/v4/pools/$dst_pool/datasets"
     log_info "create_remote_backup_dataset: Making API call to DESTINATION server='$dst_ip:$rest_api_port' URL='$url' for pool_name='$dst_pool' dataset_name='$dst_dataset'"
     
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR CREATE REMOTE BACKUP DATASET ==============="
+    log_debug "curl -k -s -w '\\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
+    log_debug "================================================================================="
+    
     local response
     response=$(curl -k -s -w "\n%{http_code}" -X POST \
         -u "${rest_api_user}:${rest_api_password}" \
@@ -11988,11 +12267,18 @@ create_remote_dataset() {
     log_info "create_remote_dataset: JSON payload: $json_input for DESTINATION pool_name='$dst_pool' dataset_name='$dst_dataset'"
     
     log_info "create_remote_dataset: Making API call to DESTINATION server='$dst_ip:$rest_api_port' for pool_name='$dst_pool' dataset_name='$dst_dataset'"
+    local url="https://$dst_ip:$rest_api_port/api/v4/pools/$dst_pool/nas-volumes"
+
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR CREATE REMOTE DATASET ==============="
+    log_debug "curl -k -s --connect-timeout 10 --max-time 30 -w '\\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_input' '$url'"
+    log_debug "============================================================================"
+
     local response
     response=$(curl -k -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_input" \
-        "https://$dst_ip:$rest_api_port/api/v4/pools/$dst_pool/nas-volumes" 2>/dev/null)
+        "$url" 2>/dev/null)
     
     local curl_exit=$?
     if [[ $curl_exit -ne 0 ]]; then
@@ -12704,6 +12990,11 @@ get_pools() {
     local response
     local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
     log_debug "get_pools: Making request to: $url"
+    
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR GET POOLS ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -w '\\n%{http_code}' -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' '$url'"
+    log_debug "==============================================================="
     
     response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \

@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.61"
+VERSION="0.62"
 RELEASE_DATE="2025-08-19"
 
 # Script mode flag
@@ -14178,8 +14178,8 @@ get_unused_nfs_storages() {
     
     log_debug "get_unused_nfs_storages: Unused storages: $(echo "$unused_storages" | tr '\n' ' ')"
     
-    # Remove trailing newline and return
-    echo -n "$unused_storages" | sed '/^$/d'
+    # Sort and remove trailing newline and return
+    echo -n "$unused_storages" | sed '/^$/d' | sort
 }
 
 # Get storage details including file count and size

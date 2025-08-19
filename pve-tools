@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.62"
+VERSION="0.63"
 RELEASE_DATE="2025-08-19"
 
 # Script mode flag
@@ -5090,6 +5090,9 @@ checkup_summary() {
 
 # Global variable to remember main menu selection across calls
 MAIN_MENU_LAST_SELECTED="0"
+
+# Global variable to remember last selected storage in delete unused NFS storage wizard
+DELETE_UNUSED_NFS_LAST_SELECTED="1"
 
 # Display main menu and handle user selections
 main_menu() {
@@ -11357,20 +11360,55 @@ Continuing with remaining setup..." \
     if check_oodp_task_exists "$selected_pool" "$selected_dataset" "$selected_nfs_ip"; then
         log_info "perform_new_nfs_setup: OODP task already exists for $selected_pool/$selected_dataset"
         
-        # Check if existing task has destinations when we want to add them
-        if [[ -n "$oodp_destinations_json" ]] && [[ -z "$OODP_TASK_DESTINATIONS" || "$OODP_TASK_DESTINATIONS" == "[]" ]]; then
-            log_info "perform_new_nfs_setup: Updating existing OODP task with destinations"
-            dialog --title "Creating ODP Task" --infobox "Updating existing OODP task with backup destinations..." 8 60
+        # Debug: Log existing destinations for analysis
+        log_debug "perform_new_nfs_setup: Existing OODP_TASK_DESTINATIONS: '$OODP_TASK_DESTINATIONS'"
+        log_debug "perform_new_nfs_setup: New oodp_destinations_json: '$oodp_destinations_json'"
+        
+        # Check if we have new destinations to add and if they differ from existing ones
+        if [[ -n "$oodp_destinations_json" ]]; then
+            local needs_update=false
             
-            if update_oodp_task_destinations "$selected_pool" "$selected_dataset" "$selected_nfs_ip" "$oodp_destinations_json"; then
-                log_info "perform_new_nfs_setup: OODP task updated successfully with destinations"
-                oodp_status="OODP auto-snapshot: Configured with backup destinations"
+            # Check if existing destinations are empty or if new destinations are different
+            if [[ -z "$OODP_TASK_DESTINATIONS" ]] || [[ "$OODP_TASK_DESTINATIONS" == "[]" ]]; then
+                log_debug "perform_new_nfs_setup: Existing task has no destinations, needs update"
+                needs_update=true
             else
-                log_error "perform_new_nfs_setup: Failed to update OODP task with destinations (non-critical)"
-                oodp_status="OODP auto-snapshot: Configured (destinations need manual setup)"
+                # Check if the new destinations contain different entries than existing ones
+                # Extract destination dataset paths from both for comparison
+                local new_destinations_check
+                new_destinations_check=$(echo "$oodp_destinations_json" | jq -r '.[].dataset' 2>/dev/null | sort)
+                
+                local existing_destinations_check
+                existing_destinations_check=$(echo "$OODP_TASK_DESTINATIONS" | jq -r '.[].dataset' 2>/dev/null | sort)
+                
+                log_debug "perform_new_nfs_setup: New destinations: '$new_destinations_check'"
+                log_debug "perform_new_nfs_setup: Existing destinations: '$existing_destinations_check'"
+                
+                if [[ "$new_destinations_check" != "$existing_destinations_check" ]]; then
+                    log_debug "perform_new_nfs_setup: Destinations differ, needs update"
+                    needs_update=true
+                else
+                    log_debug "perform_new_nfs_setup: Destinations are identical, no update needed"
+                fi
+            fi
+            
+            if [[ "$needs_update" == "true" ]]; then
+                log_info "perform_new_nfs_setup: Updating existing OODP task with new/different destinations"
+                dialog --title "Creating ODP Task" --infobox "Updating existing OODP task with backup destinations..." 8 60
+                
+                if update_oodp_task_destinations "$selected_pool" "$selected_dataset" "$selected_nfs_ip" "$oodp_destinations_json"; then
+                    log_info "perform_new_nfs_setup: OODP task updated successfully with destinations"
+                    oodp_status="OODP auto-snapshot: Configured with backup destinations"
+                else
+                    log_error "perform_new_nfs_setup: Failed to update OODP task with destinations (non-critical)"
+                    oodp_status="OODP auto-snapshot: Configured (destinations need manual setup)"
+                fi
+            else
+                log_info "perform_new_nfs_setup: Existing OODP task already has same destinations configured"
+                oodp_status="OODP auto-snapshot: Already configured with destinations"
             fi
         else
-            log_info "perform_new_nfs_setup: Existing OODP task already has proper configuration"
+            log_info "perform_new_nfs_setup: No new destinations specified, existing OODP task unchanged"
             oodp_status="OODP auto-snapshot: Already configured"
         fi
     else
@@ -11578,7 +11616,7 @@ create_oodp_task() {
     "granular_resync": true,
     "mbuffer": false,
     "destinations": $destinations_json,
-    "send_encrypted": false
+    "send_encrypted": true
 }
 EOF
         )
@@ -11591,7 +11629,8 @@ EOF
     "description": "$storage_name",
     "dedup": false,
     "granular_resync": true,
-    "mbuffer": false
+    "mbuffer": false,
+    "send_encrypted": true
 }
 EOF
         )
@@ -11608,7 +11647,7 @@ EOF
     
     # Log the FULL curl command for manual testing
     log_debug "=============== FULL CURL COMMAND FOR MANUAL TESTING ==============="
-    log_debug "curl -k -s -w '\\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
+    log_debug "curl -k -s -w '\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
     log_debug "====================================================================="
     
     # Also log a pretty-printed version of the JSON for easier reading
@@ -11624,7 +11663,8 @@ EOF
     
     local response
     log_debug "create_oodp_task: About to execute curl command"
-    response=$(curl -k -s -w "\n%{http_code}" -X POST \
+    log_debug "curl -k -s --connect-timeout 10 --max-time 30 -w '\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
+    response=$(curl -k -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" -X POST \
         -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_payload" \
@@ -12277,11 +12317,11 @@ EOF
     
     # Log the FULL curl command for manual testing
     log_debug "=============== FULL CURL COMMAND FOR CREATE REMOTE BACKUP DATASET ==============="
-    log_debug "curl -k -s -w '\\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
+    log_debug "curl -k -s --connect-timeout 10 --max-time 30 -w '\\n%{http_code}' -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
     log_debug "================================================================================="
     
     local response
-    response=$(curl -k -s -w "\n%{http_code}" -X POST \
+    response=$(curl -k -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" -X POST \
         -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_payload" \
@@ -12726,12 +12766,18 @@ EOF
     log_debug "update_oodp_task_destinations: Update JSON payload: $json_payload"
     
     # Make REST API call to update OODP task
-    local task_name="${pool_name}_${dataset_name}"
+    # Task name format should match what's returned by API: "Pool-0/dataset-name"
+    local task_name="${pool_name}/${dataset_name}"
     local url="https://$ip_address:$rest_api_port/api/v4/odp/tasks/$task_name"
     log_debug "update_oodp_task_destinations: Making PUT request to: $url"
     
+    # Log the full curl command for debugging
+    log_debug "=============== FULL CURL COMMAND FOR UPDATE OODP TASK ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -w '\\n%{http_code}' -X PUT -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
+    log_debug "======================================================================"
+    
     local response
-    response=$(curl -k -s -w "\n%{http_code}" -X PUT \
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X PUT \
         -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_payload" \
@@ -13760,29 +13806,81 @@ delete_unused_pve_nfs_storage() {
     local dataset_result=$?
     
     if [[ $dataset_result -ne 0 ]]; then
-        log_error "delete_unused_pve_nfs_storage: Could not find dataset for share '$share_name' on JovianDSS"
-        log_info "This might be a storage configuration that exists in PVE but the dataset was already deleted from JovianDSS"
-        log_info "Proceeding to remove only the PVE storage configuration"
+        log_info "Could not find dataset via NFS shares API (share may be inactive)"
+        log_info "Attempting direct dataset lookup by constructing path: Pool-0/$share_name"
         
-        # Skip dataset deletion, only remove PVE storage configuration
-        log_info "Removing PVE storage configuration..."
-        if ! pvesm remove "$pve_storage_name"; then
-            log_error "Failed to remove PVE storage '$pve_storage_name'"
-            return 1
-        fi
+        # Fallback: Try direct dataset path construction and verification
+        local constructed_path="Pool-0/$share_name"
+        
+        # Verify the constructed path exists by querying nas-volumes directly
+        local url="https://${storage_ip}:${rest_api_port}/api/v4/pools/Pool-0/nas-volumes"
+        local temp_response=$(mktemp)
+        local temp_status=$(mktemp)
+        
+        curl -k -s -X GET \
+            -u "${rest_api_user}:${rest_api_password}" \
+            -w '%{http_code}' \
+            "$url" > "$temp_response" 2>/dev/null
+        
+        local http_status=$(tail -n1 "$temp_response")
+        sed -i '$ d' "$temp_response"  # Remove status line from response
+        local response_body=$(cat "$temp_response")
+        rm -f "$temp_response" "$temp_status"
+        
+        if [[ "$http_status" == "200" ]]; then
+            # Check if our dataset exists in the nas-volumes list
+            if echo "$response_body" | grep -q "\"name\":\s*\"$share_name\""; then
+                dataset_path="$constructed_path"
+                log_info "Found dataset '$dataset_path' via direct nas-volumes lookup"
+            else
+                log_error "Dataset '$constructed_path' not found in nas-volumes either"
+                log_info "Dataset was likely already deleted from JovianDSS"
+                log_info "Proceeding to remove only the PVE storage configuration"
+                
+                # Skip dataset deletion, only remove PVE storage configuration
+                log_info "Removing PVE storage configuration..."
+                if ! pvesm remove "$pve_storage_name"; then
+                    log_error "Failed to remove PVE storage '$pve_storage_name'"
+                    return 1
+                fi
 
-        log_info "Successfully removed PVE storage configuration '$pve_storage_name'"
+                log_info "Successfully removed PVE storage configuration '$pve_storage_name'"
 
-        # Run cleanup of inactive NFS storage
-        log_info "Running cleanup of inactive NFS storage..."
-        if ! cleanup_inactive_nfs_storage; then
-            log_error "cleanup_inactive_nfs_storage failed, but main deletion was successful"
+                # Run cleanup of inactive NFS storage
+                log_info "Running cleanup of inactive NFS storage..."
+                if ! cleanup_inactive_nfs_storage; then
+                    log_error "cleanup_inactive_nfs_storage failed, but main deletion was successful"
+                else
+                    log_info "NFS storage cleanup complete"
+                fi
+
+                log_info "Unused storage '$pve_storage_name' (PVE-only) deleted successfully"
+                return 0
+            fi
         else
-            log_info "NFS storage cleanup complete"
-        fi
+            log_error "Failed to query nas-volumes. HTTP status: $http_status"
+            log_info "Cannot verify dataset existence, proceeding to remove only PVE storage configuration"
+            
+            # Skip dataset deletion, only remove PVE storage configuration
+            log_info "Removing PVE storage configuration..."
+            if ! pvesm remove "$pve_storage_name"; then
+                log_error "Failed to remove PVE storage '$pve_storage_name'"
+                return 1
+            fi
 
-        log_info "Unused storage '$pve_storage_name' (PVE-only) deleted successfully"
-        return 0
+            log_info "Successfully removed PVE storage configuration '$pve_storage_name'"
+
+            # Run cleanup of inactive NFS storage
+            log_info "Running cleanup of inactive NFS storage..."
+            if ! cleanup_inactive_nfs_storage; then
+                log_error "cleanup_inactive_nfs_storage failed, but main deletion was successful"
+            else
+                log_info "NFS storage cleanup complete"
+            fi
+
+            log_info "Unused storage '$pve_storage_name' (PVE-only) deleted successfully"
+            return 0
+        fi
     fi
 
     log_info "Storage '$pve_storage_name' corresponds to dataset path '$dataset_path'"
@@ -13797,8 +13895,16 @@ delete_unused_pve_nfs_storage() {
         log_info "Storage '$pve_storage_name' is a regular dataset - will delete dataset"
     fi
 
-    # Step 7: Delete the dataset (clone or regular) via REST API
-    log_info "Deleting dataset..."
+    # Step 7: Remove PVE storage configuration FIRST (to unmount and free the dataset)
+    log_info "Removing PVE storage configuration first to free dataset..."
+    if ! pvesm remove "$pve_storage_name"; then
+        log_error "Failed to remove PVE storage '$pve_storage_name'"
+        return 1
+    fi
+    log_info "Successfully removed PVE storage configuration '$pve_storage_name'"
+
+    # Step 8: Now delete the dataset (clone or regular) via REST API
+    log_info "Deleting dataset from JovianDSS..."
     
     if [[ "$is_clone_dataset" == "true" ]]; then
         # Delete as cloned dataset - need to extract dataset name from path for this function
@@ -13816,15 +13922,6 @@ delete_unused_pve_nfs_storage() {
         fi
         log_info "Successfully deleted dataset '$dataset_path'"
     fi
-
-    # Step 8: Remove PVE storage configuration
-    log_info "Removing PVE storage configuration..."
-    if ! pvesm remove "$pve_storage_name"; then
-        log_error "Failed to remove PVE storage '$pve_storage_name'"
-        return 1
-    fi
-
-    log_info "Successfully removed PVE storage configuration '$pve_storage_name'"
 
     # Step 9: Run cleanup of inactive NFS storage
     log_info "Running cleanup of inactive NFS storage..."
@@ -14273,7 +14370,7 @@ show_storage_file_listing_and_confirm() {
     # Show file listing with confirmation dialog
     dialog --keep-tite \
         --title "Storage Contains Files - Confirm Deletion" \
-        --yes-label "Delete All Files" --no-label "Cancel" --extra-button --extra-label "Back" \
+        --yes-label "Delete All Files" --no-label "Back to Main" --extra-button --extra-label "Back" \
         --yesno "$(<"$temp_file")" 30 100
     
     local result=$?
@@ -14508,6 +14605,7 @@ delete_unused_nfs_storage_wizard() {
         dialog --keep-tite \
             --title "Select Unused NFS Storage to Delete" \
             --ok-label "Select" --cancel-label "Cancel" \
+            --default-item "$DELETE_UNUSED_NFS_LAST_SELECTED" \
             --menu "Choose an unused NFS storage to delete:" 18 100 10 \
             "${menu_items[@]}" 2> "$dialog_selected"
 
@@ -14518,6 +14616,9 @@ delete_unused_nfs_storage_wizard() {
         if [[ $exit_code -ne 0 || -z "$selected_index" ]]; then
             return 1
         fi
+
+        # Remember the selected option for next time
+        DELETE_UNUSED_NFS_LAST_SELECTED="$selected_index"
 
         # Get the selected storage details
         local selected_detail="${storage_details[$((selected_index - 1))]}"
@@ -14607,7 +14708,7 @@ This may take a moment." 8 50
 
     # Execute deletion using the specialized function for unused storage
     if delete_unused_pve_nfs_storage "$selected_storage"; then
-        dialog --msgbox "Successfully deleted unused NFS storage '$selected_storage'.\n\nCleanup finished.\nReview logs in:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details." 12 70
+        dialog --msgbox "Successfully deleted unused NFS storage '$selected_storage'.\n\nCleanup finished.\nReview logs in:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details.\n\nNOTE: The backup destination dataset was NOT deleted. If the backup destination dataset needs to be deleted, please proceed with the WEB GUI." 15 70
         return 0
     else
         dialog --msgbox "Error: Failed to delete unused NFS storage '$selected_storage'. Check the log file for details." 8 70

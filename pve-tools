@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.60"
-RELEASE_DATE="2025-08-18"
+VERSION="0.61"
+RELEASE_DATE="2025-08-19"
 
 # Script mode flag
 VERSION_MODE=false
@@ -97,13 +97,7 @@ PVE_VM_CONF_PATH="/etc/pve/nodes/*/qemu-server/"
 PVE_CT_CONF_PATH="/etc/pve/nodes/*/lxc/"
 
 # Define device type patterns (from pve-config-backup for comprehensive VM/CT disk detection)
-BUS_DEVS="(?:scsi|ide|sata|virtio|efidisk|tpmstate|nvme)"
-LXC_DEVS="(?:rootfs|mp[0-9]+)"
 DEVICE_PATTERN="(?:(?:rootfs|mp[0-9]+)|(?:scsi|ide|sata|virtio|efidisk|tpmstate|nvme)[0-9]+)"
-
-# Legacy patterns for backward compatibility
-DISK_TYPES="(scsi|ide|sata|virtio|efidisk|tpmstate|nvme)"
-DISK_PATTERN="^${DISK_TYPES}[0-9]+:[^:]+:[0-9]+/vm"
 
 # CLEANUP FUNCTIONS
 
@@ -187,7 +181,8 @@ build_storage_ip_map() {
     storage_ip_map=()
     
     # Read entire file at once for better performance
-    local storage_config=$(<"$storage_cfg")
+    local storage_config
+    storage_config=$(<"$storage_cfg")
     local current_storage=""
     local in_nfs_section=false
     
@@ -210,7 +205,7 @@ build_storage_ip_map() {
     
     # Save to cache
     if [[ ${#storage_ip_map[@]} -gt 0 ]]; then
-        > "$cache_file"  # Clear cache file
+        true > "$cache_file"  # Clear cache file
         for storage_name in "${!storage_ip_map[@]}"; do
             echo "${storage_name}|${storage_ip_map[$storage_name]}" >> "$cache_file"
         done
@@ -246,6 +241,7 @@ get_storage_ip() {
         local ip="${storage_ip_map[$storage_name]}"
         log_debug "get_storage_ip: Found IP '$ip' for storage '$storage_name'"
         selected_nfs_ip="$ip"
+        echo "$ip"
         return 0
     else
         log_error "get_storage_ip: No IP mapping found for storage '$storage_name'"
@@ -575,8 +571,7 @@ get_dataset_pool_name_cached() {
 
     # Get cached pools
     local pools
-    pools=$(get_cached_pools "$nfs_ip")
-    if [[ $? -ne 0 ]]; then
+    if ! pools=$(get_cached_pools "$nfs_ip"); then
         log_debug "get_dataset_pool_name_cached: No cached pools list available for IP $nfs_ip"
         return 1
     fi
@@ -589,8 +584,7 @@ get_dataset_pool_name_cached() {
 
         # Get cached nas-volumes for this pool
         local response
-        response=$(get_cached_nas_volumes "$nfs_ip" "$pool_name")
-        if [[ $? -ne 0 ]]; then
+        if ! response=$(get_cached_nas_volumes "$nfs_ip" "$pool_name"); then
             continue  # Skip this pool if we can't get cached data
         fi
 
@@ -650,8 +644,7 @@ is_clone_cached() {
 
     # Get cached nas-volumes data for this pool
     local response
-    response=$(get_cached_nas_volumes "$nfs_ip" "$pool_name")
-    if [[ $? -ne 0 ]]; then
+    if ! response=$(get_cached_nas_volumes "$nfs_ip" "$pool_name"); then
         log_error "is_clone_cached: Failed to get cached nas-volumes data"
         return 1
     fi
@@ -856,9 +849,9 @@ EOF
                 # Create masked version
                 local masked_pwd
                 if [[ ${#pwd_value} -le 3 ]]; then
-                    masked_pwd=$(printf '%*s' ${#pwd_value} | tr ' ' '*')
+                    masked_pwd=$(printf '%*s' ${#pwd_value} "" | tr ' ' '*')
                 else
-                    masked_pwd="${pwd_value:0:3}$(printf '%*s' $((${#pwd_value} - 3)) | tr ' ' '*')"
+                    masked_pwd="${pwd_value:0:3}$(printf '%*s' $((${#pwd_value} - 3)) "" | tr ' ' '*')"
                 fi
                 
                 # Log the masked version
@@ -877,10 +870,10 @@ EOF
         local masked_pwd
         if [[ ${#rest_api_password} -le 3 ]]; then
             # For very short passwords, mask all characters
-            masked_pwd=$(printf '%*s' ${#rest_api_password} | tr ' ' '*')
+            masked_pwd=$(printf '%*s' ${#rest_api_password} "" | tr ' ' '*')
         else
             # Show first 3 characters and mask the rest
-            masked_pwd="${rest_api_password:0:3}$(printf '%*s' $((${#rest_api_password} - 3)) | tr ' ' '*')"
+            masked_pwd="${rest_api_password:0:3}$(printf '%*s' $((${#rest_api_password} - 3)) "" | tr ' ' '*')"
         fi
         log_debug "init_config: rest_api_password preview='$masked_pwd'"
         log_debug "init_config: rest_api_port='$rest_api_port'"
@@ -1015,11 +1008,13 @@ pve_vm_ct_conf_file() {
     fi
     
     # Determine if it's a VM or CT
-    local type=$(vm_type "$vmid")
+    local type
+    type=$(vm_type "$vmid")
     
     if [[ "$type" == "ct" ]]; then
         # Use pve_ct_conf_file for containers
-        local conf_file=$(pve_ct_conf_file "$vmid")
+        local conf_file
+        conf_file=$(pve_ct_conf_file "$vmid")
         if [[ -n "$conf_file" ]]; then
             cat "$conf_file"
             return 0
@@ -1029,7 +1024,8 @@ pve_vm_ct_conf_file() {
         fi
     else
         # Use pve_vm_conf_file for VMs
-        local conf_file=$(pve_vm_conf_file "$vmid")
+        local conf_file
+        conf_file=$(pve_vm_conf_file "$vmid")
         if [[ -n "$conf_file" ]]; then
             cat "$conf_file"
             return 0
@@ -1197,7 +1193,7 @@ ENDSCRIPT
     local wait_count=0
     local max_wait=120  # 2 minutes timeout
     
-    while [ $(jobs -r | wc -l) -gt 0 ] && [ $wait_count -lt $max_wait ]; do
+    while [ "$(jobs -r | wc -l)" -gt 0 ] && [ $wait_count -lt $max_wait ]; do
         sleep 1
         ((wait_count++))
         if [ $((wait_count % 10)) -eq 0 ]; then
@@ -1207,7 +1203,7 @@ ENDSCRIPT
     done
     
     local remaining_jobs=$(jobs -r | wc -l)
-    if [ $remaining_jobs -gt 0 ]; then
+    if [ "$remaining_jobs" -gt 0 ]; then
         log_error "Timeout: $remaining_jobs cleanup jobs still running after ${max_wait}s"
         log_error "Killing remaining background processes..."
         jobs -p | xargs -r kill -9 2>/dev/null
@@ -1446,7 +1442,6 @@ ensure_pve_config_backup_running() {
     fi
     
     local total_nodes=$(echo "$node_list" | wc -l)
-    local processed=0
     local installed=0
     local started=0
     local already_running=0
@@ -1545,7 +1540,7 @@ ENDSCRIPT
     log_info "pve-config-backup setup complete on HA nodes - Total: $total_nodes, Already running: $already_running, Installed: $installed, Started: $started"
     
     # Only show dialog if action was taken (installations or starts)
-    if [ $installed -gt 0 ] || [ $started -gt 0 ]; then
+    if [ "$installed" -gt 0 ] || [ "$started" -gt 0 ]; then
         dialog --msgbox "pve-config-backup setup complete on HA nodes.\nTotal nodes: $total_nodes\nAlready running: $already_running\nInstalled: $installed\nStarted: $started" 12 60
     fi
     
@@ -4599,7 +4594,7 @@ checkup_summary() {
     
     # Use clustered location for collecting SSH results
     local cluster_temp_file="/etc/pve/.pve-tools-status-$$"
-    > "$cluster_temp_file"  # Initialize empty file
+    true > "$cluster_temp_file"  # Initialize empty file
     
     log_debug "Starting to process node list"
     log_info "TESTING: Entering while loop now"
@@ -6603,9 +6598,16 @@ restore_ct() {
         return 1
     fi
     
-    # Start the start-and-stop sequence in background
+    # Start the start-and-stop sequence in background using SSH
     # Use nohup to fully detach the job
-    nohup bash -c "pct start $ctid; pct stop $ctid" > "$LOGS_DIR/restore_ct_${ctid}.log" 2>&1 < /dev/null &
+    local host_ip
+    host_ip=$(host_ip "$host_name")
+    if [[ -z "$host_ip" ]]; then
+        log_error "Cannot resolve IP for host '$host_name'"
+        return 1
+    fi
+    
+    nohup bash -c "ssh root@$host_ip 'pct start $ctid; pct stop $ctid'" > "$LOGS_DIR/restore_ct_${ctid}.log" 2>&1 < /dev/null &
     
     log_info "CT $ctid restored"
     return 0
@@ -7363,13 +7365,33 @@ vm_type() {
     fi
 }
 
-# Optimized function to get all VM/CT information using direct file parsing
+# Optimized function to get all VM/CT information using hybrid approach
 # Returns: vmid|name|type|status|node|tags|lock
-# This is ~10x faster than using pvesh API calls
+# Performance: Fast file parsing + single cluster API call for status
 get_all_vm_ct_info() {
     local vm_ct_list=()
+    declare -A vm_details       # vmid -> "name|tags|lock|node"
+    declare -A ct_details       # ctid -> "name|tags|lock|node"
+    declare -A status_map       # vmid -> "status"
     
-    # Process VMs from qemu-server configs
+    # Get all VM/CT status in one cluster API call (fast!)
+    local status_data
+    if status_data=$(pvesh get /cluster/resources --type vm --output-format json 2>/dev/null | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    for item in data:
+        if 'vmid' in item and 'status' in item:
+            print(f\"{item['vmid']}:{item['status']}\")
+except: pass
+" 2>/dev/null); then
+        # Parse cluster status into associative array
+        while IFS=':' read -r vmid status; do
+            [[ -n "$vmid" && -n "$status" ]] && status_map["$vmid"]="$status"
+        done <<< "$status_data"
+    fi
+    
+    # Parse VM configs for detailed info
     for conf_file in /etc/pve/nodes/*/qemu-server/*.conf; do
         [[ -f "$conf_file" ]] || continue
         
@@ -7378,7 +7400,6 @@ get_all_vm_ct_info() {
         local name="unnamed"
         local tags=""
         local lock=""
-        local status="unknown"
         
         # Parse config file for details
         while IFS=': ' read -r key value; do
@@ -7389,12 +7410,8 @@ get_all_vm_ct_info() {
             esac
         done < "$conf_file"
         
-        # Check VM status - running if PID file exists
-        if [[ -f "/var/run/qemu-server/${vmid}.pid" ]]; then
-            status="running"
-        else
-            status="stopped"
-        fi
+        # Get status from cluster data or fallback
+        local status="${status_map[$vmid]:-unknown}"
         
         # Handle suspended/paused status
         if [[ "$lock" == "suspended" ]]; then
@@ -7404,7 +7421,7 @@ get_all_vm_ct_info() {
         vm_ct_list+=("$vmid|$name|vm|$status|$node|$tags|$lock")
     done
     
-    # Process CTs from lxc configs
+    # Parse CT configs for detailed info
     for conf_file in /etc/pve/nodes/*/lxc/*.conf; do
         [[ -f "$conf_file" ]] || continue
         
@@ -7413,7 +7430,6 @@ get_all_vm_ct_info() {
         local name="unnamed"
         local tags=""
         local lock=""
-        local status="unknown"
         
         # Parse config file for details
         while IFS=': ' read -r key value; do
@@ -7424,23 +7440,8 @@ get_all_vm_ct_info() {
             esac
         done < "$conf_file"
         
-        # Check CT status using lxc-info or process check
-        if command -v lxc-info >/dev/null 2>&1; then
-            local ct_status=$(lxc-info -n "$ctid" 2>/dev/null | grep "State:" | awk '{print $2}')
-            case "$ct_status" in
-                "RUNNING") status="running" ;;
-                "STOPPED") status="stopped" ;;
-                "FROZEN") status="suspended" ;;
-                *) status="stopped" ;;
-            esac
-        else
-            # Fallback: check if container's init process exists
-            if [[ -d "/proc/$(cat /var/run/lxc/${ctid}.pid 2>/dev/null)" ]]; then
-                status="running"
-            else
-                status="stopped"
-            fi
-        fi
+        # Get status from cluster data or fallback
+        local status="${status_map[$ctid]:-unknown}"
         
         # Handle suspended/paused status
         if [[ "$lock" == "suspended" ]]; then
@@ -7456,20 +7457,33 @@ get_all_vm_ct_info() {
 
 is_power_on() {
     local vmid="$1"
-    local type status
+    local type status vm_node vm_node_ip
 
-    # Determine if this is a VM or CT
+    # Determine if this is a VM or CT and find which node it's on
     type=$(vm_type "$vmid")
+    vm_node=$(on_which_host_vmct_is "$vmid")
+    
+    if [[ -z "$vm_node" ]]; then
+        log_error "Cannot find node for VM/CT $vmid"
+        return 1
+    fi
+    
+    # Get IP for the node
+    vm_node_ip=$(host_ip "$vm_node")
+    if [[ -z "$vm_node_ip" ]]; then
+        log_error "Cannot resolve IP for node '$vm_node'"
+        return 1
+    fi
 
-    # Get status using appropriate command
-    if command -v qm >/dev/null 2>&1 && command -v pct >/dev/null 2>&1; then
-        if [[ "$type" == "ct" ]]; then
-            status=$(pct status "$vmid" 2>/dev/null | awk '{print $2}')
-        else
-            status=$(qm status "$vmid" 2>/dev/null | awk '{print $2}')
-        fi
+    # Get status using SSH to execute command on the correct node
+    if [[ "$type" == "ct" ]]; then
+        status=$(ssh root@"$vm_node_ip" "pct status '$vmid'" 2>/dev/null < /dev/null | awk '{print $2}')
     else
-        log_error "Required commands (qm/pct) not available for VM/CT status check"
+        status=$(ssh root@"$vm_node_ip" "qm status '$vmid'" 2>/dev/null < /dev/null | awk '{print $2}')
+    fi
+    
+    if [[ -z "$status" ]]; then
+        log_error "Failed to get status for VM/CT $vmid on node $vm_node"
         return 1
     fi
 
@@ -7761,18 +7775,33 @@ launch_disk_move() {
     local SRC="$2"
     local DST="$3"
     
-    # Detect VM/CT type to determine correct config directory and commands
+    # Detect VM/CT type and find which node it's on
     local type=$(vm_type "$vmid")
+    local vm_node=$(on_which_host_vmct_is "$vmid")
+    local vm_node_ip
+    
+    if [[ -z "$vm_node" ]]; then
+        log_error "Cannot find node for VM/CT $vmid"
+        return 1
+    fi
+    
+    # Get IP for the node
+    vm_node_ip=$(host_ip "$vm_node")
+    if [[ -z "$vm_node_ip" ]]; then
+        log_error "Cannot resolve IP for node '$vm_node'"
+        return 1
+    fi
+    
     local CONFIG_DIR
     local move_cmd
     local cleanup_cmd
     
     if [[ "$type" == "ct" ]]; then
-        CONFIG_DIR="/etc/pve/nodes/$(hostname)/lxc"
-        log_info "Launching disk move operations for CT $vmid from $SRC to $DST"
+        CONFIG_DIR="/etc/pve/nodes/$vm_node/lxc"
+        log_info "Launching disk move operations for CT $vmid from $SRC to $DST on node $vm_node"
     else
-        CONFIG_DIR="/etc/pve/nodes/$(hostname)/qemu-server"  
-        log_info "Launching disk move operations for VM $vmid from $SRC to $DST"
+        CONFIG_DIR="/etc/pve/nodes/$vm_node/qemu-server"  
+        log_info "Launching disk move operations for VM $vmid from $SRC to $DST on node $vm_node"
     fi
     
     log_info "Using nohup pattern - processes will survive shell exit"
@@ -7784,15 +7813,15 @@ launch_disk_move() {
     for disk in "${disks[@]}"; do
         log_info "Moving disk $disk for $type $vmid from $SRC to $DST"
 
-        # Construct the appropriate move command based on type
+        # Construct the appropriate move command based on type (using SSH)
         if [[ "$type" == "ct" ]]; then
-            # For containers, use pct move-volume
-            move_cmd="pct move-volume '$vmid' '$disk' '$DST' --delete 0"
-            cleanup_cmd="sed -i '/^unused[0-9]\\+:/d' '$CONFIG_DIR/$vmid.conf'"
+            # For containers, use pct move-volume via SSH
+            move_cmd="ssh root@$vm_node_ip 'pct move-volume $vmid $disk $DST --delete 0'"
+            cleanup_cmd="ssh root@$vm_node_ip \"sed -i '/^unused[0-9]\\\\+:/d' '$CONFIG_DIR/$vmid.conf'\""
         else
-            # For VMs, use qm move_disk (original behavior)
-            move_cmd="qm move_disk '$vmid' '$disk' '$DST' --delete 0"
-            cleanup_cmd="sed -i '/^unused[0-9]\\+:/d' '$CONFIG_DIR/$vmid.conf'"
+            # For VMs, use qm move_disk via SSH
+            move_cmd="ssh root@$vm_node_ip 'qm move_disk $vmid $disk $DST --delete 0'"
+            cleanup_cmd="ssh root@$vm_node_ip \"sed -i '/^unused[0-9]\\\\+:/d' '$CONFIG_DIR/$vmid.conf'\""
         fi
 
         # Launch disk move in background with nohup (survives shell exit)
@@ -7866,22 +7895,37 @@ wait_for_disk_migration_completion() {
 
 delete_snapshots() {
     local vmid="$1"
+    local vm_node vm_node_ip
 
     log_info "Deleting snapshots for VM $vmid (standard mode)"
 
-    # Get array of snapshot names
+    # Find which node the VM is on
+    vm_node=$(on_which_host_vmct_is "$vmid")
+    if [[ -z "$vm_node" ]]; then
+        log_error "Cannot find node for VM $vmid"
+        return 1
+    fi
+    
+    # Get IP for the node
+    vm_node_ip=$(host_ip "$vm_node")
+    if [[ -z "$vm_node_ip" ]]; then
+        log_error "Cannot resolve IP for node '$vm_node'"
+        return 1
+    fi
+
+    # Get array of snapshot names using SSH
     local snaps=()
-    mapfile -t snaps < <(qm listsnapshot "$vmid" | awk '/`->/ {print $2}' | grep -v '^current$' || true)
+    mapfile -t snaps < <(ssh root@"$vm_node_ip" "qm listsnapshot '$vmid'" < /dev/null | awk '/`->/ {print $2}' | grep -v '^current$' || true)
 
     # Process each snapshot
     for snapshot in "${snaps[@]}"; do
-        log_info "Deleting snapshot: $snapshot for VM $vmid"
+        log_info "Deleting snapshot: $snapshot for VM $vmid on node $vm_node"
 
-        # Delete snapshot with force flag (ignores locks)
-        qm delsnapshot "$vmid" "$snapshot" --force &>> "$LOG_FILE"
+        # Delete snapshot with force flag (ignores locks) using SSH
+        ssh root@"$vm_node_ip" "qm delsnapshot '$vmid' '$snapshot' --force" < /dev/null &>> "$LOG_FILE"
 
         # Wait for deletion to complete by polling until snapshot is gone
-        until ! qm listsnapshot "$vmid" | grep -q "^$snapshot"; do
+        until ! ssh root@"$vm_node_ip" "qm listsnapshot '$vmid'" < /dev/null | grep -q "^$snapshot"; do
             sleep 2
         done
     done
@@ -8068,7 +8112,8 @@ EOF
                                 while [[ $task_wait_count -lt $max_wait_time ]]; do
                                 # Check task status using pvesh
                                 # Try to get the full task status JSON
-                                local task_json=$(pvesh get /nodes/$(hostname)/tasks/$upid/status --output-format json 2>/dev/null)
+                                local task_json
+                                task_json=$(pvesh get /nodes/"$(hostname)"/tasks/$upid/status --output-format json 2>/dev/null)
                                 
                                 if [[ -n "$task_json" ]]; then
                                     # Extract status from JSON
@@ -8146,13 +8191,35 @@ EOF
                     
                     # Check if container needs to be stopped for migration
                     local was_running=false
+                    local ct_node="" ct_node_ip=""  # Make available for restart operations
+                    
+                    # Get node and IP for any container operations
+                    if [[ "$type" == "ct" ]]; then
+                        ct_node=$(on_which_host_vmct_is "$vmid")
+                        if [[ -z "$ct_node" ]]; then
+                            log_error "Cannot find node for container $vmid"
+                            vm_success=false
+                            echo "FAILED:$vmid" > "$result_file"
+                            return 1
+                        fi
+                        
+                        ct_node_ip=$(host_ip "$ct_node")
+                        if [[ -z "$ct_node_ip" ]]; then
+                            log_error "Cannot resolve IP for node '$ct_node'"
+                            vm_success=false
+                            echo "FAILED:$vmid" > "$result_file"
+                            return 1
+                        fi
+                    fi
+                    
                     if [[ "$type" == "ct" ]] && is_power_on "$vmid"; then
                         log_info "Step 0: Stopping running container $vmid for storage migration"
-                        if pct stop "$vmid" >> "$LOG_FILE" 2>&1; then
-                            log_info "Container $vmid stopped successfully"
+                        
+                        if ssh root@"$ct_node_ip" "pct stop '$vmid'" < /dev/null >> "$LOG_FILE" 2>&1; then
+                            log_info "Container $vmid stopped successfully on node $ct_node"
                             was_running=true
                         else
-                            log_error "Failed to stop container $vmid - aborting migration"
+                            log_error "Failed to stop container $vmid on node $ct_node - aborting migration"
                             vm_success=false
                             # Early exit if we can't stop the container
                             echo "FAILED:$vmid" > "$result_file"
@@ -8179,10 +8246,10 @@ EOF
                             # Step 5: Restart container if it was running before migration
                             if [[ "$type" == "ct" && "$was_running" == "true" ]]; then
                                 log_info "Step 5: Restarting container $vmid (was running before migration)"
-                                if pct start "$vmid" >> "$LOG_FILE" 2>&1; then
-                                    log_info "Container $vmid restarted successfully"
+                                if ssh root@"$ct_node_ip" "pct start '$vmid'" < /dev/null >> "$LOG_FILE" 2>&1; then
+                                    log_info "Container $vmid restarted successfully on node $ct_node"
                                 else
-                                    log_error "Failed to restart container $vmid - manual intervention may be required"
+                                    log_error "Failed to restart container $vmid on node $ct_node - manual intervention may be required"
                                     # Don't fail the migration for restart issues
                                 fi
                             fi
@@ -8193,10 +8260,10 @@ EOF
                             # If migration failed but container was stopped, try to restart it
                             if [[ "$type" == "ct" && "$was_running" == "true" ]]; then
                                 log_info "Attempting to restart container $vmid after failed migration"
-                                if pct start "$vmid" >> "$LOG_FILE" 2>&1; then
-                                    log_info "Container $vmid restarted successfully after failed migration"
+                                if ssh root@"$ct_node_ip" "pct start '$vmid'" < /dev/null >> "$LOG_FILE" 2>&1; then
+                                    log_info "Container $vmid restarted successfully after failed migration on node $ct_node"
                                 else
-                                    log_error "Failed to restart container $vmid after failed migration - manual intervention required"
+                                    log_error "Failed to restart container $vmid after failed migration on node $ct_node - manual intervention required"
                                 fi
                             fi
                         fi
@@ -8207,8 +8274,8 @@ EOF
                         # If we stopped the container but can't find disks, restart it
                         if [[ "$type" == "ct" && "$was_running" == "true" ]]; then
                             log_info "Restarting container $vmid after disk discovery failure"
-                            if pct start "$vmid" >> "$LOG_FILE" 2>&1; then
-                                log_info "Container $vmid restarted successfully"
+                            if ssh root@"$ct_node_ip" "pct start '$vmid'" < /dev/null >> "$LOG_FILE" 2>&1; then
+                                log_info "Container $vmid restarted successfully on node $ct_node"
                             else
                                 log_error "Failed to restart container $vmid - manual intervention required"
                             fi
@@ -9511,7 +9578,10 @@ nfs_step1_select_ip() {
             esac
             
             # Convert IP to sortable format (pad octets with zeros)
-            local sortable_ip=$(printf "%03d.%03d.%03d.%03d" $(echo "$ip" | tr '.' ' '))
+            local -a octets
+            IFS='.' read -ra octets <<< "$ip"
+            local sortable_ip
+            sortable_ip=$(printf "%03d.%03d.%03d.%03d" "${octets[0]}" "${octets[1]}" "${octets[2]}" "${octets[3]}")
             
             ip_data+=("${role_priority}|${sortable_ip}|${ip}|${hostname}|${node_role}")
         fi
@@ -10178,7 +10248,7 @@ refresh_storage_cache() {
     log_info "Refreshing storage cache for '$storage_name'..."
     
     # Force Proxmox VE to refresh storage information
-    pvesh set /nodes/$(hostname)/storage/"$storage_name" --enabled 1 2>/dev/null || true
+    pvesh set /nodes/"$(hostname)"/storage/"$storage_name" --enabled 1 2>/dev/null || true
     
     # Wait a moment for the refresh to take effect
     sleep 2
@@ -10781,9 +10851,7 @@ nfs_new_step3_dataset_choice() {
 nfs_new_step4a_create_dataset() {
     # Find next available dataset number
     local next_number
-    next_number=$(find_next_dataset_number "$selected_pool")
-    
-    if [[ $? -ne 0 ]]; then
+    if ! next_number=$(find_next_dataset_number "$selected_pool"); then
         dialog --msgbox "Failed to determine next dataset number!\n\nPool: $selected_pool" 10 60
         return 2  # Go back
     fi
@@ -13547,7 +13615,7 @@ delete_pve_NFS_storage() {
     log_info "Confirmed: '$pve_storage_name' is a PVE NFS storage"
 
     # Step 2: Get the IP address for this storage
-    get_storage_ip "$pve_storage_name"
+    get_storage_ip "$pve_storage_name" >/dev/null
     if [[ $? -ne 0 ]]; then
         log_error "delete_pve_NFS_storage: No IP mapping found for storage '$pve_storage_name'"
         return 1
@@ -13640,7 +13708,7 @@ delete_unused_pve_nfs_storage() {
     log_info "Confirmed: '$pve_storage_name' is a PVE NFS storage"
 
     # Step 2: Get the IP address for this storage
-    get_storage_ip "$pve_storage_name"
+    get_storage_ip "$pve_storage_name" >/dev/null
     if [[ $? -ne 0 ]]; then
         log_error "delete_unused_pve_nfs_storage: No IP mapping found for storage '$pve_storage_name'"
         return 1
@@ -14508,7 +14576,7 @@ delete_unused_nfs_storage_wizard() {
         log_debug "  - '$storage' -> '${storage_ip_map[$storage]}'"
     done
     
-    get_storage_ip "$selected_storage"
+    get_storage_ip "$selected_storage" >/dev/null
     local get_ip_result=$?
     log_debug "delete_unused_nfs_storage_wizard: get_storage_ip returned code: $get_ip_result"
     
@@ -14855,6 +14923,76 @@ vm_manager_get_vm_details() {
     return 1
 }
 
+# Find which host/node a VM/CT is located on
+# Usage: on_which_host_vmct_is <vmid>
+# Returns: node name or empty if not found
+on_which_host_vmct_is() {
+    local vmid="$1"
+    
+    if [[ -z "$vmid" ]]; then
+        log_error "on_which_host_vmct_is: VMID parameter is required"
+        return 1
+    fi
+    
+    log_debug "on_which_host_vmct_is: Looking for VM/CT $vmid"
+    
+    # Get VM/CT info using optimized function
+    local vm_info=$(get_all_vm_ct_info | grep "^${vmid}|" | head -1)
+    
+    if [[ -n "$vm_info" ]]; then
+        # Extract node from the info
+        # Format: vmid|name|type|status|node|tags|lock
+        local node=$(echo "$vm_info" | cut -d'|' -f5)
+        
+        log_debug "on_which_host_vmct_is: VM/CT $vmid found on node: $node"
+        echo "$node"
+        return 0
+    fi
+    
+    log_debug "on_which_host_vmct_is: VM/CT $vmid not found"
+    return 1
+}
+
+# Get IP address for a given hostname/node
+# Usage: host_ip <hostname>
+# Returns: IP address or empty if not found
+host_ip() {
+    local hostname="$1"
+    
+    if [[ -z "$hostname" ]]; then
+        log_error "host_ip: hostname parameter is required"
+        return 1
+    fi
+    
+    log_debug "host_ip: Looking up IP for hostname '$hostname'"
+    
+    # First try to get IP from corosync configuration (for cluster nodes)
+    local corosync_ip
+    corosync_ip=$(awk -v target="$hostname" '
+        $1 == "name:" {node=$2}
+        $1 == "ring0_addr:" && node == target {print $2; exit}
+    ' /etc/pve/corosync.conf 2>/dev/null)
+    
+    if [[ -n "$corosync_ip" ]]; then
+        log_debug "host_ip: Found IP '$corosync_ip' for hostname '$hostname' in corosync.conf"
+        echo "$corosync_ip"
+        return 0
+    fi
+    
+    # Fallback to getent for name resolution
+    local getent_ip
+    getent_ip=$(getent hosts "$hostname" 2>/dev/null | awk '{print $1; exit}')
+    
+    if [[ -n "$getent_ip" ]]; then
+        log_debug "host_ip: Found IP '$getent_ip' for hostname '$hostname' via getent"
+        echo "$getent_ip"
+        return 0
+    fi
+    
+    log_debug "host_ip: No IP found for hostname '$hostname'"
+    return 1
+}
+
 # Execute action on VM/CT for VM/CT Manager
 vm_manager_execute_action() {
     local vmid="$1"
@@ -14936,54 +15074,31 @@ vm_manager_execute_action() {
         return 1
     fi
     
-    # Execute command on correct node
-    if [[ "$vm_node" == "$current_node" ]]; then
-        # Execute locally
-        cmd_to_run="$base_cmd"
-        log_debug "Executing locally: $cmd_to_run"
-        log_info "Executing locally: $cmd_to_run"
-        
-        result=$(bash -c "$cmd_to_run" 2>&1)
-        local exit_code=$?
-        
-        log_debug "Command result: exit_code=$exit_code, output='$result'"
-        
-        if [[ $exit_code -eq 0 ]]; then
-            log_info "Action $action completed successfully for VM/CT $vmid"
-            return 0
-        else
-            log_error "Action $action failed for VM/CT $vmid: $result (exit code: $exit_code)"
-            return 1
-        fi
+    # Execute command on correct node using SSH
+    local vm_node_ip
+    vm_node_ip=$(host_ip "$vm_node")
+    
+    if [[ -z "$vm_node_ip" ]]; then
+        log_error "Cannot resolve IP for node '$vm_node'"
+        return 1
+    fi
+    
+    # Always use SSH to execute on target node (even if it's the current node)
+    cmd_to_run="ssh root@$vm_node_ip '$base_cmd'"
+    log_debug "Executing via SSH on node $vm_node ($vm_node_ip): $cmd_to_run"
+    log_info "Executing via SSH on node $vm_node: $base_cmd"
+    
+    result=$(ssh root@"$vm_node_ip" "$base_cmd" 2>&1 < /dev/null)
+    local exit_code=$?
+    
+    log_debug "SSH command result: exit_code=$exit_code, output='$result'"
+    
+    if [[ $exit_code -eq 0 ]]; then
+        log_info "Action $action completed successfully for VM/CT $vmid on node $vm_node"
+        return 0
     else
-        # Execute on remote node using pvesh
-        if [[ "$vm_type" == "vm" ]]; then
-            cmd_to_run="pvesh create /nodes/$vm_node/qemu/$vmid/status/$action"
-        elif [[ "$vm_type" == "ct" ]]; then
-            # For containers, reset should be reboot in pvesh as well
-            if [[ "$action" == "reset" ]]; then
-                cmd_to_run="pvesh create /nodes/$vm_node/lxc/$vmid/status/reboot"
-                log_debug "Building remote CT command (reset->reboot): $cmd_to_run"
-            else
-                cmd_to_run="pvesh create /nodes/$vm_node/lxc/$vmid/status/$action"
-            fi
-        fi
-        
-        log_debug "Executing on remote node $vm_node: $cmd_to_run"
-        log_info "Executing on node $vm_node: $cmd_to_run"
-        
-        result=$(bash -c "$cmd_to_run" 2>&1)
-        local exit_code=$?
-        
-        log_debug "Remote command result: exit_code=$exit_code, output='$result'"
-        
-        if [[ $exit_code -eq 0 ]]; then
-            log_info "Action $action completed successfully for VM/CT $vmid on node $vm_node"
-            return 0
-        else
-            log_error "Action $action failed for VM/CT $vmid on node $vm_node: $result (exit code: $exit_code)"
-            return 1
-        fi
+        log_error "Action $action failed for VM/CT $vmid on node $vm_node: $result (exit code: $exit_code)"
+        return 1
     fi
 }
 
@@ -16250,7 +16365,7 @@ apply_startup_settings() {
             type="CT"
         else
             # Try to find the config file on any node
-            for node_conf in /etc/pve/nodes/*/qemu-server/$vmid.conf; do
+            for node_conf in /etc/pve/nodes/*/qemu-server/"$vmid".conf; do
                 if [[ -f "$node_conf" ]]; then
                     config_file="$node_conf"
                     type="VM"
@@ -16258,7 +16373,7 @@ apply_startup_settings() {
                 fi
             done
             if [[ -z "$config_file" ]]; then
-                for node_conf in /etc/pve/nodes/*/lxc/$vmid.conf; do
+                for node_conf in /etc/pve/nodes/*/lxc/"$vmid".conf; do
                     if [[ -f "$node_conf" ]]; then
                         config_file="$node_conf"
                         type="CT"
@@ -16348,18 +16463,38 @@ apply_startup_settings() {
             if [[ "$type" == "VM" ]]; then
                 log_debug "apply_startup_settings: Applying boot order '$storage_vm_boot_order' for VM $vmid"
                 
-                # Set boot order
-                if qm set "$vmid" --boot "order=$storage_vm_boot_order" 2>/dev/null; then
-                    log_info "Successfully set boot order to '$storage_vm_boot_order' for VM $vmid"
-                else
-                    log_error "Failed to set boot order for VM $vmid"
+                # Find which node the VM is on
+                local vm_node vm_node_ip
+                vm_node=$(on_which_host_vmct_is "$vmid")
+                if [[ -z "$vm_node" ]]; then
+                    log_error "Cannot find node for VM $vmid"
+                    local formatted_result=$(printf "%-3s %-*s [%s]: ERROR - Cannot find node" "$vmid" $((max_name_len + 2)) "($vm_name)" "$vm_data_type")
+                    results_text+="$formatted_result\n"
+                    ((total_errors++))
+                    continue
                 fi
                 
-                # Delete ide2 (typically the CD-ROM) if it exists
-                if qm set "$vmid" --delete ide2 2>/dev/null; then
-                    log_info "Successfully removed ide2 device from VM $vmid"
+                vm_node_ip=$(host_ip "$vm_node")
+                if [[ -z "$vm_node_ip" ]]; then
+                    log_error "Cannot resolve IP for node '$vm_node'"
+                    local formatted_result=$(printf "%-3s %-*s [%s]: ERROR - Cannot resolve node IP" "$vmid" $((max_name_len + 2)) "($vm_name)" "$vm_data_type")
+                    results_text+="$formatted_result\n"
+                    ((total_errors++))
+                    continue
+                fi
+                
+                # Set boot order using SSH
+                if ssh root@"$vm_node_ip" "qm set '$vmid' --boot 'order=$storage_vm_boot_order'" < /dev/null >/dev/null 2>&1; then
+                    log_info "Successfully set boot order to '$storage_vm_boot_order' for VM $vmid on node $vm_node"
                 else
-                    log_debug "No ide2 device to remove or failed to remove ide2 for VM $vmid"
+                    log_error "Failed to set boot order for VM $vmid on node $vm_node"
+                fi
+                
+                # Delete ide2 (typically the CD-ROM) if it exists using SSH
+                if ssh root@"$vm_node_ip" "qm set '$vmid' --delete ide2" < /dev/null >/dev/null 2>&1; then
+                    log_info "Successfully removed ide2 device from VM $vmid on node $vm_node"
+                else
+                    log_debug "No ide2 device to remove or failed to remove ide2 for VM $vmid on node $vm_node"
                 fi
             fi
             
@@ -17013,8 +17148,7 @@ EOF_PERL_MODULE
         fi
         
         # Write the new module
-        echo "$module_content" > "$module_path"
-        if [ $? -eq 0 ]; then
+        if echo "$module_content" > "$module_path"; then
             log_info "PveToolsDiskMigration module installed successfully"
         else
             log_error "Failed to install PveToolsDiskMigration module"

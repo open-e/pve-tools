@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.65"
+VERSION="0.66"
 RELEASE_DATE="2025-08-20"
 
 # Script mode flag
@@ -765,7 +765,7 @@ concurrent_vm_disk_move_count=2
 number_of_pve_hosts_in_ha_cluster=2
 oodp_backup_destination_port=40000
 oodp_src_default_plan='1hour=>1minute,3days=>15minutes,2weeks=>1hour'
-oodp_dst_default_plan='12hours=>5minutes,1week=>15minutes,3weeks=>1hour,12hours=>3months'
+oodp_dst_default_plan='12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months'
 EOF
         log_info "Created default config file: $CONFIG_FILE"
     fi
@@ -2968,7 +2968,7 @@ fix_missing_oodp_tasks() {
                     local dest_port="${oodp_dst_port:-40000}"
                     local dest_dataset="${dataset_name}-backup"
                     
-                    dest_array+=("{\"plan\":\"${oodp_dst_default_plan:-12hours=>5minutes,1week=>15minutes,3weeks=>1hour,12hours=>3months}\",\"dataset\":\"$backup_ip:$dest_port/$dest_pool/$dest_dataset\"}")
+                    dest_array+=("{\"plan\":\"$oodp_dst_default_plan\",\"dataset\":\"$backup_ip:$dest_port/$dest_pool/$dest_dataset\"}")
                 done <<< "$backup_servers"
                 
                 if [[ ${#dest_array[@]} -gt 0 ]]; then
@@ -5789,93 +5789,146 @@ setup_oodp_dialog() {
 
 # Setup OODP backup destination port
 setup_oodp_port_dialog() {
-    local temp_input=$(mktemp)
-    local current_port="${oodp_backup_destination_port:-40000}"
-    
-    dialog --keep-tite --title "OODP Backup Destination Port" \
-           --inputbox "Enter the OODP backup destination port:\n\nThis port is used for communication with backup/DR nodes.\n\nDefault: 40000" 12 60 "$current_port" 2>"$temp_input"
-    
-    local result=$?
-    local new_port=$(< "$temp_input")
-    rm -f "$temp_input"
-    
-    case $result in
-        0)  # OK
-            # Validate port number
-            if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ $new_port -ge 1 && $new_port -le 65535 ]]; then
-                oodp_backup_destination_port="$new_port"
-                log_info "User changed OODP backup destination port to: $oodp_backup_destination_port"
-                save_config_file
-                dialog --msgbox "OODP backup destination port saved successfully!\n\nPort: $oodp_backup_destination_port" 8 60
-            else
-                dialog --msgbox "Invalid port number!\n\nPort must be between 1 and 65535." 8 60
-            fi
-            ;;
-        1)  # Cancel
-            ;;
-    esac
-    
-    return 0
+    while true; do
+        local temp_input=$(mktemp)
+        local current_port="${oodp_backup_destination_port:-40000}"
+        
+        dialog --keep-tite --title "OODP Backup Destination Port" \
+               --ok-label "Save" --cancel-label "Back" \
+               --extra-button --extra-label "Restore to Factory" \
+               --inputbox "Enter the OODP backup destination port:\n\nThis port is used for communication with backup/DR nodes.\n\nFactory Default: 40000\nCurrent: $current_port" 14 70 "$current_port" 2>"$temp_input"
+        
+        local result=$?
+        local new_port=$(< "$temp_input")
+        rm -f "$temp_input"
+        
+        case $result in
+            0)  # Save
+                # Validate port number
+                if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ $new_port -ge 1 && $new_port -le 65535 ]]; then
+                    oodp_backup_destination_port="$new_port"
+                    log_info "User changed OODP backup destination port to: $oodp_backup_destination_port"
+                    save_config_file
+                    dialog --msgbox "OODP backup destination port saved successfully!\n\nPort: $oodp_backup_destination_port" 8 60
+                    return 0
+                else
+                    dialog --msgbox "Invalid port number!\n\nPort must be between 1 and 65535." 8 60
+                fi
+                ;;
+            1)  # Back
+                return 0
+                ;;
+            3)  # Restore to Factory
+                dialog --keep-tite --title "Restore to Factory" \
+                       --yes-label "Restore" --no-label "Cancel" \
+                       --yesno "This will restore the OODP backup destination port to factory default.\n\nFactory Default: 40000\nCurrent: $current_port\n\nContinue?" 12 60
+                
+                if [[ $? -eq 0 ]]; then
+                    oodp_backup_destination_port="40000"
+                    log_info "User restored OODP backup destination port to factory default: $oodp_backup_destination_port"
+                    save_config_file
+                    dialog --msgbox "OODP backup destination port restored to factory default!\n\nPort: $oodp_backup_destination_port" 8 60
+                fi
+                # Stay in dialog - continue the loop
+                ;;
+        esac
+    done
 }
 
 # Setup OODP source default plan
 setup_oodp_src_plan_dialog() {
-    local temp_input=$(mktemp)
-    local current_plan="${oodp_src_default_plan:-1hour=>1minute,3days=>15minutes,2weeks=>1hour}"
-    
-    dialog --keep-tite --title "OODP Source Default Plan" \
-           --inputbox "Enter the OODP source default plan:\n\nFormat: retention=>interval,retention=>interval,...\nExample: 1hour=>1minute,3days=>15minutes,2weeks=>1hour\n\nThis defines the snapshot schedule for source datasets." 14 70 "$current_plan" 2>"$temp_input"
-    
-    local result=$?
-    local new_plan=$(< "$temp_input")
-    rm -f "$temp_input"
-    
-    case $result in
-        0)  # OK
-            if [[ -n "$new_plan" ]]; then
-                oodp_src_default_plan="$new_plan"
-                log_info "User changed OODP source default plan to: $oodp_src_default_plan"
-                save_config_file
-                dialog --msgbox "OODP source default plan saved successfully!\n\nPlan: $oodp_src_default_plan" 10 70
-            else
-                dialog --msgbox "Plan cannot be empty!" 8 60
-            fi
-            ;;
-        1)  # Cancel
-            ;;
-    esac
-    
-    return 0
+    while true; do
+        local temp_input=$(mktemp)
+        local current_plan="$oodp_src_default_plan"
+        
+        dialog --keep-tite --title "OODP Source Default Plan" \
+               --ok-label "Save" --cancel-label "Back" \
+               --extra-button --extra-label "Restore to Factory" \
+               --inputbox "Enter the OODP source default plan:\n\nFormat: retention=>interval,retention=>interval,...\nExample: 1hour=>1minute,3days=>15minutes,2weeks=>1hour\n\nThis defines the snapshot schedule for source datasets.\n\nFactory Default: 1hour=>1minute,3days=>15minutes,2weeks=>1hour" 16 75 "$current_plan" 2>"$temp_input"
+        
+        local result=$?
+        local new_plan=$(< "$temp_input")
+        rm -f "$temp_input"
+        
+        case $result in
+            0)  # Save
+                if [[ -n "$new_plan" ]]; then
+                    oodp_src_default_plan="$new_plan"
+                    log_info "User changed OODP source default plan to: $oodp_src_default_plan"
+                    save_config_file
+                    dialog --msgbox "OODP source default plan saved successfully!\n\nPlan: $oodp_src_default_plan" 10 75
+                    return 0
+                else
+                    dialog --msgbox "Plan cannot be empty!" 8 60
+                fi
+                ;;
+            1)  # Back
+                return 0
+                ;;
+            3)  # Restore to Factory
+                local factory_default="1hour=>1minute,3days=>15minutes,2weeks=>1hour"
+                dialog --keep-tite --title "Restore to Factory" \
+                       --yes-label "Restore" --no-label "Cancel" \
+                       --yesno "This will restore the OODP source default plan to factory default.\n\nFactory Default:\n$factory_default\n\nCurrent:\n$current_plan\n\nContinue?" 14 75
+                
+                if [[ $? -eq 0 ]]; then
+                    oodp_src_default_plan="$factory_default"
+                    log_info "User restored OODP source default plan to factory default: $oodp_src_default_plan"
+                    save_config_file
+                    dialog --msgbox "OODP source default plan restored to factory default!\n\nPlan: $oodp_src_default_plan" 10 75
+                fi
+                # Stay in dialog - continue the loop
+                ;;
+        esac
+    done
 }
 
 # Setup OODP destination default plan
 setup_oodp_dst_plan_dialog() {
-    local temp_input=$(mktemp)
-    local current_plan="${oodp_dst_default_plan:-12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months}"
-    
-    dialog --keep-tite --title "OODP Destination Default Plan" \
-           --inputbox "Enter the OODP destination default plan:\n\nFormat: retention=>interval,retention=>interval,...\nExample: 12hours=>5minute,1week=>15minutes,3weeks=>1hour\n\nThis defines the retention policy for backup destinations." 14 70 "$current_plan" 2>"$temp_input"
-    
-    local result=$?
-    local new_plan=$(< "$temp_input")
-    rm -f "$temp_input"
-    
-    case $result in
-        0)  # OK
-            if [[ -n "$new_plan" ]]; then
-                oodp_dst_default_plan="$new_plan"
-                log_info "User changed OODP destination default plan to: $oodp_dst_default_plan"
-                save_config_file
-                dialog --msgbox "OODP destination default plan saved successfully!\n\nPlan: $oodp_dst_default_plan" 10 70
-            else
-                dialog --msgbox "Plan cannot be empty!" 8 60
-            fi
-            ;;
-        1)  # Cancel
-            ;;
-    esac
-    
-    return 0
+    while true; do
+        local temp_input=$(mktemp)
+        local current_plan="$oodp_dst_default_plan"
+        
+        dialog --keep-tite --title "OODP Destination Default Plan" \
+               --ok-label "Save" --cancel-label "Back" \
+               --extra-button --extra-label "Restore to Factory" \
+               --inputbox "Enter the OODP destination default plan:\n\nFormat: retention=>interval,retention=>interval,...\nExample: 12hours=>5minute,1week=>15minutes,3weeks=>1hour\n\nThis defines the retention policy for backup destinations.\n\nFactory Default: 12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months" 16 85 "$current_plan" 2>"$temp_input"
+        
+        local result=$?
+        local new_plan=$(< "$temp_input")
+        rm -f "$temp_input"
+        
+        case $result in
+            0)  # Save
+                if [[ -n "$new_plan" ]]; then
+                    oodp_dst_default_plan="$new_plan"
+                    log_info "User changed OODP destination default plan to: $oodp_dst_default_plan"
+                    save_config_file
+                    dialog --msgbox "OODP destination default plan saved successfully!\n\nPlan: $oodp_dst_default_plan" 10 85
+                    return 0
+                else
+                    dialog --msgbox "Plan cannot be empty!" 8 60
+                fi
+                ;;
+            1)  # Back
+                return 0
+                ;;
+            3)  # Restore to Factory
+                local factory_default="12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months"
+                dialog --keep-tite --title "Restore to Factory" \
+                       --yes-label "Restore" --no-label "Cancel" \
+                       --yesno "This will restore the OODP destination default plan to factory default.\n\nFactory Default:\n$factory_default\n\nCurrent:\n$current_plan\n\nContinue?" 14 85
+                
+                if [[ $? -eq 0 ]]; then
+                    oodp_dst_default_plan="$factory_default"
+                    log_info "User restored OODP destination default plan to factory default: $oodp_dst_default_plan"
+                    save_config_file
+                    dialog --msgbox "OODP destination default plan restored to factory default!\n\nPlan: $oodp_dst_default_plan" 10 85
+                fi
+                # Stay in dialog - continue the loop
+                ;;
+        esac
+    done
 }
 
 # Restore factory defaults for storage VM configuration
@@ -11102,7 +11155,7 @@ nfs_new_step5_oodp_destinations() {
     fi
     
     # Collect destinations for each backup server
-    local dst_plan="${oodp_dst_default_plan:-12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months}"
+    local dst_plan="$oodp_dst_default_plan"
     local port="${oodp_backup_destination_port:-40000}"
     
     for backup_ip in "${backup_servers[@]}"; do
@@ -11310,7 +11363,7 @@ nfs_new_step6_summary() {
     summary+="PVE Storage Name: $new_storage_name\n"
     
     summary+="\n--- OODP AUTO-SNAPSHOT CONFIGURATION ---\n"
-    local src_plan="${oodp_src_default_plan:-1hour=>1minute,3days=>15minutes,2weeks=>1hour}"
+    local src_plan="$oodp_src_default_plan"
     summary+="Source Schedule: $src_plan\n"
     
     # Show backup destinations if configured
@@ -11329,7 +11382,7 @@ nfs_new_step6_summary() {
         fi
         
         # Also show destination plan
-        local dest_plan="${oodp_dst_default_plan:-12hours=>5minute,1week=>15minutes,3weeks=>1hour,12hours=>3months}"
+        local dest_plan="$oodp_dst_default_plan"
         summary+="Destination Schedule: $dest_plan\n"
     else
         summary+="Backup destinations: Not configured\n"
@@ -11727,7 +11780,7 @@ create_oodp_task() {
     fi
     
     # Use configured plan or default
-    local src_plan="${oodp_src_default_plan:-1hour=>1minute,3days=>15minutes,2weeks=>1hour}"
+    local src_plan="$oodp_src_default_plan"
     
     # Build the JSON payload
     local json_payload

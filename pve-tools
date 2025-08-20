@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.63"
-RELEASE_DATE="2025-08-19"
+VERSION="0.64"
+RELEASE_DATE="2025-08-20"
 
 # Script mode flag
 VERSION_MODE=false
@@ -8511,6 +8511,11 @@ get_jovian_product_info() {
     local url="https://$ip:$rest_api_port/api/v4/product"
     log_debug "get_jovian_product_info: Full URL: $url"
     
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR PRODUCT INFO ==============="
+    log_debug "curl -k -s -w '\\n%{http_code}' --connect-timeout 2 --max-time 5 -u '${rest_api_user}:${rest_api_password}' '$url'"
+    log_debug "==================================================================="
+    
     response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 2 --max-time 5 -u "${rest_api_user}:${rest_api_password}" \
         "$url" 2>&1)
     local curl_exit=$?
@@ -9046,9 +9051,16 @@ validate_ip_with_connectivity() {
         log_debug "validate_ip_with_connectivity: Connection failed to $ip, exit code: $exit_code"
         
         # Test if it's a basic network connectivity issue vs authentication
+        local test_url="https://$ip:$rest_api_port/api/v4/product"
+        
+        # Log the FULL curl command for manual testing
+        log_debug "=============== FULL CURL COMMAND FOR CONNECTIVITY TEST ==============="
+        log_debug "curl -k -s -w '\\n%{http_code}' --connect-timeout 2 --max-time 5 '$test_url'"
+        log_debug "======================================================================="
+        
         local test_response
         test_response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 2 --max-time 5 \
-            "https://$ip:$rest_api_port/api/v4/product" 2>&1)
+            "$test_url" 2>&1)
         local curl_exit=$?
         
         if [[ $curl_exit -ne 0 ]]; then
@@ -12610,6 +12622,132 @@ EOF
     fi
 }
 
+# Helper function: Check if server supports destination flag feature (up >= 32)
+check_server_supports_destination_flag() {
+    local server_ip="$1"
+    
+    log_debug "check_server_supports_destination_flag: Checking version support for server $server_ip"
+    
+    # Look for the info file for this server IP
+    local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$server_ip"
+    
+    if [[ ! -f "$info_file" ]]; then
+        log_debug "check_server_supports_destination_flag: No info file found for server $server_ip"
+        return 1
+    fi
+    
+    # Extract the "up" value from the server info file
+    local up_value=$(grep "^up=" "$info_file" 2>/dev/null | cut -d'=' -f2)
+    
+    if [[ -z "$up_value" ]]; then
+        log_debug "check_server_supports_destination_flag: No 'up' value found for server $server_ip"
+        return 1
+    fi
+    
+    # Check if up value is numeric and >= 32
+    if [[ "$up_value" =~ ^[0-9]+$ ]]; then
+        if [[ "$up_value" -ge 32 ]]; then
+            log_debug "check_server_supports_destination_flag: Server $server_ip supports destination flag (up=$up_value >= 32)"
+            return 0
+        else
+            log_debug "check_server_supports_destination_flag: Server $server_ip does not support destination flag (up=$up_value < 32)"
+            return 1
+        fi
+    else
+        log_debug "check_server_supports_destination_flag: Invalid 'up' value for server $server_ip: $up_value"
+        return 1
+    fi
+}
+
+# Helper function: Check if dataset is available in ODP volumes collection
+check_dataset_available_in_odp() {
+    local dst_ip="$1"
+    local dst_pool="$2"
+    local dst_dataset="$3"
+    
+    # Check if REST API credentials are configured
+    if [[ -z "$rest_api_user" ]] || [[ -z "$rest_api_password" ]] || [[ -z "$rest_api_port" ]]; then
+        log_error "check_dataset_available_in_odp: REST API credentials not configured"
+        return 1
+    fi
+    
+    local url="https://$dst_ip:$rest_api_port/api/v4/odp/volumes/$dst_pool/$dst_dataset"
+    
+    local response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 5 --max-time 10 -u "${rest_api_user}:${rest_api_password}" "$url" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        return 1
+    fi
+    
+    local http_code=$(echo "$response" | tail -n1)
+    
+    # HTTP 200 means dataset is available in ODP collection
+    if [[ "$http_code" == "200" ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Helper function: Set destination flag for OODP volumes (JovianDSS version >= 32)
+set_destination_flag_for_volume() {
+    local dst_ip="$1"
+    local dst_pool="$2" 
+    local dst_dataset="$3"
+    
+    log_info "set_destination_flag_for_volume: Setting destination flag for volume $dst_pool/$dst_dataset on server $dst_ip"
+    
+    # Check if REST API credentials are configured
+    if [[ -z "$rest_api_user" ]] || [[ -z "$rest_api_password" ]] || [[ -z "$rest_api_port" ]]; then
+        log_error "set_destination_flag_for_volume: REST API credentials not configured"
+        return 1
+    fi
+    
+    local url="https://$dst_ip:$rest_api_port/api/v4/odp/nas-volumes/$dst_pool/$dst_dataset/set-destination-flag"
+    
+    log_debug "set_destination_flag_for_volume: Making POST request to: $url"
+    log_debug "=============== FULL CURL COMMAND FOR SET DESTINATION FLAG ==============="
+    log_debug "curl -k -s -w '\\n%{http_code}' --connect-timeout 30 --max-time 60 -X POST -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '{}' '$url'"
+    log_debug "================================================================="
+    
+    local response
+    response=$(curl -k -s -w "\n%{http_code}" \
+        --connect-timeout 30 \
+        --max-time 60 \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d '{}' \
+        -u "${rest_api_user}:${rest_api_password}" \
+        "$url" 2>&1)
+    local curl_exit=$?
+    
+    log_debug "set_destination_flag_for_volume: curl exit code: $curl_exit"
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "set_destination_flag_for_volume: Failed to connect to API at $dst_ip:$rest_api_port (curl exit code: $curl_exit)"
+        return 1
+    fi
+    
+    local http_code=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | sed '$d')
+    
+    log_debug "set_destination_flag_for_volume: HTTP status code: $http_code"
+    log_debug "set_destination_flag_for_volume: Response: $response_body"
+    
+    case "$http_code" in
+        200|201|204)
+            log_info "set_destination_flag_for_volume: Destination flag set successfully for $dst_pool/$dst_dataset on server $dst_ip"
+            return 0
+            ;;
+        *)
+            log_error "set_destination_flag_for_volume: Failed to set destination flag. HTTP status: $http_code"
+            log_error "set_destination_flag_for_volume: Response: $response_body"
+            return 1
+            ;;
+    esac
+}
+
 # Helper function: Create destination datasets with proper error handling
 create_destination_datasets() {
     local failed_destinations=()
@@ -12666,6 +12804,20 @@ Click OK to continue with this destination." \
             log_info "create_destination_datasets: User confirmed using existing DESTINATION dataset pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
             ((success_count++))
             
+            # Set destination flag if server supports it (up >= 32) for existing dataset
+            if check_server_supports_destination_flag "$dst_ip"; then
+                log_info "create_destination_datasets: Setting destination flag for existing dataset $dst_pool/$dst_dataset on server $dst_ip"
+                dialog --title "Creating Destination Datasets" --infobox "Setting destination flag for existing dataset $dest_index of $total_count...\n\nServer: $dst_ip\nPool: $dst_pool\nDataset: $dst_dataset" 10 70
+                
+                if set_destination_flag_for_volume "$dst_ip" "$dst_pool" "$dst_dataset"; then
+                    log_info "create_destination_datasets: Destination flag set successfully for existing dataset $dst_pool/$dst_dataset on server $dst_ip"
+                else
+                    log_error "create_destination_datasets: Failed to set destination flag for existing dataset $dst_pool/$dst_dataset on server $dst_ip (non-critical)"
+                fi
+            else
+                log_debug "create_destination_datasets: Server $dst_ip does not support destination flag feature, skipping"
+            fi
+            
         elif [[ $exists_result -eq 1 ]]; then
             # Dataset does not exist - create it
             log_info "create_destination_datasets: DESTINATION dataset does not exist, creating it now..."
@@ -12675,6 +12827,59 @@ Click OK to continue with this destination." \
             if create_remote_dataset "$dst_ip" "$dst_pool" "$dst_dataset"; then
                 log_info "create_destination_datasets: DESTINATION dataset created SUCCESS pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
                 ((success_count++))
+                
+                # For up32, set destination flag if server supports it
+                if check_server_supports_destination_flag "$dst_ip"; then
+                    log_info "create_destination_datasets: Server $dst_ip supports destination flag (up32), setting flag for dataset $dst_pool/$dst_dataset"
+                    
+                    # Wait for dataset to be available for destination flag setting
+                    log_debug "create_destination_datasets: Waiting for dataset $dst_pool/$dst_dataset to be ready for destination flag"
+                    local wait_count=0
+                    local max_wait=5
+                    local dataset_ready=false
+                    
+                    while [[ $wait_count -lt $max_wait ]]; do
+                        log_debug "create_destination_datasets: Checking dataset availability (attempt $((wait_count + 1)))"
+                        
+                        # Log the full curl command for debugging
+                        log_debug "=============== FULL CURL COMMAND FOR TEST DESTINATION FLAG (attempt $((wait_count + 1))) ==============="
+                        log_debug "curl -k -s -w '\\n%{http_code}' --connect-timeout 5 --max-time 10 -X POST -H 'Content-Type: application/json' -d '{}' -u '${rest_api_user}:${rest_api_password}' 'https://$dst_ip:$rest_api_port/api/v4/odp/nas-volumes/$dst_pool/$dst_dataset/set-destination-flag'"
+                        log_debug "========================================================================================"
+                        
+                        # Try to set destination flag directly - if it fails with "not found", wait more
+                        local test_response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 5 --max-time 10 -X POST \
+                            -H "Content-Type: application/json" -d '{}' -u "${rest_api_user}:${rest_api_password}" \
+                            "https://$dst_ip:$rest_api_port/api/v4/odp/nas-volumes/$dst_pool/$dst_dataset/set-destination-flag" 2>/dev/null)
+                        local test_http_code=$(echo "$test_response" | tail -n1)
+                        local test_body=$(echo "$test_response" | sed '$d')
+                        
+                        log_debug "create_destination_datasets: Test destination flag call - HTTP: $test_http_code, Body: $test_body"
+                        
+                        if [[ "$test_http_code" == "200" ]]; then
+                            log_info "create_destination_datasets: Destination flag set successfully for $dst_pool/$dst_dataset on server $dst_ip"
+                            dataset_ready=true
+                            break
+                        elif [[ "$test_body" == *"not found"* ]]; then
+                            log_debug "create_destination_datasets: Dataset not yet available in ODP, waiting... (${wait_count}s elapsed)"
+                        else
+                            log_debug "create_destination_datasets: Unexpected response: HTTP $test_http_code, Body: $test_body"
+                        fi
+                        
+                        ((wait_count++))
+                        sleep 1
+                        
+                        if [[ $((wait_count % 10)) -eq 0 ]]; then
+                            log_debug "create_destination_datasets: Still waiting for dataset to be ready for destination flag (${wait_count}s elapsed)"
+                        fi
+                    done
+                    
+                    if [[ "$dataset_ready" == "false" ]]; then
+                        log_error "create_destination_datasets: Timeout waiting for dataset $dst_pool/$dst_dataset to be ready for destination flag (${max_wait}s)"
+                        log_error "create_destination_datasets: Final test response: HTTP $test_http_code, Body: $test_body"
+                    fi
+                else
+                    log_debug "create_destination_datasets: Server $dst_ip does not support destination flag feature, skipping"
+                fi
             else
                 log_error "create_destination_datasets: DESTINATION dataset creation FAILED pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
                 failed_destinations+=("$dst_ip/$dst_pool/$dst_dataset")

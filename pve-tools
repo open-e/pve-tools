@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.66"
-RELEASE_DATE="2025-08-20"
+VERSION="0.67"
+RELEASE_DATE="2025-08-21"
 
 # Script mode flag
 VERSION_MODE=false
@@ -690,43 +690,106 @@ except Exception as e:
     fi
 }
 
-# DIALOG DEPENDENCY CHECK
+# CONSOLIDATED DEPENDENCY CHECKS
 
-# Check for dialog and install if missing
-check_for_dialog_and_install_if_missing() {
+# Check and install all required dependencies
+check_and_install_dependencies() {
+    log_info "Checking system dependencies and environment"
+    
+    # 1. Check Proxmox VE environment first
+    log_info "Validating Proxmox VE environment"
+    if ! command -v qm >/dev/null 2>&1 || ! command -v pct >/dev/null 2>&1 || ! command -v ha-manager >/dev/null 2>&1; then
+        echo "Error: This script must run on Proxmox VE. Required commands (qm, pct, ha-manager) not found." >&2
+        log_error "Proxmox VE environment validation failed - required commands missing"
+        exit 1
+    fi
+    log_info "Proxmox VE environment validated successfully"
+    
+    # 2. Check and install dialog
     log_info "Checking for dialog dependency"
-    
-    # Check if dialog is installed
-    if command -v dialog >/dev/null 2>&1; then
-        log_info "Dialog is already installed"
-        return 0
-    fi
-    
-    log_info "Dialog not found, attempting to install"
-    log_info "Installing missing dialog package. Please wait..."
-    
-    # Update package list
-    if ! apt-get update >/dev/null 2>&1; then
-        echo "Error: Failed to update package list. Please check your network connection." >&2
-        log_error "Failed to update package list"
-        exit 1
-    fi
-    
-    # Install dialog
-    if ! apt-get install -y dialog >/dev/null 2>&1; then
-        echo "Error: Failed to install dialog package. Please install it manually: apt-get install dialog" >&2
-        log_error "Failed to install dialog via apt-get"
-        exit 1
-    fi
-    
-    # Verify installation
     if ! command -v dialog >/dev/null 2>&1; then
-        echo "Error: Dialog installation failed. Please install it manually." >&2
-        log_error "Dialog installation verification failed"
-        exit 1
+        log_info "Dialog not found, attempting to install"
+        echo "Installing required dialog package. Please wait..." >&2
+        
+        # Update package list and install dialog
+        if ! apt-get update >/dev/null 2>&1 || ! apt-get install -y dialog >/dev/null 2>&1; then
+            echo "Error: Failed to install dialog package. Please install manually: apt-get install dialog" >&2
+            log_error "Failed to install dialog via apt-get"
+            exit 1
+        fi
+        
+        # Verify dialog installation
+        if ! command -v dialog >/dev/null 2>&1; then
+            echo "Error: Dialog installation failed. Please install it manually." >&2
+            log_error "Dialog installation verification failed"
+            exit 1
+        fi
+        log_info "Dialog installed successfully"
+    else
+        log_info "Dialog is already installed"
     fi
     
-    log_info "Dialog installed successfully"
+    # 3. Check and install jq
+    log_info "Checking for jq dependency"
+    if ! command -v jq >/dev/null 2>&1; then
+        log_info "jq not found, attempting to install"
+        echo "Installing required jq package. Please wait..." >&2
+        
+        # Try different package managers
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update >/dev/null 2>&1 && apt-get install -y jq >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y jq >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y jq >/dev/null 2>&1
+        else
+            echo "Error: Could not install jq - package manager not supported" >&2
+            log_error "Could not install jq: package manager not supported"
+            exit 1
+        fi
+        
+        # Verify jq installation
+        if ! command -v jq >/dev/null 2>&1; then
+            echo "Error: Failed to install jq. Please install manually: apt-get install jq" >&2
+            log_error "Failed to install jq"
+            exit 1
+        fi
+        log_info "jq installed successfully"
+    else
+        log_info "jq is already installed"
+    fi
+    
+    # 4. Check and install python3
+    log_info "Checking for python3 dependency"
+    if ! command -v python3 >/dev/null 2>&1; then
+        log_info "python3 not found, attempting to install"
+        echo "Installing required python3 package. Please wait..." >&2
+        
+        # Try different package managers
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update >/dev/null 2>&1 && apt-get install -y python3 >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y python3 >/dev/null 2>&1
+        elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y python3 >/dev/null 2>&1
+        else
+            echo "Error: Could not install python3 - package manager not supported" >&2
+            log_error "Could not install python3: package manager not supported"
+            exit 1
+        fi
+        
+        # Verify python3 installation
+        if ! command -v python3 >/dev/null 2>&1; then
+            echo "Error: Failed to install python3. Please install manually: apt-get install python3" >&2
+            log_error "Failed to install python3"
+            exit 1
+        fi
+        log_info "python3 installed successfully"
+    else
+        log_info "python3 is already installed"
+    fi
+    
+    log_info "All dependencies validated and installed successfully"
     return 0
 }
 
@@ -3102,31 +3165,6 @@ post_known_issues_fixes() {
 
 # AUTO-UPDATE FUNCTIONS
 
-# Ensure jq is installed for JSON parsing
-ensure_jq_installed() {
-    if ! command -v jq >/dev/null 2>&1; then
-        log_info "Installing jq for JSON parsing..."
-        if command -v apt-get >/dev/null 2>&1; then
-            apt-get update >/dev/null 2>&1 && apt-get install -y jq >/dev/null 2>&1
-        elif command -v yum >/dev/null 2>&1; then
-            yum install -y jq >/dev/null 2>&1
-        elif command -v dnf >/dev/null 2>&1; then
-            dnf install -y jq >/dev/null 2>&1
-        else
-            log_error "Could not install jq: package manager not supported"
-            return 1
-        fi
-        
-        if command -v jq >/dev/null 2>&1; then
-            log_info "jq installed successfully"
-        else
-            log_error "Failed to install jq"
-            return 1
-        fi
-    fi
-    return 0
-}
-
 # Get commit information from GitHub API
 get_commit_info() {
     local commit_message=""
@@ -3139,18 +3177,10 @@ get_commit_info() {
     
     log_debug "Getting commit info from: $api_url"
     
-    # Try to get commit info from GitHub API
-    if command -v jq >/dev/null 2>&1; then
-        log_debug "Using jq for JSON parsing"
-        # Use jq if available
-        commit_message=$(curl -s "$api_url" 2>/dev/null | jq -r '.commit.message // empty' 2>/dev/null)
-        log_debug "Commit message via jq: '$commit_message'"
-    else
-        log_debug "Using grep/sed fallback for JSON parsing"
-        # Fallback to grep/sed parsing
-        commit_message=$(curl -s "$api_url" 2>/dev/null | grep -o '"message"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
-        log_debug "Commit message via grep/sed: '$commit_message'"
-    fi
+    # Get commit info from GitHub API using jq
+    log_debug "Using jq for JSON parsing"
+    commit_message=$(curl -s "$api_url" 2>/dev/null | jq -r '.commit.message // empty' 2>/dev/null)
+    log_debug "Commit message via jq: '$commit_message'"
     
     if [ -n "$commit_message" ] && [ "$commit_message" != "null" ] && [ "$commit_message" != "empty" ]; then
         # Truncate very long commit messages and clean up formatting
@@ -3207,9 +3237,8 @@ get_commits_since_version() {
         return 1
     fi
     
-    # Parse commits based on available tools
-    if command -v jq >/dev/null 2>&1; then
-        log_debug "Using jq to parse commit history"
+    # Parse commits using jq
+    log_debug "Using jq to parse commit history"
         
         # First let's see the raw commit data for debugging
         local raw_commits=$(echo "$commits_json" | jq -r '.[] | "\(.commit.author.date | split("T")[0])|\(.commit.message | split("\n")[0])"' 2>/dev/null | head -10)
@@ -3290,101 +3319,6 @@ get_commits_since_version() {
                 break
             fi
         done < <(echo "$commits_json" | jq -r '.[] | "\(.commit.author.date | split("T")[0])|\(.commit.message | split("\n")[0])"' 2>/dev/null)
-        
-    else
-        log_debug "Using grep/sed fallback for commit parsing"
-        
-        # Fallback parsing without jq - extract basic commit info
-        # This is more limited but functional
-        local in_commit=false
-        local temp_date=""
-        local temp_author=""
-        local temp_message=""
-        
-        while IFS= read -r line; do
-            # Look for commit date
-            if echo "$line" | grep -q '"date"[[:space:]]*:'; then
-                temp_date=$(echo "$line" | sed 's/.*"date"[[:space:]]*:[[:space:]]*"\([^T]*\)T.*/\1/')
-            fi
-            
-            # Look for author name  
-            if echo "$line" | grep -q '"name"[[:space:]]*:'; then
-                temp_author=$(echo "$line" | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-            fi
-            
-            # Look for commit message
-            if echo "$line" | grep -q '"message"[[:space:]]*:'; then
-                temp_message=$(echo "$line" | sed 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-                
-                # We have all parts, check if we should include this commit
-                if [ -n "$temp_date" ] && [ -n "$temp_message" ]; then
-                    # First check if commit message contains version bump to our current version
-                    if echo "$temp_message" | grep -q "VERSION=$current_version"; then
-                        log_debug "Found exact version bump to $current_version in commit: $temp_message"
-                        break
-                    fi
-                    
-                    # Also check for other version references
-                    if echo "$temp_message" | grep -q "version.*$current_version\|VERSION.*$current_version"; then
-                        log_debug "Found version reference to $current_version in commit: $temp_message"
-                        if echo "$temp_message" | grep -q "VERSION=$current_version\|version to $current_version"; then
-                            log_debug "Confirmed version bump to $current_version, stopping"
-                            break
-                        fi
-                    fi
-                    
-                    # Compare dates (updated logic matching jq parsing)
-                    local current_ver_major=$(echo "$current_version" | cut -d. -f1)
-                    local current_ver_minor=$(echo "$current_version" | cut -d. -f2 2>/dev/null || echo "0")
-                    
-                    if [ "$current_ver_major" = "0" ] && [ "$current_ver_minor" -lt "10" ]; then
-                        log_debug "Very old version detected ($current_version), using extended date filtering for commit from $temp_date"
-                        if [ -n "$current_date" ]; then
-                            local commit_date_num=$(echo "$temp_date" | tr -d '-')
-                            local current_date_num=$(echo "$current_date" | tr -d '-')
-                            
-                            if [ "$commit_date_num" -lt "$current_date_num" ]; then
-                                log_debug "Found older commit from $temp_date (before $current_date), stopping"
-                                break
-                            else
-                                log_debug "Commit from $temp_date is same day or newer than $current_date, including it"
-                            fi
-                        fi
-                    elif [ -n "$current_date" ]; then
-                        local commit_date_num=$(echo "$temp_date" | tr -d '-')
-                        local current_date_num=$(echo "$current_date" | tr -d '-')
-                        
-                        if [ "$commit_date_num" -lt "$current_date_num" ]; then
-                            log_debug "Reached commit from $temp_date (before $current_date), stopping"
-                            break
-                        fi
-                        
-                        log_debug "Processing commit from $temp_date: '$temp_message'"
-                    fi
-                    
-                    # Add commit
-                    if [ -n "$formatted_commits" ]; then
-                        formatted_commits+="\n\n"
-                    fi
-                    # Trim leading and trailing spaces from commit message
-                    temp_message=$(trim_str "$temp_message")
-                    formatted_commits+="$temp_date - $temp_message"
-                    ((commit_count++))
-                    
-                    if [ $commit_count -ge 20 ]; then
-                        formatted_commits+="\n\n... and more commits (showing latest 20)"
-                        formatted_commits+="\nVisit https://github.com/${vendor_lower}/pve-tools/commits for full history"
-                        break
-                    fi
-                    
-                    # Reset for next commit
-                    temp_date=""
-                    temp_author=""
-                    temp_message=""
-                fi
-            fi
-        done <<< "$commits_json"
-    fi
     
     if [ $commit_count -eq 0 ]; then
         log_debug "No commits found since version $current_version"
@@ -3941,37 +3875,20 @@ get_oodp_details() {
     local search_pattern="$pool_name/$dataset_name"
     log_debug "get_oodp_details: Searching for pattern: '$search_pattern'"
     
-    # Check if jq is available for JSON parsing
-    if command -v jq >/dev/null 2>&1; then
-        log_debug "get_oodp_details: Using jq for JSON parsing"
-        
-        # Extract task details using jq - looking for tasks that match our dataset
-        local task_data
-        task_data=$(jq -r --arg pattern "$search_pattern" '
-            .data.entries[] | 
-            select(.name | contains($pattern)) | 
-            "\(.name)|\(.type)|\(.enabled)|\(.plan)|\(.destinations | tostring)"
-        ' "$temp_file" 2>/dev/null)
-        
-        if [[ -n "$task_data" ]]; then
-            task_found=true
-            IFS='|' read -r task_name task_type task_enabled task_plan task_destinations <<< "$task_data"
-            log_debug "get_oodp_details: Found matching task via jq"
-        fi
-    else
-        log_debug "get_oodp_details: Using grep/sed fallback for JSON parsing"
-        
-        # Fallback parsing using grep and sed
-        if grep -q "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*$search_pattern" "$temp_file"; then
-            task_found=true
-            log_debug "get_oodp_details: Found matching task via grep/sed"
-            
-            # Extract task details using grep/sed
-            task_name=$(grep -A 20 "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*$search_pattern" "$temp_file" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
-            task_type=$(grep -A 20 "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*$search_pattern" "$temp_file" | grep -o '"type"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"type"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
-            task_enabled=$(grep -A 20 "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*$search_pattern" "$temp_file" | grep -o '"enabled"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"enabled"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
-            task_plan=$(grep -A 20 "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*$search_pattern" "$temp_file" | grep -o '"plan"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"plan"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
-        fi
+    # Extract task details using jq - looking for tasks that match our dataset
+    log_debug "get_oodp_details: Using jq for JSON parsing"
+    
+    local task_data
+    task_data=$(jq -r --arg pattern "$search_pattern" '
+        .data.entries[] | 
+        select(.name | contains($pattern)) | 
+        "\(.name)|\(.type)|\(.enabled)|\(.plan)|\(.destinations | tostring)"
+    ' "$temp_file" 2>/dev/null)
+    
+    if [[ -n "$task_data" ]]; then
+        task_found=true
+        IFS='|' read -r task_name task_type task_enabled task_plan task_destinations <<< "$task_data"
+        log_debug "get_oodp_details: Found matching task via jq"
     fi
     
     # Clean up temporary file
@@ -3993,7 +3910,7 @@ get_oodp_details() {
         
         return 0
     else
-        log_error "get_oodp_details: No matching OODP task found for $pool_name/$dataset_name"
+        log_debug "get_oodp_details: No matching OODP task found for $pool_name/$dataset_name"
         return 1
     fi
 }
@@ -4793,7 +4710,7 @@ checkup_summary() {
         done < /etc/pve/ha/resources.cfg
         
     # Method 2: Fallback to ha-manager command if file not accessible
-    elif command -v ha-manager >/dev/null 2>&1; then
+    else
         local ha_manager_output
         ha_manager_output=$(ha-manager config 2>/dev/null)
         
@@ -4836,11 +4753,7 @@ checkup_summary() {
     
     # Show appropriate message based on results
     if [ $ha_resource_count -eq 0 ]; then
-        if [ -f /etc/pve/ha/resources.cfg ] || command -v ha-manager >/dev/null 2>&1; then
-            printf "%s%*s%s\n" "   No HA resources configured" $((total_width - 30 - 4)) "" "NONE" >> "$ha_temp_file"
-        else
-            printf "%s%*s%s\n" "   HA not configured or not available" $((total_width - 36 - 4)) "" "N/A" >> "$ha_temp_file"
-        fi
+        printf "%s%*s%s\n" "   No HA resources configured" $((total_width - 30 - 4)) "" "NONE" >> "$ha_temp_file"
     fi
     
     if [ -f "$ha_temp_file" ]; then
@@ -11320,13 +11233,9 @@ nfs_new_step5_oodp_destinations() {
         
         # Log pretty-printed JSON for debugging
         log_debug "=== FINAL DESTINATIONS JSON (PRETTY-PRINTED) ==="
-        if command -v python3 >/dev/null 2>&1; then
-            echo "$oodp_destinations_json" | python3 -m json.tool 2>/dev/null | while IFS= read -r line; do
-                log_debug "  $line"
-            done || log_debug "  (Could not pretty-print JSON)"
-        else
-            log_debug "  $oodp_destinations_json"
-        fi
+        echo "$oodp_destinations_json" | python3 -m json.tool 2>/dev/null | while IFS= read -r line; do
+            log_debug "  $line"
+        done || log_debug "  $oodp_destinations_json"
         log_debug "================================================"
     else
         oodp_destinations_json=""
@@ -11831,13 +11740,9 @@ EOF
     
     # Also log a pretty-printed version of the JSON for easier reading
     log_debug "=== FORMATTED JSON PAYLOAD ==="
-    if command -v python3 >/dev/null 2>&1; then
-        echo "$json_payload" | python3 -m json.tool 2>/dev/null | while IFS= read -r line; do
-            log_debug "  $line"
-        done || log_debug "  (Could not pretty-print JSON)"
-    else
-        log_debug "  $json_payload"
-    fi
+    echo "$json_payload" | python3 -m json.tool 2>/dev/null | while IFS= read -r line; do
+        log_debug "  $line"
+    done || log_debug "  $json_payload"
     log_debug "==============================="
     
     local response
@@ -12357,7 +12262,7 @@ get_dataset_from_share_name() {
     log_debug "get_dataset_from_share_name: Response: $response_body"
     
     # Check for authentication failure
-    if check_rest_api_auth_failure "get_dataset_from_share_name" "$http_status" "$response_body"; then
+    if check_rest_api_auth_failure "$http_status" "$response_body" "get_dataset_from_share_name"; then
         local auth_result=$?
         if [[ $auth_result -eq 10 ]]; then
             log_error "get_dataset_from_share_name: REST API authentication failed (401)"
@@ -12744,13 +12649,9 @@ EOF
     
     # Also log a pretty-printed version of the JSON for easier reading
     log_debug "=== FORMATTED JSON PAYLOAD FOR ODP NODE REGISTRATION ==="
-    if command -v python3 >/dev/null 2>&1; then
-        echo "$json_payload" | python3 -m json.tool 2>/dev/null | while IFS= read -r line; do
-            log_debug "  $line"
-        done || log_debug "  (Could not pretty-print JSON)"
-    else
-        log_debug "  $json_payload"
-    fi
+    echo "$json_payload" | python3 -m json.tool 2>/dev/null | while IFS= read -r line; do
+        log_debug "  $line"
+    done || log_debug "  $json_payload"
     log_debug "========================================================="
     
     local response
@@ -13690,7 +13591,7 @@ except Exception as e:
     done <<< "$pools"
 
     # Dataset not found in any pool
-    log_error "get_dataset_pool_name: Dataset '$dataset_name' not found in any pool. Searched pools: $pools"
+    log_debug "get_dataset_pool_name: Dataset '$dataset_name' not found in any pool. Searched pools: $pools"
     return 1
 }
 
@@ -13839,7 +13740,7 @@ delete_dataset() {
     log_debug "delete_dataset: Response: $response_body"
 
     # Check for authentication failure
-    if check_rest_api_auth_failure "delete_dataset" "$http_status" "$response_body"; then
+    if check_rest_api_auth_failure "$http_status" "$response_body" "delete_dataset"; then
         local auth_result=$?
         if [[ $auth_result -eq 10 ]]; then
             log_error "delete_dataset: REST API authentication failed (401)"
@@ -15675,11 +15576,6 @@ vm_ct_manager_bulk_actions() {
         return 1
     fi
     
-    # Check if Proxmox VE commands are available
-    if ! command -v qm >/dev/null 2>&1 || ! command -v pct >/dev/null 2>&1; then
-        dialog --title "Error" --msgbox "Proxmox VE commands (qm/pct) not found. Please run on a Proxmox VE node." 10 60
-        return 1
-    fi
     
     while true; do
         # Step 1: Select VMs/CTs
@@ -17656,8 +17552,8 @@ main() {
     # Initialize debug error capture system if in debug mode
     init_debug_error_capture
     
-    # Check for dialog dependency and install if missing
-    check_for_dialog_and_install_if_missing
+    # Check and install all required dependencies
+    check_and_install_dependencies
     
     # Initialize configuration
     if ! init_config; then

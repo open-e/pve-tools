@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.69"
+VERSION="0.70"
 RELEASE_DATE="2025-08-21"
 
 # Script mode flag
@@ -707,7 +707,7 @@ check_and_install_dependencies() {
     log_info "Proxmox VE environment validated successfully"
     
     # 2. Check and install dialog
-    log_info "Checking for dialog dependency"
+    log_debug "Checking for dialog dependency"
     if ! command -v dialog >/dev/null 2>&1; then
         log_info "Dialog not found, attempting to install"
         echo "Installing required dialog package. Please wait..." >&2
@@ -727,11 +727,11 @@ check_and_install_dependencies() {
         fi
         log_info "Dialog installed successfully"
     else
-        log_info "Dialog is already installed"
+        log_debug "Dialog is already installed"
     fi
     
     # 3. Check and install jq
-    log_info "Checking for jq dependency"
+    log_debug "Checking for jq dependency"
     if ! command -v jq >/dev/null 2>&1; then
         log_info "jq not found, attempting to install"
         echo "Installing required jq package. Please wait..." >&2
@@ -757,11 +757,11 @@ check_and_install_dependencies() {
         fi
         log_info "jq installed successfully"
     else
-        log_info "jq is already installed"
+        log_debug "jq is already installed"
     fi
     
     # 4. Check and install python3
-    log_info "Checking for python3 dependency"
+    log_debug "Checking for python3 dependency"
     if ! command -v python3 >/dev/null 2>&1; then
         log_info "python3 not found, attempting to install"
         echo "Installing required python3 package. Please wait..." >&2
@@ -787,7 +787,7 @@ check_and_install_dependencies() {
         fi
         log_info "python3 installed successfully"
     else
-        log_info "python3 is already installed"
+        log_debug "python3 is already installed"
     fi
     
     log_info "All dependencies validated and installed successfully"
@@ -1834,7 +1834,7 @@ cleanup_selected_unused_disks() {
 
 # Execute dialog menu and capture result
 dialog_menu() {
-    log_debug "dialog_menu: About to execute dialog command: ${cmd[*]}"
+    log_debug $'dialog_menu: About to execute dialog command:\n\n'"${cmd[*]}"$'\n'
     "${cmd[@]}" "${options[@]}" 2> "$dialog_selected"
     dialog_exit_code=$?
     selected_option=$(< "$dialog_selected")
@@ -5980,7 +5980,7 @@ get_ha_nodes() {
             if [ -n "$nodes_line" ]; then
                 # Extract node names, removing priorities if present (pve1:2 -> pve1)
                 ha_nodes=$(echo "$nodes_line" | sed 's/^\s*nodes\s*//' | tr ',' '\n' | sed 's/:.*$//' | sort)
-                log_debug "get_ha_nodes: Extracted nodes from rules.cfg: $ha_nodes"
+                log_debug "get_ha_nodes: Extracted nodes from rules.cfg: $(echo "$ha_nodes" | tr '\n' ' ')"
             else
                 log_debug "get_ha_nodes: No nodes line found in ha-nodes rule"
             fi
@@ -9332,6 +9332,7 @@ get_pool_names() {
         return 1
     fi
 
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' 'https://$addr:$rest_api_port/api/v4/pools'"
     response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
         "https://$addr:$rest_api_port/api/v4/pools")
 
@@ -9368,6 +9369,7 @@ get_datasets_in_pool() {
     local nfs_ip="${2:-$selected_nfs_ip}"  # Use provided IP or default to selected_nfs_ip
     local response
 
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' 'https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes'"
     response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
         "https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes")
 
@@ -10119,6 +10121,7 @@ extract_timestamp_from_snapname() {
         echo "${day_part}-${hourmin}"
     else
         local response
+        log_debug "curl -k -s --connect-timeout 5 --max-time 30 -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' 'https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc'"
         response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
             "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
         local curl_exit=$?
@@ -10305,7 +10308,7 @@ add_nfs_storage_to_proxmox() {
     pvesh_exit_code=$?
     
     log_debug "add_nfs_storage_to_proxmox: pvesh exit code: $pvesh_exit_code"
-    log_debug "add_nfs_storage_to_proxmox: pvesh output: $pvesh_output"
+    log_debug $'add_nfs_storage_to_proxmox: pvesh output:\n'"$pvesh_output"
     
     if [[ $pvesh_exit_code -ne 0 ]]; then
         log_error "add_nfs_storage_to_proxmox: Failed to add NFS storage (exit code: $pvesh_exit_code): $pvesh_output"
@@ -10454,6 +10457,7 @@ check_clone_exists() {
     local clone_name="$2"
     
     local response
+    log_debug "curl -k -s -w '\\n%{http_code}' -X GET -u '${rest_api_user}:${rest_api_password}' 'https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$clone_name'"
     response=$(curl -k -s -w "\n%{http_code}" -X GET \
         -u "${rest_api_user}:${rest_api_password}" \
         "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$clone_name" 2>/dev/null)
@@ -11623,7 +11627,7 @@ and try adding the storage again." \
     pvesh_exit_code=$?
     
     log_debug "pvesh exit code: $pvesh_exit_code"
-    log_debug "pvesh output: $pvesh_output"
+    log_debug $'pvesh output:\n'"$pvesh_output"
     
     if [[ $pvesh_exit_code -ne 0 ]]; then
         log_error "perform_new_nfs_setup: STEP 4 FAILED - PVE storage creation failed"
@@ -12527,6 +12531,7 @@ check_destination_dataset_exists() {
     log_debug "check_destination_dataset_exists: Making GET request to: $url"
     
     local response
+    log_debug "curl -k -s -w '\\n%{http_code}' -X GET -u '${rest_api_user}:${rest_api_password}' '$url'"
     response=$(curl -k -s -w "\n%{http_code}" -X GET \
         -u "${rest_api_user}:${rest_api_password}" \
         "$url" 2>/dev/null)
@@ -12581,6 +12586,7 @@ check_odp_destination_registered() {
     log_debug "check_odp_destination_registered: Making GET request to: $url"
     
     local response
+    log_debug "curl -k -s -w '\\n%{http_code}' -X GET --connect-timeout 5 --max-time 90 -u '${rest_api_user}:${rest_api_password}' '$url'"
     response=$(curl -k -s -w "\n%{http_code}" -X GET \
         --connect-timeout 5 --max-time 90 \
         -u "${rest_api_user}:${rest_api_password}" \
@@ -12748,6 +12754,7 @@ check_dataset_available_in_odp() {
     
     local url="https://$dst_ip:$rest_api_port/api/v4/odp/volumes/$dst_pool/$dst_dataset"
     
+    log_debug "curl -k -s -w '\\n%{http_code}' --connect-timeout 5 --max-time 10 -u '${rest_api_user}:${rest_api_password}' '$url'"
     local response=$(curl -k -s -w "\n%{http_code}" --connect-timeout 5 --max-time 10 -u "${rest_api_user}:${rest_api_password}" "$url" 2>/dev/null)
     local curl_exit=$?
     
@@ -13119,6 +13126,7 @@ get_remote_pools() {
     
     local url="https://$dst_ip:$rest_api_port/api/v4/pools"
     local response
+    log_debug "curl -k -s -w '\\n%{http_code}' -X GET -u '${rest_api_user}:${rest_api_password}' '$url'"
     response=$(curl -k -s -w "\n%{http_code}" -X GET \
         -u "${rest_api_user}:${rest_api_password}" \
         "$url" 2>/dev/null)
@@ -13748,6 +13756,7 @@ delete_dataset() {
     local url="https://${nfs_ip}:${rest_api_port}/api/v4/pools/${pool_name}/nas-volumes/${dataset_name}"
 
     local response
+    log_debug "curl -k -s -X DELETE --connect-timeout 5 --max-time 120 -u '${rest_api_user}:${rest_api_password}' -w '\\n%{http_code}\\n%{redirect_url}' '$url'"
     response=$(curl -k -s -X DELETE \
         --connect-timeout 5 --max-time 120 \
         -u "${rest_api_user}:${rest_api_password}" \
@@ -13829,6 +13838,7 @@ delete_cloned_dataset() {
     local url="https://${nfs_ip}:${rest_api_port}/api/v4/pools/${pool_name}/nas-volumes/${dataset_name}"
 
     local response
+    log_debug "curl -k -s -X DELETE --connect-timeout 5 --max-time 120 -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '{}' -w '\\n%{http_code}\\n%{redirect_url}' '$url'"
     response=$(curl -k -s -X DELETE \
         --connect-timeout 5 --max-time 120 \
         -u "${rest_api_user}:${rest_api_password}" \

@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.68"
+VERSION="0.69"
 RELEASE_DATE="2025-08-21"
 
 # Script mode flag
@@ -17593,14 +17593,9 @@ main() {
     # Install/update PveToolsDiskMigration Perl module
     install_disk_migration_module
     
-    # Check if any NFS storage exists
+    # Check if any NFS storage exists (continue regardless)
     if ! check_nfs_storage_exists; then
-        dialog --title "No NFS Storage Found" \
-               --msgbox "No NFS storage found in Proxmox VE. Please connect one first." \
-               8 60 \
-               --ok-label "Exit"
-        log_info "Script terminated: No NFS storage found"
-        exit 0
+        log_info "No NFS storage found - continuing with limited functionality"
     fi
     
     # Build storage to IP mapping table

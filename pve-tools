@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.67"
+VERSION="0.68"
 RELEASE_DATE="2025-08-21"
 
 # Script mode flag
@@ -83,6 +83,7 @@ nfs_current_step=1
 nfs_total_steps=6
 oodp_destinations_json=""
 oodp_destination_datasets=()
+skip_backup_destinations=false
 
 # NFS tuning variables
 selected_nfs_storages=""
@@ -11503,6 +11504,12 @@ Continuing with remaining setup..." \
         # Create new OODP task
         log_info "perform_new_nfs_setup: Creating new OODP task"
         
+        # Check if user chose to skip backup destinations
+        if [[ "$skip_backup_destinations" == "true" ]]; then
+            log_info "perform_new_nfs_setup: Creating auto-snapshot only OODP task (destinations skipped by user choice)"
+            oodp_destinations_json=""  # Clear destinations
+        fi
+        
         if [[ -n "$oodp_destinations_json" ]]; then
             dialog --title "Creating ODP Task" --infobox "Creating OODP task with backup destinations..." 8 60
             log_debug "perform_new_nfs_setup: Creating OODP task with destinations: $oodp_destinations_json"
@@ -12859,18 +12866,25 @@ create_destination_datasets() {
             # Dataset already exists - prompt user for confirmation
             log_info "create_destination_datasets: DESTINATION dataset ALREADY EXISTS pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
             
-            dialog --title "Destination Dataset Already Exists" --msgbox \
+            local temp_choice=$(mktemp)
+            dialog --title "Destination Dataset Already Exists" \
+                --yes-label "Confirm" --no-label "Skip-Backup-DST" --yesno \
 "The destination dataset already exists!\n\n\
 Server: $dst_ip\n\
 Pool: $dst_pool\n\
 Dataset: $dst_dataset\n\n\
-This is acceptable for backup destinations.\n\
-The ODP task will use the existing dataset.\n\n\
-Click OK to continue with this destination." \
-16 60
+If the Dataset: $dst_dataset can be used as OODP backup destination\n\
+please select 'Confirm' or not, please select 'Skip-Backup-DST'\n\n\
+NOTE: Selecting 'Skip-Backup-DST' will create only Auto-Snapshot\n\
+OODP task without the backup destination." \
+18 65 2>"$temp_choice"
+            local choice_result=$?
+            rm -f "$temp_choice"
             
-            log_info "create_destination_datasets: User confirmed using existing DESTINATION dataset pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
-            ((success_count++))
+            if [[ $choice_result -eq 0 ]]; then
+                # User chose "Confirm" - continue normally
+                log_info "create_destination_datasets: User confirmed using existing DESTINATION dataset pool_name='$dst_pool' dataset_name='$dst_dataset' on server='$dst_ip'"
+                ((success_count++))
             
             # Set destination flag if server supports it (up >= 32) for existing dataset
             if check_server_supports_destination_flag "$dst_ip"; then
@@ -12884,6 +12898,21 @@ Click OK to continue with this destination." \
                 fi
             else
                 log_debug "create_destination_datasets: Server $dst_ip does not support destination flag feature, skipping"
+            fi
+            
+            else
+                # User chose "Skip-Backup-DST"
+                skip_backup_destinations=true
+                log_info "create_destination_datasets: User chose to skip backup destinations - will create auto-snapshot only OODP task"
+                
+                # Show confirmation of choice
+                dialog --title "Auto-Snapshot Only" --msgbox \
+"You have chosen to skip backup destinations.\n\n\
+The OODP task will be created with auto-snapshots only.\n\
+No backup destinations will be configured." 10 60
+                
+                log_info "create_destination_datasets: Skipping remaining destination processing due to user choice"
+                return 0  # Return success but skip processing
             fi
             
         elif [[ $exists_result -eq 1 ]]; then

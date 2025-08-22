@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.70"
-RELEASE_DATE="2025-08-21"
+VERSION="0.71"
+RELEASE_DATE="2025-08-22"
 
 # Script mode flag
 VERSION_MODE=false
@@ -8646,7 +8646,7 @@ update_connected_storage_servers() {
         log_debug "Processing IP: $ip"
         
         # Skip non-IP entries (special menu options)
-        if [[ "$ip" == "Enter new IP" || "$ip" == "Manage custom IPs" ]]; then
+        if [[ "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
             continue
         fi
         
@@ -9229,13 +9229,13 @@ add_custom_ip() {
     log_info "Added custom IP: $new_ip"
 }
 
-remove_custom_ip() {
-    local ip_to_remove="$1"
+unregister_custom_ip() {
+    local ip_to_unregister="$1"
     local current_ips
     current_ips=$(get_custom_ips | tr '\n' ',' | sed 's/,$//')
     
     # Remove the IP
-    current_ips=$(echo "$current_ips" | sed "s/$ip_to_remove,//g" | sed "s/,$ip_to_remove//g" | sed "s/^$ip_to_remove$//g")
+    current_ips=$(echo "$current_ips" | sed "s/$ip_to_unregister,//g" | sed "s/,$ip_to_unregister//g" | sed "s/^$ip_to_unregister$//g")
     
     # Update config file
     if [[ -n "$current_ips" ]]; then
@@ -9244,7 +9244,7 @@ remove_custom_ip() {
         sed -i "/^custom_ips=/d" "$CONFIG_FILE"
     fi
     
-    log_info "Removed custom IP: $ip_to_remove"
+    log_info "Removed custom IP: $ip_to_unregister"
 }
 
 manage_custom_ips() {
@@ -9263,23 +9263,22 @@ manage_custom_ips() {
     for ((i=0; i<${#custom_ips_array[@]}; i++)); do
         local ip="${custom_ips_array[i]}"
         local hostname
-        if [[ "$ip" == "Enter new IP" || "$ip" == "Manage custom IPs" ]]; then
+        local vip_info
+        if [[ "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
             hostname=""
+            menu_items+=("$i" "$ip")
         else
             hostname=$(get_hostname_for_ip "$ip")
-        fi
-        if [[ -n "$hostname" && "$hostname" != "Unknown" ]]; then
-            menu_items+=("$i" "$(printf "%-16s - %s" "$ip" "$hostname")")
-        else
-            menu_items+=("$i" "$(printf "%-16s" "$ip")")
+            vip_info=$(get_vip_info_for_ip "$ip" "$hostname")
+            menu_items+=("$i" "$(printf "%-16s %s" "$ip" "$vip_info")")
         fi
     done
     
     local selected_ip
     local temp_output=$(mktemp)
     dialog --keep-tite --title "Manage Custom IPs" \
-        --ok-label "Delete" --cancel-label "Back" \
-        --menu "Select IP to delete:" 15 50 8 \
+        --ok-label "Unregister" --cancel-label "Back" \
+        --menu "Select IP to unregister:" 15 80 8 \
         "${menu_items[@]}" 2>"$temp_output"
     
     local dialog_result=$?
@@ -9288,12 +9287,12 @@ manage_custom_ips() {
     
     # Only proceed if user selected an IP (not cancelled)
     if [[ $dialog_result -eq 0 && -n "$selected_ip" ]]; then
-        local ip_to_delete="${custom_ips_array[selected_ip]}"
+        local ip_to_unregister="${custom_ips_array[selected_ip]}"
         # Ask for confirmation before deletion
-        if dialog --yesno "Delete IP: $ip_to_delete?" 8 40; then
-            remove_custom_ip "$ip_to_delete"
+        if dialog --yesno "Unregister IP: $ip_to_unregister?" 8 40; then
+            unregister_custom_ip "$ip_to_unregister"
             # Only show success message after actual deletion
-            dialog --msgbox "IP $ip_to_delete deleted." 8 40
+            dialog --msgbox "IP $ip_to_unregister unregistered." 8 40
         fi
     fi
 }
@@ -9317,7 +9316,7 @@ get_current_storage_servers_ip() {
     # Remove duplicates
     readarray -t uniq_ips < <(printf "%s\n" "${ips[@]}" | sort -u)
     uniq_ips+=("Enter new IP")
-    uniq_ips+=("Manage custom IPs")
+    uniq_ips+=("Unregister IPs")
 
     printf '%s\n' "${uniq_ips[@]}"
 }
@@ -9633,6 +9632,85 @@ get_pve_storage_for_dataset() {
     echo "$storage_name"
 }
 
+get_vip_info_for_ip() {
+    local target_ip="$1"
+    local hostname="$2"
+    
+    log_debug "get_vip_info_for_ip: Checking VIP status for IP '$target_ip' with hostname '$hostname'"
+    
+    # First, get all pools to determine which pools to check for VIPs
+    local pools_response
+    log_debug "get_vip_info_for_ip: Getting pools list from '$target_ip:$rest_api_port'"
+    
+    pools_response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET \
+        -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        "https://$target_ip:$rest_api_port/api/v4/pools" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_debug "get_vip_info_for_ip: Failed to connect to API at $target_ip:$rest_api_port (curl exit code: $curl_exit)"
+        echo "IP ($hostname)"
+        return 1
+    fi
+    
+    # Parse pool names from the response
+    local pool_names
+    pool_names=$(echo "$pools_response" | grep -Po '"name"\s*:\s*"\K[^"]+' | head -10)
+    
+    if [[ -z "$pool_names" ]]; then
+        log_debug "get_vip_info_for_ip: No pools found in response"
+        echo "IP ($hostname)"
+        return 1
+    fi
+    
+    log_debug "get_vip_info_for_ip: Found pools: $(echo "$pool_names" | tr '\n' ' ')"
+    
+    # Check each pool for VIPs
+    while IFS= read -r pool_name; do
+        [[ -z "$pool_name" ]] && continue
+        
+        log_debug "get_vip_info_for_ip: Checking VIPs for pool '$pool_name'"
+        
+        local vips_response
+        vips_response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET \
+            -u "${rest_api_user}:${rest_api_password}" \
+            -H 'Content-Type: application/json' \
+            "https://$target_ip:$rest_api_port/api/v4/pools/$pool_name/vips" 2>/dev/null)
+        local vips_curl_exit=$?
+        
+        if [[ $vips_curl_exit -ne 0 ]]; then
+            log_debug "get_vip_info_for_ip: Failed to get VIPs for pool '$pool_name' (curl exit code: $vips_curl_exit)"
+            continue
+        fi
+        
+        # Check if target_ip matches any VIP address in this pool
+        local vip_addresses
+        vip_addresses=$(echo "$vips_response" | grep -Po '"address"\s*:\s*"\K[^"]+')
+        
+        if [[ -n "$vip_addresses" ]]; then
+            log_debug "get_vip_info_for_ip: Pool '$pool_name' VIP addresses: $(echo "$vip_addresses" | tr '\n' ' ')"
+            
+            while IFS= read -r vip_addr; do
+                [[ -z "$vip_addr" ]] && continue
+                
+                if [[ "$vip_addr" == "$target_ip" ]]; then
+                    log_debug "get_vip_info_for_ip: Found match - IP '$target_ip' is VIP of pool '$pool_name'"
+                    echo "VIP of $pool_name ($hostname)"
+                    return 0
+                fi
+            done <<< "$vip_addresses"
+        else
+            log_debug "get_vip_info_for_ip: No VIP addresses found in pool '$pool_name'"
+        fi
+    done <<< "$pool_names"
+    
+    # If we get here, the IP is not a VIP
+    log_debug "get_vip_info_for_ip: IP '$target_ip' is not a VIP"
+    echo "IP ($hostname)"
+    return 0
+}
+
 nfs_step1_select_ip() {
     log_debug "nfs_step1_select_ip: Function started"
     local line ips=() menu_items=()
@@ -9652,7 +9730,7 @@ nfs_step1_select_ip() {
     local ip_data=()  # Array to store IP info for sorting
     
     for ip in "${ips[@]}"; do
-        if [[ "$ip" == "Enter new IP" || "$ip" == "Manage custom IPs" ]]; then
+        if [[ "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
             special_options+=("$ip")
         else
             actual_ips+=("$ip")
@@ -9714,26 +9792,27 @@ nfs_step1_select_ip() {
         local node_role
         
         # Check if this is a special menu option (not an actual IP)
-        if [[ "$ip" == "Enter new IP" || "$ip" == "Manage custom IPs" ]]; then
+        if [[ "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
             # Special menu options - don't show role
             menu_items+=("$i" "$ip")
         else
-            # Regular IP addresses - show hostname and role
+            # Regular IP addresses - show VIP info, hostname, and role
             hostname=$(get_hostname_for_ip "$ip")
             node_role=$(get_node_role_for_ip "$ip")
+            local vip_info=$(get_vip_info_for_ip "$ip" "$hostname")
             
-            # Build display string with IP, hostname, and role
+            # Build display string with IP, VIP info (replacing hostname), and role
             if [[ -n "$hostname" && "$hostname" != "Unknown" ]]; then
                 if [[ -n "$node_role" && "$node_role" != "unassigned" ]]; then
-                    menu_items+=("$i" "$(printf "%-16s - %-20s [%s]" "$ip" "$hostname" "$node_role")")
+                    menu_items+=("$i" "$(printf "%-16s %-35s [%s]" "$ip" "$vip_info" "$node_role")")
                 else
-                    menu_items+=("$i" "$(printf "%-16s - %-20s [unassigned]" "$ip" "$hostname")")
+                    menu_items+=("$i" "$(printf "%-16s %-35s [unassigned]" "$ip" "$vip_info")")
                 fi
             else
                 if [[ -n "$node_role" && "$node_role" != "unassigned" ]]; then
-                    menu_items+=("$i" "$(printf "%-16s [%s]" "$ip" "$node_role")")
+                    menu_items+=("$i" "$(printf "%-16s %-35s [%s]" "$ip" "$vip_info" "$node_role")")
                 else
-                    menu_items+=("$i" "$(printf "%-16s [unassigned]" "$ip")")
+                    menu_items+=("$i" "$(printf "%-16s %-35s [unassigned]" "$ip" "$vip_info")")
                 fi
             fi
         fi
@@ -9748,7 +9827,7 @@ nfs_step1_select_ip() {
     log_debug "nfs_step1_select_ip: About to display dialog menu with ${#menu_items[@]} items"
     cmd=(dialog --keep-tite --title "Step 1/$nfs_total_steps: Select $PRODUCT NFS Storage IP (VIP)"
          --ok-label "Next" --cancel-label "Back to Main" $extra_button
-         --menu "Choose $PRODUCT NFS Storage IP (VIP):" 15 95 8)
+         --menu "Choose $PRODUCT NFS Storage IP (VIP):" 15 100 8)
     options=("${menu_items[@]}")
     dialog_menu
     log_debug "nfs_step1_select_ip: dialog_menu returned, exit code: $dialog_exit_code, selected: $selected_option"
@@ -9834,7 +9913,7 @@ nfs_step1_select_ip() {
                     return 2  # Retry same step
                 fi
                 return 0
-            elif [[ "${ips[selected_option]}" == "Manage custom IPs" ]]; then
+            elif [[ "${ips[selected_option]}" == "Unregister IPs" ]]; then
                 manage_custom_ips
                 return 2  # Retry same step
             else
@@ -14573,10 +14652,13 @@ get_unused_nfs_storages() {
     
     log_debug "get_unused_nfs_storages: Used storages: $(echo "$used_storages" | tr '\n' ' ')"
     
-    # Find unused storages
+    # Find unused storages (excluding cloned volumes)
     while IFS= read -r storage; do
         if [[ -n "$storage" ]]; then
-            if [[ ! "$used_storages" =~ (^|$'\n')"$storage"($'\n'|$) ]]; then
+            # Skip cloned volumes (contain "_clone_" in name)
+            if [[ "$storage" =~ _clone_ ]]; then
+                log_debug "get_unused_nfs_storages: Storage '$storage' is a cloned volume, skipping"
+            elif [[ ! "$used_storages" =~ (^|$'\n')"$storage"($'\n'|$) ]]; then
                 unused_storages+="$storage"$'\n'
                 log_debug "get_unused_nfs_storages: Storage '$storage' is unused"
             else
@@ -15020,7 +15102,7 @@ This may take a moment." 8 50
 
     # Execute deletion using the specialized function for unused storage
     if delete_unused_pve_nfs_storage "$selected_storage"; then
-        dialog --msgbox "Successfully deleted unused NFS storage '$selected_storage'.\n\nCleanup finished.\nReview logs in:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details.\n\nNOTE: The backup destination dataset was NOT deleted. If the backup destination dataset needs to be deleted, please proceed with the WEB GUI." 15 70
+        dialog --msgbox "Successfully deleted unused NFS storage '$selected_storage'.\n\nCleanup finished.\nReview logs in:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details.\n\nNOTE: The backup destination dataset was NOT deleted. If the backup destination dataset needs to be deleted, please proceed with the $PRODUCT WEB GUI." 15 70
         return 0
     else
         dialog --msgbox "Error: Failed to delete unused NFS storage '$selected_storage'. Check the log file for details." 8 70

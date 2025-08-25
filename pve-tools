@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.75"
+VERSION="0.76"
 RELEASE_DATE="2025-08-25"
 
 # Script mode flag
@@ -11934,11 +11934,48 @@ Continuing with remaining setup..." \
         # Check if it's mounted and unmount if needed
         if mountpoint -q "$mount_point" 2>/dev/null; then
             log_info "Unmounting existing mount at $mount_point"
-            umount "$mount_point" 2>/dev/null || {
-                log_error "Failed to unmount $mount_point"
+            
+            # Check for processes using the mount point
+            local processes_using_mount
+            processes_using_mount=$(lsof +f -- "$mount_point" 2>/dev/null | wc -l)
+            
+            if [[ "$processes_using_mount" -gt 1 ]]; then
+                log_error "Mount point $mount_point is in use by $((processes_using_mount - 1)) processes"
+                # Show which processes are using it
+                lsof +f -- "$mount_point" 2>/dev/null | tail -n +2 | while read -r line; do
+                    log_error "Process using mount: $line"
+                done
+                
                 dialog --title "PVE Storage Creation Failed" --msgbox \
 "Cannot create PVE storage!\n\n\
-REASON: Mount point $mount_point is in use\n\n\
+REASON: Mount point $mount_point is in use by running processes\n\n\
+DETAILS: $((processes_using_mount - 1)) processes are actively using this storage\n\
+This typically means VMs/containers are running with disks on this storage.\n\n\
+SUMMARY:\n\
+Destination datasets: CREATED\n\
+Source dataset: CREATED\n\
+Source NFS share: CREATED\n\
+ODP task: $oodp_status\n\
+PVE storage: FAILED\n\n\
+NOTE: This usually happens when an NFS storage was previously removed\n\
+from Proxmox configuration but VMs continued using the mount point.\n\n\
+To resolve:\n\
+1. Stop all VMs/containers using this storage\n\
+2. Run 'Cleanup Inactive NFS Storage' from main menu\n\
+3. Then retry creating the NFS storage, OR\n\
+4. Choose a different storage name to avoid conflict" \
+22 78
+                return 1
+            fi
+            
+            # Try normal unmount first, then lazy unmount if that fails
+            if ! umount "$mount_point" 2>/dev/null; then
+                log_info "Normal unmount failed, trying lazy unmount"
+                if ! umount -l "$mount_point" 2>/dev/null; then
+                    log_error "Failed to unmount $mount_point"
+                    dialog --title "PVE Storage Creation Failed" --msgbox \
+"Cannot create PVE storage!\n\n\
+REASON: Mount point $mount_point cannot be unmounted\n\n\
 SUMMARY:\n\
 Destination datasets: CREATED\n\
 Source dataset: CREATED\n\
@@ -11948,8 +11985,9 @@ PVE storage: FAILED\n\n\
 Please manually unmount or remove $mount_point\n\
 and try adding the storage again." \
 18 70
-                return 1
-            }
+                    return 1
+                fi
+            fi
         fi
         
         # Remove the directory if it's empty

@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.76"
-RELEASE_DATE="2025-08-25"
+VERSION="0.77"
+RELEASE_DATE="2025-08-26"
 
 # Script mode flag
 VERSION_MODE=false
@@ -4402,6 +4402,103 @@ perform_oodp_checkup() {
     return 0
 }
 
+# NFS service checkup function for system checkup integration
+perform_nfs_service_checkup() {
+    local temp_file="$1"
+    
+    log_info "perform_nfs_service_checkup: Starting NFS service status checkup"
+    
+    # Ensure we have REST API credentials
+    if [[ -z "${rest_api_user}" ]] || [[ -z "${rest_api_password}" ]] || [[ -z "${rest_api_port}" ]]; then
+        echo "   Configuration error: REST API credentials not configured" >> "$temp_file"
+        echo "   Please run: pve-tools -> Setup -> REST API Configuration" >> "$temp_file"
+        echo "" >> "$temp_file"
+        return 1
+    fi
+    
+    # Get list of unique NFS server IPs from storage configuration
+    local nfs_server_ips=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^nfs:[[:space:]]*([^[:space:]]+) ]]; then
+            # Read the next few lines to find the server IP
+            while IFS= read -r config_line; do
+                if [[ "$config_line" =~ ^[[:space:]]*server[[:space:]]+([^[:space:]]+) ]]; then
+                    local server_ip="${BASH_REMATCH[1]}"
+                    # Add to array if not already present
+                    local found=false
+                    for existing_ip in "${nfs_server_ips[@]}"; do
+                        if [[ "$existing_ip" == "$server_ip" ]]; then
+                            found=true
+                            break
+                        fi
+                    done
+                    if [[ "$found" == false ]]; then
+                        nfs_server_ips+=("$server_ip")
+                    fi
+                    break
+                elif [[ "$config_line" =~ ^[[:space:]]*$ ]] || [[ "$config_line" =~ ^[a-zA-Z]+: ]]; then
+                    break
+                fi
+            done
+        fi
+    done < /etc/pve/storage.cfg
+    
+    if [[ ${#nfs_server_ips[@]} -eq 0 ]]; then
+        echo "   No NFS storage servers found in configuration" >> "$temp_file"
+        echo "" >> "$temp_file"
+        log_info "perform_nfs_service_checkup: No NFS servers found"
+        return 0
+    fi
+    
+    log_info "perform_nfs_service_checkup: Found ${#nfs_server_ips[@]} NFS server(s): ${nfs_server_ips[*]}"
+    
+    # Check NFS service status for each server
+    for server_ip in "${nfs_server_ips[@]}"; do
+        log_info "perform_nfs_service_checkup: Checking NFS service on $server_ip"
+        
+        # Use our new NFS service check function
+        check_nfs_service_status "$server_ip"
+        local check_result=$?
+        
+        local header_line="    NFS Service ($server_ip)"
+        local status_text=""
+        local details=""
+        
+        case $check_result in
+            0)  # NFS service is enabled
+                status_text="ENABLED"
+                log_info "perform_nfs_service_checkup: NFS service ENABLED on $server_ip"
+                ;;
+            2)  # NFS service is disabled
+                status_text="DISABLED"
+                details="NFS service is disabled on this server"
+                log_info "perform_nfs_service_checkup: NFS service DISABLED on $server_ip"
+                ;;
+            1)  # API error or connection failure
+                status_text="ERROR"
+                details="Cannot check NFS service status - check connectivity and credentials"
+                log_error "perform_nfs_service_checkup: Cannot check NFS service on $server_ip"
+                ;;
+        esac
+        
+        # Format output with proper alignment
+        local status_length=${#status_text}
+        local padding=$((104 - ${#header_line} - status_length))
+        if [ $padding -lt 1 ]; then padding=1; fi
+        
+        printf "%s%*s%s\n" "$header_line" $padding "" "$status_text" >> "$temp_file"
+        
+        if [[ -n "$details" ]]; then
+            printf "    %s\n" "$details" >> "$temp_file"
+        fi
+        
+        echo "" >> "$temp_file"
+    done
+    
+    log_info "perform_nfs_service_checkup: NFS service checkup completed"
+    return 0
+}
+
 # MAIN MENU SYSTEM
 
 # Check background pve-config-backup status
@@ -4468,6 +4565,26 @@ checkup_summary() {
         fi
         
         rm -f "$oodp_temp_file"
+    }
+    
+    # Add NFS Service Status section
+    {
+        log_debug "checkup_summary: Starting NFS service checkup section"
+        local nfs_service_temp_file=$(mktemp)
+        
+        # Perform NFS service checkup
+        perform_nfs_service_checkup "$nfs_service_temp_file"
+        
+        if [[ -f "$nfs_service_temp_file" ]] && [[ -s "$nfs_service_temp_file" ]]; then
+            summary="${summary}$(cat "$nfs_service_temp_file")\n"
+            log_debug "checkup_summary: Added NFS service checkup results to summary"
+        else
+            summary="${summary}   No NFS service checkup results available\n"
+            summary="${summary}\n"
+            log_debug "checkup_summary: No NFS service checkup results available"
+        fi
+        
+        rm -f "$nfs_service_temp_file"
     }
     
     summary="${summary}\n"
@@ -10887,6 +11004,18 @@ handle_existing_clone_dialog() {
 }
 
 perform_clone_and_setup() {
+    # Check NFS service status and enable if needed before creating clone
+    log_info "perform_clone_and_setup: Checking NFS service status"
+    
+    dialog --title "Checking NFS Service" --infobox "Checking NFS service status on server $selected_nfs_ip...\n\nPlease wait..." 8 60
+    
+    if ! check_and_enable_nfs_service "$selected_nfs_ip"; then
+        log_error "perform_clone_and_setup: NFS service check/enablement failed"
+        return 1  # Error dialog already shown by check_and_enable_nfs_service
+    fi
+    
+    log_info "perform_clone_and_setup: NFS service is enabled, proceeding with clone creation"
+    
     local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot" "$selected_pve_storage")
     local actual_clone_name="$clone_name"
 
@@ -11711,15 +11840,27 @@ perform_new_nfs_setup() {
         log_info "perform_new_nfs_setup: STEP 1 SKIPPED - No destinations configured"
     fi
     
-    # STEP 2: Create SOURCE dataset + NFS share
-    log_info "perform_new_nfs_setup: STEP 2 - Creating source dataset and NFS share"
+    # STEP 2: Check NFS service status and enable if needed
+    log_info "perform_new_nfs_setup: STEP 2 - Checking NFS service status"
+    
+    dialog --title "Checking NFS Service" --infobox "Checking NFS service status on server $selected_nfs_ip...\n\nPlease wait..." 8 60
+    
+    if ! check_and_enable_nfs_service "$selected_nfs_ip"; then
+        log_error "perform_new_nfs_setup: STEP 2 FAILED - NFS service check/enablement failed"
+        return 1  # Error dialog already shown by check_and_enable_nfs_service
+    fi
+    
+    log_info "perform_new_nfs_setup: STEP 2 SUCCESS - NFS service is enabled"
+    
+    # STEP 3: Create SOURCE dataset + NFS share
+    log_info "perform_new_nfs_setup: STEP 3 - Creating source dataset and NFS share"
     
     if [[ "$selected_dataset_option" == "create" ]]; then
         log_info "perform_new_nfs_setup: Creating SOURCE dataset pool_name='$selected_pool' dataset_name='$new_dataset_name' on server='$selected_nfs_ip'"
         dialog --title "Creating SOURCE Dataset" --infobox "Creating SOURCE dataset:\nServer: $selected_nfs_ip\nPool: $selected_pool\nDataset: $new_dataset_name" 10 70
         
         if ! create_dataset "$selected_pool" "$new_dataset_name"; then
-            log_error "perform_new_nfs_setup: STEP 2 FAILED - SOURCE dataset creation failed"
+            log_error "perform_new_nfs_setup: STEP 3 FAILED - SOURCE dataset creation failed"
             dialog --title "SOURCE Dataset Creation Failed" --msgbox \
 "Failed to create SOURCE dataset!\n\n\
 SERVER: $selected_nfs_ip\n\
@@ -11735,7 +11876,7 @@ Check logs for detailed error information." \
             return 1
         fi
         
-        log_info "perform_new_nfs_setup: SOURCE dataset created SUCCESS pool_name='$selected_pool' dataset_name='$new_dataset_name'"
+        log_info "perform_new_nfs_setup: STEP 3 SUCCESS - SOURCE dataset created pool_name='$selected_pool' dataset_name='$new_dataset_name'"
         selected_dataset="$new_dataset_name"
     fi
     
@@ -11743,7 +11884,7 @@ Check logs for detailed error information." \
     dialog --title "Creating SOURCE NFS Share" --infobox "Creating NFS share for source dataset...\nServer: $selected_nfs_ip\nPool: $selected_pool\nDataset: $selected_dataset" 10 70
     
     if ! create_nfs_share_for_dataset "$selected_pool" "$selected_dataset"; then
-        log_error "perform_new_nfs_setup: STEP 2 FAILED - SOURCE NFS share creation failed"
+        log_error "perform_new_nfs_setup: STEP 3 FAILED - SOURCE NFS share creation failed"
         dialog --title "SOURCE NFS Share Creation Failed" --msgbox \
 "Failed to create SOURCE NFS share!\n\n\
 SERVER: $selected_nfs_ip\n\
@@ -11760,13 +11901,13 @@ Check logs for detailed error information." \
         return 1
     fi
     
-    log_info "perform_new_nfs_setup: STEP 2 SUCCESS - Source dataset and NFS share created"
+    log_info "perform_new_nfs_setup: STEP 3 SUCCESS - Source dataset and NFS share created"
     dialog --title "Success" --infobox "SOURCE dataset and NFS share created successfully!\nServer: $selected_nfs_ip\nPool: $selected_pool\nDataset: $selected_dataset" 8 70
     sleep 2
     
-    # STEP 3: Register ODP destination nodes if needed (before ODP task creation)
+    # STEP 4: Register ODP destination nodes if needed (before ODP task creation)
     if [[ -n "$oodp_destinations_json" ]]; then
-        log_info "perform_new_nfs_setup: STEP 3 - Registering ODP destination nodes"
+        log_info "perform_new_nfs_setup: STEP 4 - Registering ODP destination nodes"
         dialog --title "Registering ODP Destinations" --infobox "Registering backup destination servers..." 8 60
         
         local registration_failed=false
@@ -11775,7 +11916,7 @@ Check logs for detailed error information." \
             IFS='|' read -r dst_ip dst_pool dst_dataset <<< "$dest_info"
             
             if [[ -z "$dst_ip" ]]; then
-                log_error "perform_new_nfs_setup: STEP 3 - Invalid destination info: $dest_info"
+                log_error "perform_new_nfs_setup: STEP 4 - Invalid destination info: $dest_info"
                 continue
             fi
             
@@ -11788,14 +11929,14 @@ Check logs for detailed error information." \
             else
                 log_info "perform_new_nfs_setup: Registering ODP destination: $dst_ip:$dst_port"
                 if ! register_odp_destination_node "$dst_ip" "$dst_port" "$selected_nfs_ip" "Backup DR Node for $dst_pool/$dst_dataset"; then
-                    log_error "perform_new_nfs_setup: STEP 3 FAILED - Could not register ODP destination $dst_ip:$dst_port"
+                    log_error "perform_new_nfs_setup: STEP 4 FAILED - Could not register ODP destination $dst_ip:$dst_port"
                     registration_failed=true
                 fi
             fi
         done
         
         if [[ "$registration_failed" == "true" ]]; then
-            log_error "perform_new_nfs_setup: STEP 3 PARTIAL FAILURE - Some ODP destinations could not be registered"
+            log_error "perform_new_nfs_setup: STEP 4 PARTIAL FAILURE - Some ODP destinations could not be registered"
             dialog --title "ODP Registration Warning" --msgbox \
 "Some backup destinations could not be registered!\n\n\
 This may affect ODP task creation.\n\
@@ -11803,16 +11944,16 @@ Check logs for details.\n\n\
 Continuing with remaining setup..." \
 12 60
         else
-            log_info "perform_new_nfs_setup: STEP 3 SUCCESS - All ODP destinations registered"
+            log_info "perform_new_nfs_setup: STEP 4 SUCCESS - All ODP destinations registered"
         fi
     else
-        log_info "perform_new_nfs_setup: STEP 3 SKIPPED - No ODP destinations configured"
+        log_info "perform_new_nfs_setup: STEP 4 SKIPPED - No ODP destinations configured"
     fi
     
-    log_info "perform_new_nfs_setup: STEP 3 COMPLETED - ODP destination registration"
+    log_info "perform_new_nfs_setup: STEP 4 COMPLETED - ODP destination registration"
     
     # STEP 4: Create ODP task (warning only if fails, not critical)
-    log_info "perform_new_nfs_setup: STEP 4 - Creating ODP task"
+    log_info "perform_new_nfs_setup: STEP 5 - Creating ODP task"
     
     local oodp_status="OODP auto-snapshot: Not configured"
     
@@ -11905,10 +12046,10 @@ Continuing with remaining setup..." \
         fi
     fi
     
-    log_info "perform_new_nfs_setup: STEP 4 COMPLETED - ODP task status: $oodp_status"
+    log_info "perform_new_nfs_setup: STEP 5 COMPLETED - ODP task status: $oodp_status"
     
     # STEP 5: Add storage to Proxmox VE
-    log_info "perform_new_nfs_setup: STEP 5 - Adding storage to Proxmox VE"
+    log_info "perform_new_nfs_setup: STEP 6 - Adding storage to Proxmox VE"
     dialog --title "Adding PVE Storage" --infobox "Adding storage to Proxmox VE...\nStorage: $new_storage_name\nServer: $selected_nfs_ip" 8 60
     
     local nodes_csv=$(get_ha_nodes_csv)
@@ -12035,7 +12176,7 @@ and try adding the storage again." \
     log_debug $'pvesh output:\n'"$pvesh_output"
     
     if [[ $pvesh_exit_code -ne 0 ]]; then
-        log_error "perform_new_nfs_setup: STEP 4 FAILED - PVE storage creation failed"
+        log_error "perform_new_nfs_setup: STEP 6 FAILED - PVE storage creation failed"
         dialog --title "PVE Storage Creation Failed" --msgbox \
 "Failed to add storage to Proxmox VE!\n\n\
 ERROR: $pvesh_output\n\n\
@@ -12053,7 +12194,7 @@ Export: $export_path" \
         return 1
     fi
     
-    log_info "perform_new_nfs_setup: STEP 4 SUCCESS - PVE storage created successfully"
+    log_info "perform_new_nfs_setup: STEP 6 SUCCESS - PVE storage created successfully"
     
     # Wait for storage to mount and refresh cache
     dialog --title "Finalizing" --infobox "Waiting for storage to become available..." 6 50
@@ -12411,6 +12552,172 @@ EOF
         
         return 1
     fi
+}
+
+# Helper function: Check if NFS service is enabled on a server
+check_nfs_service_status() {
+    local server_ip="$1"
+    
+    log_info "Checking NFS service status on server: $server_ip"
+    
+    # Validate inputs
+    if [[ -z "$server_ip" ]]; then
+        log_error "check_nfs_service_status: Missing server IP parameter"
+        return 1
+    fi
+    
+    # Check if REST API credentials are configured
+    if [[ -z "${rest_api_user}" ]] || [[ -z "${rest_api_password}" ]] || [[ -z "${rest_api_port}" ]]; then
+        log_error "check_nfs_service_status: REST API credentials not configured"
+        return 1
+    fi
+    
+    local url="https://$server_ip:$rest_api_port/api/v4/services/nfs"
+    
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR NFS SERVICE CHECK ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -w '\\n%{http_code}' -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' '$url'"
+    log_debug "==============================================================================="
+    
+    local response
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X GET -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        "$url" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "check_nfs_service_status: curl command failed with exit code: $curl_exit"
+        return 1
+    fi
+    
+    local http_status=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | sed '$d')
+    
+    log_debug "check_nfs_service_status: HTTP status: $http_status"
+    log_debug "check_nfs_service_status: Response body: $response_body"
+    
+    if [[ "$http_status" == "200" ]]; then
+        # Parse JSON response to check if NFS service is enabled
+        local nfs_enabled
+        nfs_enabled=$(echo "$response_body" | grep -Po '"enabled"\s*:\s*\K(true|false)' | head -1)
+        
+        if [[ "$nfs_enabled" == "true" ]]; then
+            log_info "check_nfs_service_status: NFS service is ENABLED on $server_ip"
+            return 0  # NFS is enabled
+        else
+            log_info "check_nfs_service_status: NFS service is DISABLED on $server_ip"
+            return 2  # NFS is disabled (special return code)
+        fi
+    else
+        log_error "check_nfs_service_status: API call failed. HTTP status: $http_status, Response: $response_body"
+        return 1
+    fi
+}
+
+# Helper function: Enable NFS service on a server
+enable_nfs_service() {
+    local server_ip="$1"
+    
+    log_info "Enabling NFS service on server: $server_ip"
+    
+    # Validate inputs
+    if [[ -z "$server_ip" ]]; then
+        log_error "enable_nfs_service: Missing server IP parameter"
+        return 1
+    fi
+    
+    # Check if REST API credentials are configured
+    if [[ -z "${rest_api_user}" ]] || [[ -z "${rest_api_password}" ]] || [[ -z "${rest_api_port}" ]]; then
+        log_error "enable_nfs_service: REST API credentials not configured"
+        return 1
+    fi
+    
+    local url="https://$server_ip:$rest_api_port/api/v4/services/nfs"
+    local json_input='{"enabled": true}'
+    
+    # Log the FULL curl command for manual testing
+    log_debug "=============== FULL CURL COMMAND FOR ENABLE NFS SERVICE ==============="
+    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -w '\\n%{http_code}' -X PUT -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_input' '$url'"
+    log_debug "============================================================================="
+    
+    local response
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -w "\n%{http_code}" -X PUT -u "${rest_api_user}:${rest_api_password}" \
+        -H 'Content-Type: application/json' \
+        -d "$json_input" \
+        "$url" 2>/dev/null)
+    local curl_exit=$?
+    
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "enable_nfs_service: curl command failed with exit code: $curl_exit"
+        return 1
+    fi
+    
+    local http_status=$(echo "$response" | tail -n1)
+    local response_body=$(echo "$response" | sed '$d')
+    
+    log_debug "enable_nfs_service: HTTP status: $http_status"
+    log_debug "enable_nfs_service: Response body: $response_body"
+    
+    if [[ "$http_status" == "204" ]]; then
+        log_info "enable_nfs_service: NFS service successfully ENABLED on $server_ip"
+        return 0
+    else
+        log_error "enable_nfs_service: API call failed. HTTP status: $http_status, Response: $response_body"
+        return 1
+    fi
+}
+
+# Helper function: Check and prompt to enable NFS service if needed
+check_and_enable_nfs_service() {
+    local server_ip="$1"
+    
+    log_info "Checking and ensuring NFS service is enabled on server: $server_ip"
+    
+    # Check current NFS service status
+    check_nfs_service_status "$server_ip"
+    local check_result=$?
+    
+    case $check_result in
+        0)  # NFS is enabled
+            log_info "check_and_enable_nfs_service: NFS service already enabled on $server_ip"
+            return 0
+            ;;
+        2)  # NFS is disabled
+            log_info "check_and_enable_nfs_service: NFS service is disabled on $server_ip, prompting user"
+            
+            # Prompt user to enable NFS service
+            dialog --keep-tite --title "NFS Service Disabled" \
+                   --yes-label "Enable NFS" --no-label "Cancel" \
+                   --yesno "NFS service is DISABLED on server $server_ip.\n\nNFS service must be enabled to create NFS storage.\n\nDo you want to enable NFS service now?" 12 60
+            
+            if [[ $? -eq 0 ]]; then
+                # User chose to enable NFS
+                log_info "check_and_enable_nfs_service: User approved enabling NFS service on $server_ip"
+                
+                dialog --title "Enabling NFS Service" --infobox "Enabling NFS service on server $server_ip...\n\nPlease wait..." 8 60
+                
+                if enable_nfs_service "$server_ip"; then
+                    log_info "check_and_enable_nfs_service: Successfully enabled NFS service on $server_ip"
+                    dialog --msgbox "NFS service has been successfully ENABLED on server $server_ip.\n\nYou can now create NFS storage." 10 60
+                    return 0
+                else
+                    log_error "check_and_enable_nfs_service: Failed to enable NFS service on $server_ip"
+                    dialog --msgbox "ERROR: Failed to enable NFS service on server $server_ip.\n\nPlease check:\n- REST API credentials\n- Server connectivity\n- Server permissions\n\nCheck logs for detailed error information." 14 60
+                    return 1
+                fi
+            else
+                # User chose to cancel
+                log_info "check_and_enable_nfs_service: User canceled NFS service enablement"
+                dialog --msgbox "NFS storage creation canceled.\n\nNFS service must be enabled to create NFS storage.\nYou can enable it later in the server's GUI." 10 60
+                return 1
+            fi
+            ;;
+        1)  # API error or connection failure
+            log_error "check_and_enable_nfs_service: Failed to check NFS service status on $server_ip"
+            dialog --msgbox "ERROR: Cannot check NFS service status on server $server_ip.\n\nPlease check:\n- REST API credentials\n- Server connectivity\n- Server availability\n\nCheck logs for detailed error information." 14 60
+            return 1
+            ;;
+    esac
 }
 
 # Helper function: Create NFS share for a dataset

@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.73"
+VERSION="0.74"
 RELEASE_DATE="2025-08-25"
 
 # Script mode flag
@@ -12256,8 +12256,10 @@ create_dataset() {
         return 1
     fi
     
-    # Get JovianDSS version and determine direct setting
+    # Get JovianDSS version and determine direct setting and recordsize
     local direct_setting="standard"  # Default value
+    local recordsize="131072"  # Default value for non-NVMe
+    local is_nvme_pool=false
     
     log_info "create_dataset: Checking JovianDSS version for direct setting determination"
     local up_version
@@ -12271,18 +12273,39 @@ create_dataset() {
             # Check if pool consists entirely of NVMe disks
             if is_pool_full_nvme "$pool_name" "$selected_nfs_ip"; then
                 direct_setting="always"
+                is_nvme_pool=true
                 log_info "create_dataset: Pool '$pool_name' is full NVMe and UP <= 33, setting direct=always"
             else
                 direct_setting="standard"
+                is_nvme_pool=false
                 log_info "create_dataset: Pool '$pool_name' contains non-NVMe disks, setting direct=standard"
             fi
         else
             direct_setting="standard"
             log_info "create_dataset: UP version $up_version is > 33, setting direct=standard"
+            
+            # Still check if pool is full NVMe for recordsize decision
+            if is_pool_full_nvme "$pool_name" "$selected_nfs_ip"; then
+                is_nvme_pool=true
+                log_info "create_dataset: Pool '$pool_name' is full NVMe (UP > 33)"
+            else
+                is_nvme_pool=false
+                log_info "create_dataset: Pool '$pool_name' contains non-NVMe disks (UP > 33)"
+            fi
         fi
     else
-        log_error "create_dataset: Failed to get UP version, using default direct=standard"
+        log_error "create_dataset: Failed to get UP version, using defaults"
         direct_setting="standard"
+        is_nvme_pool=false
+    fi
+    
+    # Set recordsize based on NVMe pool detection
+    if [[ "$is_nvme_pool" == true ]]; then
+        recordsize="16384"
+        log_info "create_dataset: Pool is full NVMe, setting recordsize=16384"
+    else
+        recordsize="131072"
+        log_info "create_dataset: Pool contains non-NVMe disks, setting recordsize=131072"
     fi
     
     # Prepare JSON payload for dataset creation
@@ -12296,12 +12319,13 @@ create_dataset() {
     "logbias": "latency",
     "primarycache": "all",
     "secondarycache": "all",
-    "atime": "off"
+    "atime": "off",
+    "recordsize": ${recordsize}
 }
 EOF
 )
     log_info "create_dataset: JSON payload: $json_input for SOURCE pool_name='$pool_name' dataset_name='$dataset_name'"
-    log_info "create_dataset: Applied direct setting: $direct_setting with optimized dataset properties"
+    log_info "create_dataset: Applied direct setting: $direct_setting, recordsize: $recordsize with optimized dataset properties"
     
     log_info "create_dataset: Making API call to SOURCE server='$selected_nfs_ip:$rest_api_port' for pool_name='$pool_name' dataset_name='$dataset_name'"
     local url="https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes"

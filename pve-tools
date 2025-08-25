@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.71"
-RELEASE_DATE="2025-08-22"
+VERSION="0.72"
+RELEASE_DATE="2025-08-25"
 
 # Script mode flag
 VERSION_MODE=false
@@ -8646,7 +8646,7 @@ update_connected_storage_servers() {
         log_debug "Processing IP: $ip"
         
         # Skip non-IP entries (special menu options)
-        if [[ "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
+        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
             continue
         fi
         
@@ -9264,7 +9264,7 @@ manage_custom_ips() {
         local ip="${custom_ips_array[i]}"
         local hostname
         local vip_info
-        if [[ "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
+        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
             hostname=""
             menu_items+=("$i" "$ip")
         else
@@ -9315,6 +9315,7 @@ get_current_storage_servers_ip() {
 
     # Remove duplicates
     readarray -t uniq_ips < <(printf "%s\n" "${ips[@]}" | sort -u)
+    uniq_ips+=("Scan network for $PRODUCT IP")
     uniq_ips+=("Enter new IP")
     uniq_ips+=("Unregister IPs")
 
@@ -9711,6 +9712,245 @@ get_vip_info_for_ip() {
     return 0
 }
 
+network_scan_for_storage_servers_ip() {
+    log_debug "network_scan_for_storage_servers_ip: Function started"
+    
+    # Get current registered IPs to filter them out
+    local registered_ips=()
+    local line
+    while IFS= read -r line; do
+        if [[ -n "$line" && "$line" != "Scan network for $PRODUCT IP" && "$line" != "Enter new IP" && "$line" != "Unregister IPs" ]]; then
+            registered_ips+=("$line")
+        fi
+    done < <(get_current_storage_servers_ip)
+    
+    log_debug "network_scan_for_storage_servers_ip: Found ${#registered_ips[@]} registered IPs: ${registered_ips[*]}"
+    
+    # Extract IP addresses from interfaces file and get subnets
+    local subnets=()
+    while IFS= read -r ip_cidr; do
+        [[ -z "$ip_cidr" ]] && continue
+        # Get IP without CIDR
+        local ip_base=$(echo "$ip_cidr" | cut -d'/' -f1)
+        # Assume /24 subnet
+        local subnet=$(echo "$ip_base" | awk -F. '{print $1"."$2"."$3".0/24"}')
+        subnets+=("$subnet")
+    done < <(grep address /etc/network/interfaces | awk '{print $2}')
+    
+    if [[ ${#subnets[@]} -eq 0 ]]; then
+        dialog --msgbox "No network interfaces found to scan." 8 50
+        log_error "network_scan_for_storage_servers_ip: No subnets found"
+        return 1
+    fi
+    
+    # Remove duplicates from subnets
+    readarray -t unique_subnets < <(printf "%s\n" "${subnets[@]}" | sort -u)
+    subnets=("${unique_subnets[@]}")
+    
+    log_info "network_scan_for_storage_servers_ip: Scanning ${#subnets[@]} subnets: ${subnets[*]}"
+    
+    # Discovered servers array
+    local discovered_servers=()
+    
+    # Create progress pipe for gauge
+    local progress_pipe=$(mktemp -u)
+    mkfifo "$progress_pipe"
+    
+    # Start progress dialog in background
+    dialog --title "Scanning Network for $PRODUCT Servers" \
+           --gauge "Initializing scan..." 8 60 0 < "$progress_pipe" &
+    local dialog_pid=$!
+    
+    # Open pipe for writing
+    exec 3>"$progress_pipe"
+    
+    # Function to update progress
+    update_scan_progress() {
+        local message="$1"
+        local current_subnet="$2"
+        local total_subnets="$3"
+        local found_count="$4"
+        local percentage=$((current_subnet * 100 / total_subnets))
+        local progress_text="$message"
+        
+        # Add found IPs count if any
+        if [[ -n "$found_count" && "$found_count" -gt 0 ]]; then
+            progress_text="$message\n\nFound $found_count unregistered $PRODUCT server(s)"
+        fi
+        
+        echo "$percentage" >&3
+        echo "XXX" >&3
+        echo "$progress_text" >&3
+        echo "XXX" >&3
+    }
+    
+    # Scan each subnet
+    local subnet_index=0
+    for subnet in "${subnets[@]}"; do
+        ((subnet_index++))
+        update_scan_progress "Scanning subnet: $subnet" "$subnet_index" "${#subnets[@]}" "${#discovered_servers[@]}"
+        log_debug "network_scan_for_storage_servers_ip: Scanning subnet $subnet"
+        
+        # Use nmap to find live hosts
+        local live_hosts
+        live_hosts=$(nmap -sn "$subnet" 2>/dev/null | grep "Nmap scan report for" | awk '{print $5}')
+        
+        if [[ -n "$live_hosts" ]]; then
+            while IFS= read -r ip; do
+                [[ -z "$ip" ]] && continue
+                
+                # Check if IP is already registered
+                local is_registered=false
+                for registered_ip in "${registered_ips[@]}"; do
+                    if [[ "$ip" == "$registered_ip" ]]; then
+                        is_registered=true
+                        break
+                    fi
+                done
+                
+                if [[ "$is_registered" == true ]]; then
+                    log_debug "network_scan_for_storage_servers_ip: Skipping registered IP: $ip"
+                    continue
+                fi
+                
+                # Test REST API connection
+                local url="https://$ip:$rest_api_port/api/v4/conn_test"
+                local response
+                response=$(curl -k -s --connect-timeout 1 --max-time 5 -w "\n%{http_code}" \
+                          -u "${rest_api_user}:${rest_api_password}" "$url" 2>/dev/null)
+                local curl_exit=$?
+                
+                if [[ $curl_exit -eq 0 ]]; then
+                    local status=$(echo "$response" | tail -n1)
+                    if [[ "$status" == "200" ]]; then
+                        discovered_servers+=("$ip")
+                        log_info "network_scan_for_storage_servers_ip: Found $PRODUCT server at $ip"
+                        # Update progress with current count
+                        update_scan_progress "Scanning subnet: $subnet" "$subnet_index" "${#subnets[@]}" "${#discovered_servers[@]}"
+                    elif [[ "$status" == "401" || "$status" == "403" ]]; then
+                        discovered_servers+=("$ip")
+                        log_info "network_scan_for_storage_servers_ip: Found $PRODUCT server at $ip (authentication required)"
+                        # Update progress with current count
+                        update_scan_progress "Scanning subnet: $subnet" "$subnet_index" "${#subnets[@]}" "${#discovered_servers[@]}"
+                    fi
+                fi
+            done <<< "$live_hosts"
+        fi
+    done
+    
+    # Close progress dialog
+    local final_message="Scan complete"
+    if [[ ${#discovered_servers[@]} -gt 0 ]]; then
+        final_message="Scan complete\n\nFound ${#discovered_servers[@]} unregistered $PRODUCT server(s)"
+    fi
+    
+    echo "100" >&3
+    echo "XXX" >&3
+    echo "$final_message" >&3
+    echo "XXX" >&3
+    
+    # Close the file descriptor to signal EOF to dialog
+    exec 3>&-
+    
+    # Wait for dialog to finish
+    wait $dialog_pid 2>/dev/null
+    rm -f "$progress_pipe"
+    
+    if [[ ${#discovered_servers[@]} -eq 0 ]]; then
+        dialog --msgbox "No unregistered $PRODUCT storage servers found on the scanned networks." 8 60
+        log_info "network_scan_for_storage_servers_ip: No new servers discovered"
+        return 1
+    fi
+    
+    log_info "network_scan_for_storage_servers_ip: Discovered ${#discovered_servers[@]} unregistered servers"
+    
+    # Show multi-select dialog for discovered servers using standard dialog_menu pattern
+    local dialog_selected=$(mktemp)
+    local checklist_options=()
+    local all_selected=false
+    local selected_ips=()
+    
+    # Build initial checklist options (IP as both tag and description)
+    for ip in "${discovered_servers[@]}"; do
+        checklist_options+=("$ip" "$ip" "off")
+    done
+    
+    # Multi-select dialog with Select All/Deselect All functionality
+    while true; do
+        # Dynamic button label based on current state
+        local middle_button_label="Select All"
+        if [[ "$all_selected" == true ]]; then
+            middle_button_label="Deselect All"
+        fi
+        
+        # Build dialog command using standard pattern
+        cmd=(dialog --keep-tite --title "Network Scan Results - Select IPs to Add"
+             --ok-label "Add Selected" --cancel-label "Back"
+             --extra-button --extra-label "$middle_button_label"
+             --checklist "Found $PRODUCT storage servers (unregistered only):\n\nSelect IPs to add to configuration:"
+             20 80 10)
+        options=("${checklist_options[@]}")
+        
+        # Execute dialog using standard function
+        dialog_menu
+        
+        case $dialog_exit_code in
+            3)  # Select All/Deselect All button pressed
+                if [[ "$all_selected" == false ]]; then
+                    # Select all items
+                    for i in $(seq 2 3 $((${#checklist_options[@]} - 1))); do
+                        checklist_options[i]="on"
+                    done
+                    all_selected=true
+                else
+                    # Deselect all items
+                    for i in $(seq 2 3 $((${#checklist_options[@]} - 1))); do
+                        checklist_options[i]="off"
+                    done
+                    all_selected=false
+                fi
+                continue
+                ;;
+            0)  # Add Selected
+                if [[ -z "$selected_option" ]]; then
+                    dialog --msgbox "No IPs selected." 6 30
+                    continue
+                fi
+                
+                # Parse selected IPs from dialog_menu result
+                selected_ips=($selected_option)
+                break
+                ;;
+            1)  # Cancel
+                rm -f "$dialog_selected"
+                log_info "network_scan_for_storage_servers_ip: User cancelled IP selection"
+                return 1
+                ;;
+        esac
+    done
+    
+    rm -f "$dialog_selected"
+    
+    if [[ ${#selected_ips[@]} -eq 0 ]]; then
+        log_info "network_scan_for_storage_servers_ip: No IPs selected"
+        return 1
+    fi
+    
+    log_info "network_scan_for_storage_servers_ip: User selected ${#selected_ips[@]} IPs: ${selected_ips[*]}"
+    
+    # Add selected IPs to configuration
+    for ip in "${selected_ips[@]}"; do
+        add_custom_ip "$ip"
+        log_info "network_scan_for_storage_servers_ip: Added IP $ip to configuration"
+    done
+    
+    # Update connected storage servers to create info files for new IPs
+    update_connected_storage_servers
+    
+    log_info "network_scan_for_storage_servers_ip: Function completed successfully"
+    return 0
+}
+
 nfs_step1_select_ip() {
     log_debug "nfs_step1_select_ip: Function started"
     local line ips=() menu_items=()
@@ -9730,7 +9970,7 @@ nfs_step1_select_ip() {
     local ip_data=()  # Array to store IP info for sorting
     
     for ip in "${ips[@]}"; do
-        if [[ "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
+        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
             special_options+=("$ip")
         else
             actual_ips+=("$ip")
@@ -9792,7 +10032,7 @@ nfs_step1_select_ip() {
         local node_role
         
         # Check if this is a special menu option (not an actual IP)
-        if [[ "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
+        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
             # Special menu options - don't show role
             menu_items+=("$i" "$ip")
         else
@@ -9836,7 +10076,19 @@ nfs_step1_select_ip() {
     case $dialog_exit_code in
         0)  # Next
             selected_nfs_ip_index="$selected_option"
-            if [[ "${ips[selected_option]}" == "Enter new IP" ]]; then
+            if [[ "${ips[selected_option]}" == "Scan network for $PRODUCT IP" ]]; then
+                log_debug "nfs_step1_select_ip: User selected 'Scan network for $PRODUCT IP', starting network scan"
+                network_scan_for_storage_servers_ip
+                local scan_result=$?
+                if [[ $scan_result -eq 0 ]]; then
+                    log_info "nfs_step1_select_ip: Network scan completed successfully, refreshing IP list"
+                    # Return to step 1 to show the updated IP list with newly discovered IPs
+                    return 2  # Retry same step to refresh the list
+                else
+                    log_debug "nfs_step1_select_ip: Network scan cancelled or failed, returning to step 1"
+                    return 2  # Retry same step
+                fi
+            elif [[ "${ips[selected_option]}" == "Enter new IP" ]]; then
                 log_debug "nfs_step1_select_ip: User selected 'Enter new IP', showing input dialog"
                 # Get custom IP input with validation loop
                 local input_ip

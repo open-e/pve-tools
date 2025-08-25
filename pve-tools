@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.72"
+VERSION="0.73"
 RELEASE_DATE="2025-08-25"
 
 # Script mode flag
@@ -8614,6 +8614,37 @@ get_jovian_product_info() {
     fi
 }
 
+# Function to get UP version from JovianDSS server
+get_joviandss_up_version() {
+    local ip="$1"
+    
+    log_debug "get_joviandss_up_version: Getting UP version for IP: $ip"
+    
+    if [[ -z "$ip" ]]; then
+        log_error "get_joviandss_up_version: IP address parameter is required"
+        return 1
+    fi
+    
+    # Get product info JSON
+    local product_info
+    if product_info=$(get_jovian_product_info "$ip" 2>/dev/null); then
+        # Extract UP version from JSON
+        local up_version=$(echo "$product_info" | grep -o '"up"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"up"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+        
+        if [[ -n "$up_version" ]]; then
+            log_debug "get_joviandss_up_version: Found UP version '$up_version' for IP $ip"
+            echo "$up_version"
+            return 0
+        else
+            log_error "get_joviandss_up_version: Could not extract UP version from product info for IP $ip"
+            return 1
+        fi
+    else
+        log_error "get_joviandss_up_version: Failed to get product info for IP $ip"
+        return 1
+    fi
+}
+
 # Function to get list of IP addresses from vmbr interfaces
 get_pve_vmbr_ip_address_list() {
     awk '$1=="iface" && $2 ~ /^vmbr/ {f=1; next} $1=="address" && f {sub(/\/.*/, "", $2); print $2; f=0}' /etc/network/interfaces
@@ -12225,10 +12256,52 @@ create_dataset() {
         return 1
     fi
     
+    # Get JovianDSS version and determine direct setting
+    local direct_setting="standard"  # Default value
+    
+    log_info "create_dataset: Checking JovianDSS version for direct setting determination"
+    local up_version
+    if up_version=$(get_joviandss_up_version "$selected_nfs_ip"); then
+        log_info "create_dataset: JovianDSS UP version detected: $up_version"
+        
+        # Check if UP version is <= 33
+        if [[ "$up_version" -le 33 ]]; then
+            log_info "create_dataset: UP version $up_version is <= 33, checking if pool is full NVMe"
+            
+            # Check if pool consists entirely of NVMe disks
+            if is_pool_full_nvme "$pool_name" "$selected_nfs_ip"; then
+                direct_setting="always"
+                log_info "create_dataset: Pool '$pool_name' is full NVMe and UP <= 33, setting direct=always"
+            else
+                direct_setting="standard"
+                log_info "create_dataset: Pool '$pool_name' contains non-NVMe disks, setting direct=standard"
+            fi
+        else
+            direct_setting="standard"
+            log_info "create_dataset: UP version $up_version is > 33, setting direct=standard"
+        fi
+    else
+        log_error "create_dataset: Failed to get UP version, using default direct=standard"
+        direct_setting="standard"
+    fi
+    
     # Prepare JSON payload for dataset creation
-    # Based on API docs: only "name" is required
-    local json_input="{\"name\": \"${dataset_name}\"}"
+    # Include direct property based on version and pool type, plus additional optimized properties
+    local json_input=$(cat <<EOF
+{
+    "name": "${dataset_name}",
+    "direct": "${direct_setting}",
+    "compression": "lz4",
+    "sync": "always",
+    "logbias": "latency",
+    "primarycache": "all",
+    "secondarycache": "all",
+    "atime": "off"
+}
+EOF
+)
     log_info "create_dataset: JSON payload: $json_input for SOURCE pool_name='$pool_name' dataset_name='$dataset_name'"
+    log_info "create_dataset: Applied direct setting: $direct_setting with optimized dataset properties"
     
     log_info "create_dataset: Making API call to SOURCE server='$selected_nfs_ip:$rest_api_port' for pool_name='$pool_name' dataset_name='$dataset_name'"
     local url="https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes"
@@ -13824,6 +13897,68 @@ except Exception as e:
     if [[ $python_exit -ne 0 ]]; then
         log_error "get_pools: Failed to parse JSON response"
         return 1
+    fi
+}
+
+# Function to check if pool consists entirely of NVMe disks
+is_pool_full_nvme() {
+    local pool_name="$1"
+    local ip_addr="$2"
+    
+    log_info "is_pool_full_nvme: Checking if pool '$pool_name' on $ip_addr consists entirely of NVMe disks"
+    log_debug "is_pool_full_nvme: Pool name: '$pool_name', IP address: '$ip_addr'"
+    
+    if [[ -z "$pool_name" ]]; then
+        log_error "is_pool_full_nvme: Pool name parameter is required"
+        return 1
+    fi
+    
+    if [[ -z "$ip_addr" ]]; then
+        log_error "is_pool_full_nvme: IP address parameter is required"
+        return 1
+    fi
+    
+    local url="https://${ip_addr}:${rest_api_port}/api/v4/disks"
+    log_debug "is_pool_full_nvme: Making API call to: $url"
+    log_debug "is_pool_full_nvme: Using REST API user: ${rest_api_user}"
+    log_debug "is_pool_full_nvme: REST API password length: ${#rest_api_password}"
+    
+    local full_response
+    full_response=$(curl -k -s --connect-timeout 5 --max-time 30 -w '\n%{http_code}' -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' "$url")
+    
+    local http_code="${full_response##*$'\n'}"
+    local response="${full_response%$'\n'*}"
+    
+    log_debug "is_pool_full_nvme: HTTP response code: $http_code"
+    
+    if [ "$http_code" != "200" ]; then
+        log_error "is_pool_full_nvme: API call failed with HTTP code $http_code"
+        log_debug "is_pool_full_nvme: Full response: $full_response"
+        return 1
+    fi
+    
+    log_debug "is_pool_full_nvme: Successfully retrieved disks data"
+    
+    # Extract disk types for the specified pool and active_pool_disk assignment
+    local types
+    types=$(echo "$response" | jq -r --arg pool "$pool_name" '.data[] | select(.pool_name == $pool and .assignment == "active_pool_disk") | .type')
+    
+    if [ -z "$types" ]; then
+        log_error "is_pool_full_nvme: No active pool disks found for pool '$pool_name'"
+        log_debug "is_pool_full_nvme: Available pools in response: $(echo "$response" | jq -r '.data[].pool_name' | sort -u | tr '\n' ' ')"
+        return 1  # No disks found for the pool
+    fi
+    
+    log_debug "is_pool_full_nvme: Found disk types for pool '$pool_name': $(echo "$types" | tr '\n' ' ')"
+    
+    # Check if any disk type is NOT NVMe
+    echo "$types" | grep -qv '^nvme'
+    if [ $? -eq 0 ]; then
+        log_info "is_pool_full_nvme: Pool '$pool_name' contains non-NVMe disks"
+        return 1  # Found non-NVMe disk
+    else
+        log_info "is_pool_full_nvme: Pool '$pool_name' consists entirely of NVMe disks"
+        return 0  # All disks are NVMe
     fi
 }
 

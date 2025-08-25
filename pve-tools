@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.74"
+VERSION="0.75"
 RELEASE_DATE="2025-08-25"
 
 # Script mode flag
@@ -9344,8 +9344,13 @@ get_current_storage_servers_ip() {
         done <<< "$custom_ips"
     fi
 
-    # Remove duplicates
-    readarray -t uniq_ips < <(printf "%s\n" "${ips[@]}" | sort -u)
+    # Remove duplicates only if we have actual IPs
+    local uniq_ips=()
+    if [[ ${#ips[@]} -gt 0 ]]; then
+        readarray -t uniq_ips < <(printf "%s\n" "${ips[@]}" | sort -u)
+    fi
+    
+    # Always add special menu options
     uniq_ips+=("Scan network for $PRODUCT IP")
     uniq_ips+=("Enter new IP")
     uniq_ips+=("Unregister IPs")
@@ -10003,7 +10008,7 @@ nfs_step1_select_ip() {
     for ip in "${ips[@]}"; do
         if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
             special_options+=("$ip")
-        else
+        elif [[ -n "$ip" ]]; then  # Only process non-empty IP addresses
             actual_ips+=("$ip")
             local hostname=$(get_hostname_for_ip "$ip")
             local node_role=$(get_node_role_for_ip "$ip")
@@ -18071,6 +18076,373 @@ EOF_PERL_MODULE
     return 0
 }
 
+# Check if any storage IPs are configured (either in storage.cfg or custom_ips)
+check_for_storage_ips() {
+    log_debug "check_for_storage_ips: Checking for existing storage IPs"
+    
+    # Check if any NFS storage entries exist in storage.cfg
+    if [[ -f "/etc/pve/storage.cfg" ]]; then
+        if grep -q "server " /etc/pve/storage.cfg 2>/dev/null; then
+            log_debug "check_for_storage_ips: Found NFS storage IPs in storage.cfg"
+            return 0
+        fi
+    fi
+    
+    # Check if any custom IPs exist in config file
+    local custom_ips
+    custom_ips=$(get_custom_ips)
+    if [[ -n "$custom_ips" ]]; then
+        log_debug "check_for_storage_ips: Found custom IPs: $custom_ips"
+        return 0
+    fi
+    
+    log_debug "check_for_storage_ips: No storage IPs found"
+    return 1
+}
+
+# Initial IP selection menu for first-time setup
+initial_ip_selection_menu() {
+    log_debug "initial_ip_selection_menu: Function started"
+    local line ips=() menu_items=()
+    while IFS= read -r line; do
+        ips+=("$line")
+    done < <(get_current_storage_servers_ip)
+    log_debug "initial_ip_selection_menu: Got ${#ips[@]} IPs: ${ips[*]}"
+
+    if [ "${#ips[@]}" -eq 0 ]; then
+        dialog --msgbox "No IPs found." 8 40
+        return 1
+    fi
+
+    # Separate actual IPs from special menu options
+    local actual_ips=()
+    local special_options=()
+    local ip_data=()  # Array to store IP info for sorting
+    
+    for ip in "${ips[@]}"; do
+        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
+            special_options+=("$ip")
+        elif [[ -n "$ip" ]]; then  # Only process non-empty IP addresses
+            actual_ips+=("$ip")
+            local hostname=$(get_hostname_for_ip "$ip")
+            local node_role=$(get_node_role_for_ip "$ip")
+            log_debug "initial_ip_selection_menu: IP '$ip' has hostname '$hostname' and role '$node_role'"
+            
+            # Store IP data with role priority for sorting
+            # Format: "role_priority|ip|hostname|role"
+            local role_priority
+            case "$node_role" in
+                "ha-cluster-node")
+                    role_priority="1"  # Highest priority (will appear first)
+                    ;;
+                "backup-dr-node")
+                    role_priority="2"  # Second priority
+                    ;;
+                *)
+                    role_priority="3"  # Lowest priority (unassigned)
+                    ;;
+            esac
+            
+            # Convert IP to sortable format (pad octets with zeros)
+            local -a octets
+            IFS='.' read -ra octets <<< "$ip"
+            local sortable_ip
+            sortable_ip=$(printf "%03d.%03d.%03d.%03d" "${octets[0]}" "${octets[1]}" "${octets[2]}" "${octets[3]}")
+            
+            ip_data+=("${role_priority}|${sortable_ip}|${ip}|${hostname}|${node_role}")
+        fi
+    done
+    
+    # Sort IP data by role priority (ascending) and then by IP
+    IFS=$'\n' sorted_ip_data=($(printf '%s\n' "${ip_data[@]}" | sort))
+    unset IFS
+    
+    log_debug "initial_ip_selection_menu: Sorted ${#sorted_ip_data[@]} IPs by role and IP address"
+    
+    # Build sorted IP array - only add actual IPs if they exist, then special options
+    local sorted_ips=()
+    for data in "${sorted_ip_data[@]}"; do
+        local ip=$(echo "$data" | cut -d'|' -f3)
+        sorted_ips+=("$ip")
+    done
+    
+    # Add special options at the end
+    for option in "${special_options[@]}"; do
+        sorted_ips+=("$option")
+    done
+    
+    # Replace original ips array with sorted one
+    ips=("${sorted_ips[@]}")
+    
+    # Build menu items with proper display formatting
+    local i
+    for ((i=0; i<${#ips[@]}; i++)); do
+        local ip="${ips[i]}"
+        local hostname
+        local node_role
+        
+        # Check if this is a special menu option (not an actual IP)
+        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
+            # Special menu options - don't show role
+            menu_items+=("$i" "$ip")
+        else
+            # Regular IP addresses - show VIP info, hostname, and role
+            hostname=$(get_hostname_for_ip "$ip")
+            node_role=$(get_node_role_for_ip "$ip")
+            local vip_info=$(get_vip_info_for_ip "$ip" "$hostname")
+            
+            # Build display string with IP, VIP info (replacing hostname), and role
+            if [[ -n "$hostname" && "$hostname" != "Unknown" ]]; then
+                if [[ -n "$node_role" && "$node_role" != "unassigned" ]]; then
+                    menu_items+=("$i" "$(printf "%-16s %-35s [%s]" "$ip" "$vip_info" "$node_role")")
+                else
+                    menu_items+=("$i" "$(printf "%-16s %-35s [unassigned]" "$ip" "$vip_info")")
+                fi
+            else
+                if [[ -n "$node_role" && "$node_role" != "unassigned" ]]; then
+                    menu_items+=("$i" "$(printf "%-16s %-35s [%s]" "$ip" "$vip_info" "$node_role")")
+                else
+                    menu_items+=("$i" "$(printf "%-16s %-35s [unassigned]" "$ip" "$vip_info")")
+                fi
+            fi
+        fi
+    done
+
+    # Determine if we have at least one actual IP configured
+    local cancel_label="Exit"
+    if [[ ${#actual_ips[@]} -gt 0 ]]; then
+        cancel_label="Go to Main"
+    fi
+
+    local dialog_selected=$(mktemp)
+
+    log_debug "initial_ip_selection_menu: About to display dialog menu with ${#menu_items[@]} items, cancel_label: $cancel_label"
+    cmd=(dialog --keep-tite --title "Select $PRODUCT NFS Storage IP (VIP)"
+         --ok-label "Next" --cancel-label "$cancel_label"
+         --menu "Choose $PRODUCT NFS Storage IP (VIP):" 15 100 8)
+    options=("${menu_items[@]}")
+    dialog_menu
+    log_debug "initial_ip_selection_menu: dialog_menu returned, exit code: $dialog_exit_code, selected: $selected_option"
+    rm -f "$dialog_selected"
+
+    case $dialog_exit_code in
+        0)  # Next
+            if [[ "${ips[selected_option]}" == "Scan network for $PRODUCT IP" ]]; then
+                log_debug "initial_ip_selection_menu: User selected 'Scan network for $PRODUCT IP', starting network scan"
+                network_scan_for_storage_servers_ip
+                local scan_result=$?
+                if [[ $scan_result -eq 0 ]]; then
+                    log_info "initial_ip_selection_menu: Network scan completed successfully, refreshing IP list"
+                    return 2  # Retry same step to refresh the list
+                else
+                    log_debug "initial_ip_selection_menu: Network scan cancelled or failed, returning to menu"
+                    return 2  # Retry same step
+                fi
+            elif [[ "${ips[selected_option]}" == "Enter new IP" ]]; then
+                log_debug "initial_ip_selection_menu: User selected 'Enter new IP', showing input dialog"
+                # Get custom IP input with validation loop
+                local input_ip
+                while true; do
+                    log_debug "initial_ip_selection_menu: Displaying IP input dialog"
+                    # Kill any background "Please wait..." dialogs that might be interfering
+                    pkill -f "Please wait" 2>/dev/null || true  # Don't fail if no processes found
+                    sleep 0.1  # Brief delay for cleanup
+                    log_debug "initial_ip_selection_menu: Killed background dialogs, showing input dialog"
+                    
+                    # Use temporary file for dialog output instead of complex redirection
+                    local temp_input=$(mktemp)
+                    dialog --keep-tite --title "Enter New IP" --inputbox "Enter the NFS Storage IP address:" 8 40 2>"$temp_input"
+                    local input_exit_code=$?
+                    input_ip=$(< "$temp_input")
+                    rm -f "$temp_input"
+                    log_debug "initial_ip_selection_menu: Input dialog returned, exit code: $input_exit_code, input: '$input_ip'"
+                    if [[ $input_exit_code -ne 0 ]]; then
+                        log_debug "initial_ip_selection_menu: User cancelled input dialog"
+                        return 2  # User cancelled, retry
+                    fi
+                    
+                    if [[ -z "$input_ip" ]]; then
+                        log_debug "initial_ip_selection_menu: Empty IP address entered, showing error"
+                        dialog --msgbox "IP address cannot be empty. Please try again." 8 50
+                        continue
+                    fi
+                    
+                    # Enhanced validation with REST API connectivity testing
+                    local validation_error=""
+                    log_debug "initial_ip_selection_menu: Starting enhanced validation for $input_ip"
+                    
+                    # Show progress dialog while testing connectivity
+                    dialog --infobox "Testing connection to $PRODUCT at $input_ip...\nPlease wait (up to 10 seconds)" 5 60 &
+                    local progress_pid=$!
+                    
+                    validate_ip_with_connectivity "$input_ip" validation_error
+                    local validation_result=$?
+                    
+                    # Kill progress dialog
+                    kill $progress_pid 2>/dev/null || true
+                    wait $progress_pid 2>/dev/null || true
+                    
+                    if [[ $validation_result -ne 0 ]]; then
+                        log_debug "initial_ip_selection_menu: Validation failed for $input_ip, result: $validation_result, error: $validation_error"
+                        dialog --msgbox "$validation_error" 12 70
+                        continue
+                    fi
+                    
+                    if ip_already_exists "$input_ip"; then
+                        dialog --msgbox "IP address $input_ip already exists in configuration. Please enter a different IP." 10 60
+                        continue
+                    fi
+                    
+                    # IP is valid, add it to custom IPs
+                    add_custom_ip "$input_ip"
+                    log_info "initial_ip_selection_menu: Added custom IP: $input_ip"
+                    
+                    # Prompt for node role selection
+                    select_node_role "$input_ip"
+                    log_info "initial_ip_selection_menu: Role selection completed for IP '$input_ip'"
+                    
+                    # Return to menu to allow selection of the newly added IP
+                    return 2  # Retry same step
+                done
+            elif [[ "${ips[selected_option]}" == "Unregister IPs" ]]; then
+                manage_custom_ips
+                return 2  # Retry same step
+            else
+                # User selected an existing IP
+                local selected_ip="${ips[selected_option]}"
+                log_info "initial_ip_selection_menu: User selected existing IP: $selected_ip"
+                
+                # Check if the selected IP is disconnected
+                if ! check_ip_connection_state "$selected_ip"; then
+                    log_info "Selected disconnected IP: $selected_ip, attempting reconnection"
+                    
+                    # Show attempting reconnection dialog
+                    dialog --infobox "Attempting to reconnect to $selected_ip..." 5 50
+                    
+                    if attempt_reconnect_ip "$selected_ip"; then
+                        # Reconnection successful
+                        dialog --msgbox "Successfully reconnected to $selected_ip" 6 50
+                        
+                        # Prompt for node role selection after successful reconnection
+                        log_info "initial_ip_selection_menu: Successfully reconnected to '$selected_ip', prompting for role selection"
+                        select_node_role "$selected_ip"
+                        log_info "initial_ip_selection_menu: Role selection completed for reconnected IP '$selected_ip'"
+                        
+                        return 0
+                    else
+                        # Reconnection failed - check if it was authentication
+                        local error_msg="Failed to connect to $selected_ip\n\n"
+                        if grep -q "Authentication failed" /var/log/pve-tools/pve-tools.log 2>/dev/null | tail -n 5; then
+                            error_msg="${error_msg}Authentication failed (HTTP 401)\n\n"
+                            error_msg="${error_msg}Please check REST API credentials in Main Menu -> Setup\n\n"
+                        elif grep -q "Access forbidden" /var/log/pve-tools/pve-tools.log 2>/dev/null | tail -n 5; then
+                            error_msg="${error_msg}Access forbidden (HTTP 403)\n\n"
+                            error_msg="${error_msg}The REST API user may not have sufficient permissions.\n\n"
+                        else
+                            error_msg="${error_msg}The storage server appears to be offline or unreachable.\n\n"
+                        fi
+                        error_msg="${error_msg}Returning to IP selection menu."
+                        
+                        dialog --msgbox "$error_msg" 12 65
+                        return 2  # Retry same step
+                    fi
+                fi
+                
+                # Prompt for node role selection for connected IP (if role is unassigned)
+                local current_role
+                current_role=$(get_node_role_for_ip "$selected_ip")
+                if [[ "$current_role" == "unassigned" ]]; then
+                    log_info "initial_ip_selection_menu: Selected IP '$selected_ip' has unassigned role, prompting for role selection"
+                    select_node_role "$selected_ip"
+                    log_info "initial_ip_selection_menu: Role selection completed for connected IP '$selected_ip'"
+                else
+                    log_debug "initial_ip_selection_menu: Selected IP '$selected_ip' already has role '$current_role', skipping role selection"
+                fi
+                
+                return 0
+            fi
+            ;;
+        1)  # Exit or Go to Main
+            if [[ ${#actual_ips[@]} -gt 0 ]]; then
+                log_info "initial_ip_selection_menu: User selected 'Go to Main' with ${#actual_ips[@]} IP(s) configured"
+                return 0
+            else
+                log_info "initial_ip_selection_menu: User selected 'Exit' with no IPs configured"
+                return 1
+            fi
+            ;;
+    esac
+}
+
+# Initial IP management controller - loops until IP is configured or user exits
+initial_ip_management_dialog() {
+    log_debug "initial_ip_management_dialog: Starting initial IP management"
+    
+    # Check if we need to show the dialog at all
+    if check_for_storage_ips; then
+        log_debug "initial_ip_management_dialog: Storage IPs already configured, skipping dialog"
+        return 0
+    fi
+    
+    log_info "initial_ip_management_dialog: No storage IPs configured, showing initial setup dialog"
+    
+    # Show informational dialog about initial setup
+    dialog --keep-tite --title "Initial Setup Required" \
+           --ok-label "Continue" --cancel-label "Exit" \
+           --yesno "Welcome to PVE Tools!\n\nNo JovianDSS NFS Storage IPs are currently configured.\n\nYou need to configure at least one storage IP to continue.\n\nWould you like to configure storage IPs now?" 12 70
+    
+    if [[ $? -ne 0 ]]; then
+        log_info "initial_ip_management_dialog: User chose to exit initial setup"
+        exit 0
+    fi
+    
+    # Main loop - keep showing the dialog until IP is configured or user exits
+    while true; do
+        log_debug "initial_ip_management_dialog: Starting dialog loop iteration"
+        
+        # Show the IP selection menu
+        initial_ip_selection_menu
+        local result=$?
+        
+        case $result in
+            0)  # Success - IP was selected/configured
+                log_info "initial_ip_management_dialog: IP selection successful, checking if IPs are now available"
+                
+                # Verify that we now have at least one IP configured
+                if check_for_storage_ips; then
+                    log_info "initial_ip_management_dialog: Initial IP setup completed successfully"
+                    dialog --msgbox "Initial setup completed successfully!\n\nPVE Tools will now continue with initialization." 8 60
+                    return 0
+                else
+                    log_warn "initial_ip_management_dialog: IP selection returned success but no IPs configured, continuing loop"
+                    continue
+                fi
+                ;;
+            1)  # User chose Exit
+                log_info "initial_ip_management_dialog: User chose to exit"
+                dialog --keep-tite --title "Exit Confirmation" \
+                       --yes-label "Exit" --no-label "Continue Setup" \
+                       --yesno "Are you sure you want to exit?\n\nPVE Tools requires at least one storage IP to function properly." 10 60
+                if [[ $? -eq 0 ]]; then
+                    log_info "initial_ip_management_dialog: User confirmed exit"
+                    exit 0
+                else
+                    log_debug "initial_ip_management_dialog: User cancelled exit, continuing setup"
+                    continue
+                fi
+                ;;
+            2)  # Retry - user performed an action that requires refreshing the menu
+                log_debug "initial_ip_management_dialog: Menu refresh requested, continuing loop"
+                continue
+                ;;
+            *)  # Unexpected return code
+                log_error "initial_ip_management_dialog: Unexpected return code: $result"
+                continue
+                ;;
+        esac
+    done
+}
+
 # Main script entry point
 main() {
     # Initialize logging system first
@@ -18099,6 +18471,12 @@ main() {
     # Check if any NFS storage exists (continue regardless)
     if ! check_nfs_storage_exists; then
         log_info "No NFS storage found - continuing with limited functionality"
+    fi
+    
+    # Check if any storage IPs are configured, if not show initial setup
+    if ! check_for_storage_ips; then
+        log_info "No storage IPs configured, starting initial IP setup"
+        initial_ip_management_dialog
     fi
     
     # Build storage to IP mapping table

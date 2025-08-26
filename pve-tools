@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.77"
+VERSION="0.78"
 RELEASE_DATE="2025-08-26"
 
 # Script mode flag
@@ -9554,6 +9554,116 @@ except Exception:
 '
 }
 
+# Helper function: Get all NFS shares from the server
+get_all_nfs_shares() {
+    local nfs_ip="${1:-$selected_nfs_ip}"
+    local response
+    
+    if [[ -z "$rest_api_user" || -z "$rest_api_password" ]]; then
+        log_error "get_all_nfs_shares: API credentials not configured"
+        return 1
+    fi
+    
+    if [[ -z "$nfs_ip" ]]; then
+        log_error "get_all_nfs_shares: NFS IP not provided"
+        return 1
+    fi
+    
+    log_debug "get_all_nfs_shares: Getting all NFS shares from $nfs_ip"
+    
+    local url="https://$nfs_ip:$rest_api_port/api/v4/shares"
+    response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' "$url")
+    
+    local curl_exit=$?
+    if [[ $curl_exit -ne 0 ]]; then
+        log_error "get_all_nfs_shares: Failed to connect to server for shares"
+        return 1
+    fi
+    
+    if [[ -z "$response" ]]; then
+        log_error "get_all_nfs_shares: Empty response from server (shares)"
+        return 1
+    fi
+    
+    # Extract share names from JSON response
+    printf '%s' "$response" | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    entries = data.get("data", {}).get("entries", [])
+    if not entries:
+        sys.exit(0)  # No shares is valid, not an error
+    for share in entries:
+        name = share.get("name")
+        if name:
+            print(name)
+except Exception:
+    sys.exit(1)
+'
+}
+
+# Helper function: Get all NFS shares from ALL configured servers (GLOBAL CHECK)
+get_all_nfs_shares_from_all_servers() {
+    local all_shares=()
+    local all_ips=()
+    
+    # Get all configured server IPs
+    # 1. From custom_ips config
+    local custom_ips
+    custom_ips=$(get_custom_ips)
+    if [[ -n "$custom_ips" ]]; then
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] && all_ips+=("$ip")
+        done <<< "$custom_ips"
+    fi
+    
+    # 2. From existing NFS storage in /etc/pve/storage.cfg
+    local storage_ips
+    storage_ips=$(grep "^[[:space:]]*server[[:space:]]" /etc/pve/storage.cfg 2>/dev/null | awk '{print $2}' | sort -u)
+    if [[ -n "$storage_ips" ]]; then
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] && all_ips+=("$ip")
+        done <<< "$storage_ips"
+    fi
+    
+    # Remove duplicates from all_ips array
+    local unique_ips=()
+    for ip in "${all_ips[@]}"; do
+        local found=false
+        for existing in "${unique_ips[@]}"; do
+            if [[ "$existing" == "$ip" ]]; then
+                found=true
+                break
+            fi
+        done
+        if [[ "$found" == false ]]; then
+            unique_ips+=("$ip")
+        fi
+    done
+    
+    log_debug "get_all_nfs_shares_from_all_servers: Found ${#unique_ips[@]} unique server IPs: ${unique_ips[*]}"
+    
+    # Get shares from each server
+    for ip in "${unique_ips[@]}"; do
+        log_debug "get_all_nfs_shares_from_all_servers: Getting shares from server $ip"
+        
+        # Get shares from this server (suppress errors for offline servers)
+        while IFS= read -r share_name; do
+            if [[ -n "$share_name" ]]; then
+                all_shares+=("$share_name")
+                log_debug "get_all_nfs_shares_from_all_servers: Found share '$share_name' on server $ip"
+            fi
+        done < <(get_all_nfs_shares "$ip" 2>/dev/null || true)
+    done
+    
+    log_debug "get_all_nfs_shares_from_all_servers: Total shares found across all servers: ${#all_shares[@]}"
+    
+    # Output all shares (one per line)
+    for share in "${all_shares[@]}"; do
+        echo "$share"
+    done
+}
+
 get_snapshots_in_dataset() {
     local pool_name="$1"
     local dataset_name="$2"
@@ -11443,20 +11553,116 @@ nfs_new_step3_dataset_choice() {
     esac
 }
 
-# Step 4A: Create New Dataset
+# Step 4A: Create New Dataset (NEW LOGIC - checks NFS exports first, handles conflicts)
 nfs_new_step4a_create_dataset() {
-    # Find next available dataset number
-    local next_number
-    if ! next_number=$(find_next_dataset_number "$selected_pool"); then
+    # Find next available dataset number from NFS exports with dataset existence check
+    local result
+    if ! result=$(find_next_dataset_number "$selected_pool" true "$selected_nfs_ip"); then
         dialog --msgbox "Failed to determine next dataset number!\n\nPool: $selected_pool" 10 60
         return 2  # Go back
     fi
     
-    new_dataset_name="${dataset_auto_prefix}-$next_number"
-    selected_dataset="$new_dataset_name"
+    # Parse the result: "suffix:exists_flag"
+    local next_suffix="${result%%:*}"
+    local dataset_exists="${result##*:}"
+    local proposed_name="${dataset_auto_prefix}-${next_suffix}"
     
-    log_info "Generated new dataset name: $new_dataset_name"
-    return 0
+    log_info "nfs_new_step4a_create_dataset: Next suffix from exports: '$next_suffix', dataset exists: '$dataset_exists'"
+    
+    if [[ "$dataset_exists" == "true" ]]; then
+        # Dataset with this name exists, prompt user for choice
+        log_info "Dataset '$proposed_name' already exists in pool '$selected_pool', prompting user"
+        
+        dialog --keep-tite --title "Dataset Already Exists" \
+               --yes-label "Use Existing" --no-label "Create New" \
+               --yesno "Dataset '$proposed_name' already exists in pool '$selected_pool'.\n\n\
+The next available export number is '$next_suffix', but a dataset with this name already exists.\n\n\
+Do you want to:\n\n\
+• Use Existing: Use the existing dataset '$proposed_name'\n\
+  (The NFS share will be created for this dataset)\n\n\
+• Create New: Create a new dataset with the next available number\n\
+  (This will use a higher number like $(printf "${dataset_auto_prefix}-%02d" $((10#${next_suffix} + 1))))" 16 75
+        
+        if [[ $? -eq 0 ]]; then
+            # User chose to use existing dataset
+            log_info "User chose to use existing dataset: '$proposed_name'"
+            new_dataset_name="$proposed_name"
+            selected_dataset="$proposed_name"
+            selected_dataset_option="existing"  # Mark as existing for later processing
+            
+            log_info "Using existing dataset: $new_dataset_name"
+            return 0
+        else
+            # User chose to create new with next number
+            log_info "User chose to create new dataset with next available number"
+            
+            # Find next truly available number (both export and dataset must not exist)
+            local number=$((10#${next_suffix} + 1))  # Convert to decimal and increment
+            local format_pattern="%02d"  # Default format
+            
+            # Determine format pattern from the next_suffix
+            case "${#next_suffix}" in
+                2) format_pattern="%02d" ;;
+                3) format_pattern="%03d" ;;
+                *) format_pattern="%02d" ;;
+            esac
+            
+            log_debug "Searching for next available number starting from $number with format $format_pattern"
+            
+            # Loop to find next truly available number (not in exports AND not in datasets)
+            while true; do
+                local test_suffix=$(printf "$format_pattern" "$number")
+                local test_name="${dataset_auto_prefix}-${test_suffix}"
+                local export_exists=false
+                local dataset_exists_check=false
+                
+                # Check if export exists
+                while IFS= read -r share_name; do
+                    if [[ "$share_name" == "$test_name" ]]; then
+                        export_exists=true
+                        break
+                    fi
+                done < <(get_all_nfs_shares "$selected_nfs_ip" 2>/dev/null)
+                
+                # Check if dataset exists
+                if [[ "$export_exists" == false ]]; then
+                    while IFS= read -r dataset; do
+                        if [[ "$dataset" == "$test_name" ]]; then
+                            dataset_exists_check=true
+                            break
+                        fi
+                    done < <(get_datasets_in_pool "$selected_pool" 2>/dev/null)
+                fi
+                
+                if [[ "$export_exists" == false && "$dataset_exists_check" == false ]]; then
+                    # Found available name
+                    log_info "Found next available dataset name: $test_name"
+                    new_dataset_name="$test_name"
+                    selected_dataset="$test_name"
+                    selected_dataset_option="create"
+                    return 0
+                fi
+                
+                log_debug "Name '$test_name' is taken (export_exists=$export_exists, dataset_exists=$dataset_exists_check), trying next"
+                ((number++))
+                
+                # Safety check
+                if [[ $number -gt 999 ]]; then
+                    dialog --msgbox "Error: Cannot find available dataset name!\n\nAll numbers up to 999 are taken." 10 60
+                    return 2  # Go back
+                fi
+            done
+        fi
+    else
+        # Dataset doesn't exist, proceed with creation using the proposed name
+        log_info "Dataset '$proposed_name' does not exist, proceeding with creation"
+        new_dataset_name="$proposed_name"
+        selected_dataset="$proposed_name"
+        selected_dataset_option="create"
+        
+        log_info "Generated new dataset name: $new_dataset_name"
+        return 0
+    fi
 }
 
 # Step 4B: Select Existing Dataset
@@ -11878,6 +12084,16 @@ Check logs for detailed error information." \
         
         log_info "perform_new_nfs_setup: STEP 3 SUCCESS - SOURCE dataset created pool_name='$selected_pool' dataset_name='$new_dataset_name'"
         selected_dataset="$new_dataset_name"
+    elif [[ "$selected_dataset_option" == "existing" ]]; then
+        # Using existing dataset, skip creation
+        log_info "perform_new_nfs_setup: Using EXISTING SOURCE dataset pool_name='$selected_pool' dataset_name='$selected_dataset' on server='$selected_nfs_ip'"
+        dialog --title "Using Existing Dataset" --infobox "Using existing SOURCE dataset:\nServer: $selected_nfs_ip\nPool: $selected_pool\nDataset: $selected_dataset" 8 70
+        sleep 2  # Brief pause to show the message
+        
+        log_info "perform_new_nfs_setup: STEP 3 SUCCESS - Using existing SOURCE dataset pool_name='$selected_pool' dataset_name='$selected_dataset'"
+    else
+        log_error "perform_new_nfs_setup: Unknown selected_dataset_option: '$selected_dataset_option'"
+        return 1
     fi
     
     # Create NFS share for source dataset
@@ -12545,9 +12761,60 @@ EOF
         log_error "create_dataset: SOURCE dataset FAILED RESPONSE='$body' for pool_name='$pool_name' dataset_name='$dataset_name'"
         
         # Try to extract error message from response
+        local error_msg=""
         if [[ -n "$body" ]]; then
-            local error_msg=$(echo "$body" | grep -o '"message":"[^"]*"' | sed 's/"message":"\([^"]*\)"/\1/' 2>/dev/null || echo "$body")
+            error_msg=$(echo "$body" | grep -o '"message":"[^"]*"' | sed 's/"message":"\([^"]*\)"/\1/' 2>/dev/null || echo "$body")
             log_error "create_dataset: SOURCE dataset ERROR DETAILS='$error_msg' for pool_name='$pool_name' dataset_name='$dataset_name'"
+        fi
+        
+        # Check if the error is about unsupported 'direct' property and retry with basic payload
+        if [[ $status -eq 400 && "$error_msg" == *"direct"*"unexpected"* ]]; then
+            log_info "create_dataset: API doesn't support 'direct' property, retrying with basic payload"
+            
+            # Prepare basic JSON payload without 'direct' property
+            local basic_json_input=$(cat <<EOF
+{
+    "name": "${dataset_name}",
+    "compression": "lz4",
+    "sync": "always",
+    "logbias": "latency",
+    "primarycache": "all",
+    "secondarycache": "all",
+    "atime": "off",
+    "recordsize": ${recordsize}
+}
+EOF
+)
+            log_info "create_dataset: RETRY - Basic JSON payload: $basic_json_input for SOURCE pool_name='$pool_name' dataset_name='$dataset_name'"
+            
+            # Retry the API call with basic payload
+            local retry_response
+            retry_response=$(curl -k -s --connect-timeout 10 --max-time 30 -w "\n%{http_code}" -X POST -u "${rest_api_user}:${rest_api_password}" \
+                -H 'Content-Type: application/json' \
+                -d "$basic_json_input" \
+                "$url" 2>/dev/null)
+            
+            local retry_curl_exit=$?
+            if [[ $retry_curl_exit -ne 0 ]]; then
+                log_error "create_dataset: RETRY - CURL FAILED to connect to SOURCE server='$selected_nfs_ip:$rest_api_port' for pool_name='$pool_name' dataset_name='$dataset_name' curl_exit='$retry_curl_exit'"
+                return 1
+            fi
+            
+            # Parse retry response
+            local retry_body=$(echo "$retry_response" | sed '$d')
+            local retry_status=$(echo "$retry_response" | tail -n1)
+            
+            log_info "create_dataset: RETRY - API response HTTP_STATUS='$retry_status' for SOURCE pool_name='$pool_name' dataset_name='$dataset_name' on server='$selected_nfs_ip:$rest_api_port'"
+            log_debug "create_dataset: RETRY - API response BODY='$retry_body' for pool_name='$pool_name' dataset_name='$dataset_name'"
+            
+            if [[ $retry_status -eq 200 || $retry_status -eq 201 ]]; then
+                log_info "create_dataset: RETRY SUCCESS - SOURCE dataset created with basic payload pool_name='$pool_name' dataset_name='$dataset_name' on server='$selected_nfs_ip:$rest_api_port' HTTP_STATUS='$retry_status'"
+                return 0
+            else
+                log_error "create_dataset: RETRY FAILED - SOURCE dataset creation failed even with basic payload pool_name='$pool_name' dataset_name='$dataset_name' on server='$selected_nfs_ip:$rest_api_port' HTTP_STATUS='$retry_status'"
+                log_error "create_dataset: RETRY FAILED RESPONSE='$retry_body' for pool_name='$pool_name' dataset_name='$dataset_name'"
+                return 1
+            fi
         fi
         
         return 1
@@ -12774,10 +13041,15 @@ EOF
     fi
 }
 
-# Helper function: Find next available dataset number
-find_next_dataset_number() {
-    local pool_name="$1"
+# Helper function: Find next available suffix from NFS exports
+find_next_available_suffix_from_exports() {
+    local nfs_ip="${1:-$selected_nfs_ip}"
     local start_pattern="$new_NFS_storage_volume_running_number_starts_with"
+    
+    if [[ -z "$nfs_ip" ]]; then
+        log_error "find_next_available_suffix_from_exports: NFS IP not provided"
+        return 1
+    fi
     
     # Determine starting number and format from pattern (same logic as storage naming)
     local start_number
@@ -12816,32 +13088,63 @@ find_next_dataset_number() {
             ;;
     esac
     
-    local number=$start_number
+    log_debug "find_next_available_suffix_from_exports: start_pattern='$start_pattern', start_number=$start_number, format='$format_pattern'"
     
-    log_debug "Finding next available dataset number for pool: $pool_name, start_pattern: $start_pattern, start_number: $start_number, format: $format_pattern"
+    # Get all existing exports with the auto-prefix FROM ALL SOURCES (GLOBAL CHECK)
+    local existing_exports=()
     
-    # Get all existing datasets with the auto-prefix
-    local existing_datasets=()
-    while IFS= read -r dataset; do
-        if [[ "$dataset" =~ ^${dataset_auto_prefix}-([0-9]+)$ ]]; then
-            existing_datasets+=("$dataset")
+    # 1. Check existing PVE NFS storage exports (more reliable than API)
+    log_debug "find_next_available_suffix_from_exports: Checking existing PVE NFS exports"
+    local pve_exports
+    pve_exports=$(grep "^[[:space:]]*export[[:space:]]" /etc/pve/storage.cfg 2>/dev/null | awk '{print $2}' | sed 's|^/||') # Remove leading slash
+    if [[ -n "$pve_exports" ]]; then
+        while IFS= read -r export_name; do
+            if [[ "$export_name" =~ ^${dataset_auto_prefix}-([0-9]+)$ ]]; then
+                existing_exports+=("$export_name")
+                log_debug "find_next_available_suffix_from_exports: Found PVE export: $export_name"
+            fi
+        done <<< "$pve_exports"
+    fi
+    
+    # 2. Also check API shares from all servers as fallback
+    log_debug "find_next_available_suffix_from_exports: Checking API shares from all servers"
+    while IFS= read -r share_name; do
+        if [[ "$share_name" =~ ^${dataset_auto_prefix}-([0-9]+)$ ]]; then
+            # Check if already in existing_exports to avoid duplicates
+            local already_exists=false
+            for existing in "${existing_exports[@]}"; do
+                if [[ "$existing" == "$share_name" ]]; then
+                    already_exists=true
+                    break
+                fi
+            done
+            if [[ "$already_exists" == false ]]; then
+                existing_exports+=("$share_name")
+                log_debug "find_next_available_suffix_from_exports: Found API share: $share_name"
+            fi
         fi
-    done < <(get_datasets_in_pool "$pool_name" 2>/dev/null)
+    done < <(get_all_nfs_shares_from_all_servers 2>/dev/null)
+    
+    log_debug "find_next_available_suffix_from_exports: Found ${#existing_exports[@]} existing exports with prefix '$dataset_auto_prefix' across ALL sources"
     
     # Find first available number starting from configured pattern
+    local number=$start_number
     while true; do
-        local candidate="${dataset_auto_prefix}-$(printf "$format_pattern" "$number")"
+        local candidate_suffix=$(printf "$format_pattern" "$number")
+        local candidate="${dataset_auto_prefix}-${candidate_suffix}"
         local exists=false
         
-        for existing in "${existing_datasets[@]}"; do
+        for existing in "${existing_exports[@]}"; do
             if [[ "$existing" == "$candidate" ]]; then
                 exists=true
+                log_debug "find_next_available_suffix_from_exports: Export '$candidate' already exists"
                 break
             fi
         done
         
         if [[ "$exists" == false ]]; then
-            printf "$format_pattern" "$number"
+            log_debug "find_next_available_suffix_from_exports: Found available suffix: $candidate_suffix"
+            printf "$candidate_suffix"
             return 0
         fi
         
@@ -12856,10 +13159,59 @@ find_next_dataset_number() {
         fi
         
         if [[ $number -gt $max_limit ]]; then
-            log_error "find_next_dataset_number: Reached maximum dataset number limit ($max_limit) for pattern $start_pattern"
+            log_error "find_next_available_suffix_from_exports: Reached maximum suffix limit ($max_limit) for pattern $start_pattern"
             return 1
         fi
     done
+}
+
+# Helper function: Find next available dataset number (NEW LOGIC - checks NFS exports first)
+find_next_dataset_number() {
+    local pool_name="$1"
+    local check_dataset_exists="${2:-true}"  # New parameter to control dataset existence check
+    local nfs_ip="${3:-$selected_nfs_ip}"    # Allow IP override for flexibility
+    
+    if [[ -z "$pool_name" ]]; then
+        log_error "find_next_dataset_number: pool_name is required"
+        return 1
+    fi
+    
+    log_debug "find_next_dataset_number: pool='$pool_name', check_dataset_exists='$check_dataset_exists', nfs_ip='$nfs_ip'"
+    
+    # Step 1: Find next available suffix from NFS exports
+    local next_suffix
+    if ! next_suffix=$(find_next_available_suffix_from_exports "$nfs_ip"); then
+        log_error "find_next_dataset_number: Failed to find available suffix from NFS exports"
+        return 1
+    fi
+    
+    log_debug "find_next_dataset_number: Next available suffix from exports: '$next_suffix'"
+    
+    # Step 2: Check if dataset with this suffix exists in pool (if requested)
+    local candidate_name="${dataset_auto_prefix}-${next_suffix}"
+    local dataset_exists=false
+    
+    if [[ "$check_dataset_exists" == "true" ]]; then
+        log_debug "find_next_dataset_number: Checking if dataset '$candidate_name' exists in pool '$pool_name'"
+        
+        while IFS= read -r dataset; do
+            if [[ "$dataset" == "$candidate_name" ]]; then
+                dataset_exists=true
+                log_debug "find_next_dataset_number: Dataset '$candidate_name' exists in pool"
+                break
+            fi
+        done < <(get_datasets_in_pool "$pool_name" 2>/dev/null)
+        
+        if [[ "$dataset_exists" == false ]]; then
+            log_debug "find_next_dataset_number: Dataset '$candidate_name' does not exist in pool"
+        fi
+    else
+        log_debug "find_next_dataset_number: Skipping dataset existence check"
+    fi
+    
+    # Return suffix and existence flag in format: "suffix:exists_flag"
+    echo "${next_suffix}:${dataset_exists}"
+    return 0
 }
 
 # Helper function: Find next available storage name

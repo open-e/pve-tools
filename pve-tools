@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.78"
+VERSION="0.79"
 RELEASE_DATE="2025-08-26"
 
 # Script mode flag
@@ -344,6 +344,7 @@ init_debug_error_capture() {
                 '^\(\('                     # arithmetic expressions ((var++))
                 '^return( [0-9]+| \$[a-zA-Z_][a-zA-Z0-9_]*)?$'  # explicit return statements with numbers or variables
                 '=[^=]*\$\('               # command substitutions (var=$(cmd))
+                '^curl'                     # curl commands (expected to fail during network scanning)
             )
             
             local should_skip=false
@@ -5409,7 +5410,7 @@ setup_rest_api_dialog() {
         local masked_password=$(printf '%*s' ${#temp_password} | tr ' ' '*')
         dialog --keep-tite --title "REST API Configuration - Step 2/2" \
                --ok-label "Save" --cancel-label "Back" \
-               --insecure --passwordbox "Enter REST API password (supports copy&paste):\n" 12 70 \
+               --passwordbox "Enter REST API password (supports copy&paste):\n" 12 70 "" \
                2> "$form_data"
 
         exit_code=$?
@@ -9202,6 +9203,225 @@ select_node_role() {
     fi
 }
 
+# Get all storage IPs with their information for node type editing
+get_all_storage_ips_with_info() {
+    local ips=()
+    local ip_data=()
+    
+    log_debug "get_all_storage_ips_with_info: Starting to collect IP information"
+    
+    # Get IPs from current storage servers list, filtering out special menu options
+    local storage_ips
+    storage_ips=$(get_current_storage_servers_ip)
+    if [[ -n "$storage_ips" ]]; then
+        while IFS= read -r ip; do
+            # Only include actual IP addresses, skip special menu options
+            if [[ -n "$ip" && "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+                ips+=("$ip")
+            fi
+        done <<< "$storage_ips"
+    fi
+    
+    log_debug "get_all_storage_ips_with_info: Found ${#ips[@]} IPs to process"
+    
+    # Build IP data with role priority for sorting
+    for ip in "${ips[@]}"; do
+        if [[ -n "$ip" ]]; then
+            local hostname=$(get_hostname_for_ip "$ip")
+            local node_role=$(get_node_role_for_ip "$ip")
+            local vip_info=$(get_vip_info_for_ip "$ip" "$hostname")
+            
+            log_debug "get_all_storage_ips_with_info: IP '$ip' has hostname '$hostname', role '$node_role', vip_info '$vip_info'"
+            
+            # Assign role priority for sorting
+            local role_priority
+            case "$node_role" in
+                "ha-cluster-node")
+                    role_priority="1"  # Highest priority
+                    ;;
+                "backup-dr-node")
+                    role_priority="2"  # Second priority
+                    ;;
+                *)
+                    role_priority="3"  # Lowest priority (unassigned)
+                    ;;
+            esac
+            
+            # Convert IP to sortable format
+            local -a octets
+            IFS='.' read -ra octets <<< "$ip"
+            local sortable_ip
+            sortable_ip=$(printf "%03d.%03d.%03d.%03d" "${octets[0]}" "${octets[1]}" "${octets[2]}" "${octets[3]}")
+            
+            ip_data+=("${role_priority}|${sortable_ip}|${ip}|${vip_info}|${node_role}")
+        fi
+    done
+    
+    # Sort IP data by role priority and then by IP
+    if [[ ${#ip_data[@]} -gt 0 ]]; then
+        IFS=$'\n' sorted_ip_data=($(printf '%s\n' "${ip_data[@]}" | sort))
+        unset IFS
+        
+        # Output sorted IP information
+        for data in "${sorted_ip_data[@]}"; do
+            local ip=$(echo "$data" | cut -d'|' -f3)
+            local vip_info=$(echo "$data" | cut -d'|' -f4)
+            local role=$(echo "$data" | cut -d'|' -f5)
+            
+            # Format role for display
+            local display_role="[$role]"
+            if [[ "$role" == "unassigned" ]]; then
+                display_role="[unassigned]"
+            fi
+            
+            echo "${ip}|${vip_info}|${display_role}"
+        done
+    fi
+    
+    log_debug "get_all_storage_ips_with_info: Completed IP information collection"
+}
+
+# Edit node types for all storage IPs
+edit_node_types() {
+    log_info "edit_node_types: Starting node type editing interface"
+    
+    while true; do
+        # Get all storage IPs with their information
+        local ip_info
+        ip_info=$(get_all_storage_ips_with_info)
+        
+        if [[ -z "$ip_info" ]]; then
+            dialog --msgbox "No storage IPs found to edit." 8 40
+            log_info "edit_node_types: No storage IPs found"
+            return
+        fi
+        
+        # Build dialog menu items
+        local menu_items=()
+        local ips=()
+        local counter=0
+        
+        while IFS='|' read -r ip vip_info display_role; do
+            [[ -z "$ip" ]] && continue
+            ips+=("$ip")
+            menu_items+=("$counter" "$(printf "%-16s %-35s %-20s" "$ip" "$vip_info" "$display_role")")
+            ((counter++))
+        done <<< "$ip_info"
+        
+        log_debug "edit_node_types: Built menu with ${#menu_items[@]} items"
+        
+        # Show IP selection dialog
+        local temp_output=$(mktemp)
+        dialog --keep-tite --title "Edit Node Types" \
+               --ok-label "Select" --cancel-label "Back" \
+               --menu "Select an IP to edit its node type:" 20 80 10 \
+               "${menu_items[@]}" 2>"$temp_output"
+        
+        local dialog_result=$?
+        local selected_index=$(< "$temp_output")
+        rm -f "$temp_output"
+        
+        case $dialog_result in
+            0)  # Select button pressed
+                if [[ -n "$selected_index" && "$selected_index" =~ ^[0-9]+$ ]] && [[ $selected_index -lt ${#ips[@]} ]]; then
+                    local selected_ip="${ips[$selected_index]}"
+                    log_info "edit_node_types: User selected IP '$selected_ip' for role editing"
+                    
+                    # Call modified select_node_role function with "Back" button
+                    select_node_role_with_back "$selected_ip"
+                    local role_result=$?
+                    
+                    if [[ $role_result -eq 0 ]]; then
+                        # Role was successfully changed, continue to show updated list
+                        log_info "edit_node_types: Role successfully updated for IP '$selected_ip'"
+                        continue
+                    elif [[ $role_result -eq 2 ]]; then
+                        # User pressed Back, continue to show IP list
+                        log_debug "edit_node_types: User pressed Back from role selection"
+                        continue
+                    else
+                        # Error occurred
+                        log_error "edit_node_types: Error occurred during role selection for IP '$selected_ip'"
+                        continue
+                    fi
+                fi
+                ;;
+            1|255)  # Back button or ESC
+                log_info "edit_node_types: User cancelled node type editing"
+                return
+                ;;
+        esac
+    done
+}
+
+# Select node role with Back button (for node type editing)
+select_node_role_with_back() {
+    local ip="$1"
+    local current_role
+    current_role=$(get_node_role_for_ip "$ip")
+    
+    log_info "select_node_role_with_back: Starting role selection for IP '$ip', current role: '$current_role'"
+    
+    # Set default selection based on current role
+    local default_item=""
+    case "$current_role" in
+        "ha-cluster-node")
+            default_item="--default-item 1"
+            ;;
+        "backup-dr-node")
+            default_item="--default-item 2"
+            ;;
+        *)
+            default_item="--default-item 1"  # Default to ha-cluster-node
+            ;;
+    esac
+    
+    log_debug "select_node_role_with_back: Displaying role selection dialog for IP '$ip'"
+    
+    local temp_output=$(mktemp)
+    dialog --keep-tite --title "Select Node Role" \
+        --ok-label "Select" --cancel-label "Back" $default_item \
+        --menu "Select the role for storage node $ip:" 12 60 5 \
+        "1" "ha-cluster-node    (High Availability Cluster Node)" \
+        "2" "backup-dr-node     (Backup/Disaster Recovery Node)" 2>"$temp_output"
+    
+    local dialog_result=$?
+    local selected_option=$(< "$temp_output")
+    rm -f "$temp_output"
+    
+    log_debug "select_node_role_with_back: Dialog returned exit code $dialog_result, selected: '$selected_option'"
+    
+    if [[ $dialog_result -eq 0 ]]; then
+        local selected_role=""
+        case "$selected_option" in
+            "1")
+                selected_role="ha-cluster-node"
+                ;;
+            "2")
+                selected_role="backup-dr-node"
+                ;;
+            *)
+                log_error "select_node_role_with_back: Invalid selection '$selected_option'"
+                return 1
+                ;;
+        esac
+        
+        log_info "select_node_role_with_back: User selected role '$selected_role' for IP '$ip'"
+        
+        # Set the role
+        if set_node_role_for_ip "$ip" "$selected_role"; then
+            log_info "select_node_role_with_back: Successfully set role '$selected_role' for IP '$ip'"
+            return 0
+        else
+            log_error "select_node_role_with_back: Failed to set role '$selected_role' for IP '$ip'"
+            return 1
+        fi
+    else
+        log_info "select_node_role_with_back: User pressed Back for IP '$ip'"
+        return 2  # User pressed Back
+    fi
+}
+
 get_custom_ips() {
     if [[ -f "$CONFIG_FILE" ]]; then
         grep "^custom_ips=" "$CONFIG_FILE" 2>/dev/null | cut -d'=' -f2- | tr ',' '\n' | grep -v '^$'
@@ -9390,6 +9610,14 @@ unregister_custom_ip() {
         sed -i "s/^custom_ips=.*/custom_ips=$current_ips/" "$CONFIG_FILE"
     else
         sed -i "/^custom_ips=/d" "$CONFIG_FILE"
+    fi
+    
+    # Remove the associated info file to clear stored node role
+    local info_file="$CONNECTED_STORAGE_SERVERS_DIR/$ip_to_unregister"
+    if [[ -f "$info_file" ]]; then
+        log_debug "unregister_custom_ip: Removing info file: $info_file"
+        rm -f "$info_file"
+        log_info "unregister_custom_ip: Removed info file for IP: $ip_to_unregister"
     fi
     
     log_info "Removed custom IP: $ip_to_unregister"
@@ -10329,7 +10557,7 @@ nfs_step1_select_ip() {
 
     log_debug "nfs_step1_select_ip: About to display dialog menu with ${#menu_items[@]} items"
     cmd=(dialog --keep-tite --title "Step 1/$nfs_total_steps: Select $PRODUCT NFS Storage IP (VIP)"
-         --ok-label "Next" --cancel-label "Back to Main" $extra_button
+         --ok-label "Next" --cancel-label "Back to Main" --extra-button --extra-label "Edit node type" $extra_button
          --menu "Choose $PRODUCT NFS Storage IP (VIP):" 15 100 8)
     options=("${menu_items[@]}")
     dialog_menu
@@ -10486,6 +10714,11 @@ nfs_step1_select_ip() {
             ;;
         1)  # Back to Main
             return 1
+            ;;
+        3)  # Edit node type
+            log_debug "nfs_step1_select_ip: User selected 'Edit node type' button"
+            edit_node_types
+            return 2  # Retry same step to refresh display
             ;;
     esac
 }
@@ -11796,7 +12029,7 @@ nfs_new_step5_oodp_destinations() {
             # Prompt for storage server web GUI password
             local temp_password=$(mktemp)
             dialog --keep-tite --title "Backup Server Authentication" \
-                   --passwordbox "To register backup server $backup_ip, please provide the WEB GUI password for that server:" 12 70 2>"$temp_password"
+                   --passwordbox "To register backup server $backup_ip, please provide the WEB GUI password for that server:" 12 70 "" 2>"$temp_password"
             local dialog_result=$?
             
             if [[ $dialog_result -ne 0 ]]; then
@@ -11818,7 +12051,7 @@ nfs_new_step5_oodp_destinations() {
             
             # NOW register the ODP destination immediately
             log_info "nfs_new_step5_oodp_destinations: Registering ODP destination $backup_ip:$port now..."
-            dialog --title "Registering Backup Server" --infobox "Registering backup server $backup_ip...\n\nThis may take up to 90 seconds." 8 60
+            dialog --title "Registering Backup Server" --infobox "Registering backup server $backup_ip...\n\nThis may take a moment." 8 60
             
             if register_odp_destination_node "$backup_ip" "$port" "$selected_nfs_ip" "Backup DR Node for backup operations"; then
                 log_info "nfs_new_step5_oodp_destinations: ODP destination $backup_ip:$port registered successfully"

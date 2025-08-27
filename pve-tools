@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.80"
+VERSION="0.81"
 RELEASE_DATE="2025-08-27"
 
 # Script mode flag
@@ -12061,13 +12061,13 @@ nfs_new_step5_oodp_destinations() {
             log_info "nfs_new_step5_oodp_destinations: Registering ODP destination $backup_ip:$port now..."
             dialog --title "Registering Backup Server" --infobox "Registering backup server $backup_ip...\n\nThis may take a moment." 8 60
             
-            if register_odp_destination_node "$backup_ip" "$port" "$selected_nfs_ip" "Backup DR Node for backup operations"; then
+            if ensure_odp_node_registered "$backup_ip" "$port" "$selected_nfs_ip" "Backup DR Node for backup operations"; then
                 log_info "nfs_new_step5_oodp_destinations: ODP destination $backup_ip:$port registered successfully"
                 dialog --title "Registration Complete" --infobox "Backup server $backup_ip registered successfully!" 6 60
                 sleep 2
             else
-                log_error "nfs_new_step5_oodp_destinations: Failed to register ODP destination $backup_ip:$port"
-                dialog --title "Registration Failed" --msgbox "Failed to register backup server $backup_ip!\n\nCheck logs for details.\nYou may need to register manually in JovianDSS GUI." 10 60
+                log_error "nfs_new_step5_oodp_destinations: Failed to ensure ODP destination registration for $backup_ip:$port"
+                dialog --title "Registration Failed" --msgbox "Failed to register backup server $backup_ip!\n\nThe server may have been registered but verification failed.\nCheck logs for details or verify manually in JovianDSS GUI." 12 70
                 continue  # Skip this server
             fi
         else
@@ -12385,8 +12385,8 @@ Check logs for detailed error information." \
                 log_info "perform_new_nfs_setup: ODP destination already registered: $dst_ip:$dst_port"
             else
                 log_info "perform_new_nfs_setup: Registering ODP destination: $dst_ip:$dst_port"
-                if ! register_odp_destination_node "$dst_ip" "$dst_port" "$selected_nfs_ip" "Backup DR Node for $dst_pool/$dst_dataset"; then
-                    log_error "perform_new_nfs_setup: STEP 4 FAILED - Could not register ODP destination $dst_ip:$dst_port"
+                if ! ensure_odp_node_registered "$dst_ip" "$dst_port" "$selected_nfs_ip" "Backup DR Node for $dst_pool/$dst_dataset"; then
+                    log_error "perform_new_nfs_setup: STEP 4 FAILED - Could not ensure ODP destination registration for $dst_ip:$dst_port"
                     registration_failed=true
                 fi
             fi
@@ -13957,9 +13957,10 @@ check_odp_destination_registered() {
     log_debug "check_odp_destination_registered: Making GET request to: $url"
     
     local response
-    log_debug "curl -k -s -w '\\n%{http_code}' -X GET --connect-timeout 5 --max-time 90 -u '${rest_api_user}:${rest_api_password}' '$url'"
+    log_debug "curl -k -s -w '\\n%{http_code}' -X GET --connect-timeout 5 --max-time 10 -u '${rest_api_user}:${rest_api_password}' '$url'"
+    # IMPORTANT: max-time MUST be 10 seconds and not more due to a BUG in this endpoint.
     response=$(curl -k -s -w "\n%{http_code}" -X GET \
-        --connect-timeout 5 --max-time 90 \
+        --connect-timeout 5 --max-time 10 \
         -u "${rest_api_user}:${rest_api_password}" \
         "$url" 2>/dev/null)
     local curl_exit=$?
@@ -14028,7 +14029,7 @@ EOF
     
     # Log the FULL curl command for manual testing
     log_debug "=============== FULL CURL COMMAND FOR ODP NODE REGISTRATION ==============="
-    log_debug "curl -k -s -w '\\n%{http_code}' -X POST --connect-timeout 5 --max-time 90 -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
+    log_debug "curl -k -s -w '\\n%{http_code}' -X POST --connect-timeout 5 --max-time 10 -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' -d '$json_payload' '$url'"
     log_debug "============================================================================"
     
     # Also log a pretty-printed version of the JSON for easier reading
@@ -14038,9 +14039,10 @@ EOF
     done || log_debug "  $json_payload"
     log_debug "========================================================="
     
+    # IMPORTANT: max-time MUST be 10 seconds and not more due to a BUG in this endpoint.
     local response
     response=$(curl -k -s -w "\n%{http_code}" -X POST \
-        --connect-timeout 5 --max-time 90 \
+        --connect-timeout 5 --max-time 10 \
         -u "${rest_api_user}:${rest_api_password}" \
         -H 'Content-Type: application/json' \
         -d "$json_payload" \
@@ -14072,6 +14074,64 @@ EOF
         log_error "register_odp_destination_node: Response: $response_body"
         return 1
     fi
+}
+
+# Helper function: Ensure ODP destination node is registered (check-first pattern)
+ensure_odp_node_registered() {
+    local dst_ip="$1"
+    local dst_port="$2" 
+    local src_ip="$3"  # Source server IP where we register
+    local description="$4"  # Optional description
+    
+    local dst_address="${dst_ip}:${dst_port}"
+    log_info "ensure_odp_node_registered: Ensuring ODP destination is registered - address='$dst_address' on source='$src_ip'"
+    
+    # Step 1: Check if node is already registered
+    log_debug "ensure_odp_node_registered: Step 1 - Checking current registration status"
+    if check_odp_destination_registered "$dst_ip" "$dst_port" "$src_ip"; then
+        log_info "ensure_odp_node_registered: ODP destination already registered - address='$dst_address' on source='$src_ip'"
+        return 0
+    fi
+    
+    local check_result=$?
+    if [[ $check_result -eq 2 ]]; then
+        log_error "ensure_odp_node_registered: Cannot verify registration status due to API error"
+        return 1
+    fi
+    
+    # Step 2: Node is not registered, attempt registration
+    log_debug "ensure_odp_node_registered: Step 2 - Node not registered, attempting registration"
+    log_info "ensure_odp_node_registered: Attempting to register ODP destination - address='$dst_address'"
+    
+    # Attempt registration - may timeout due to endpoint bug but might still succeed
+    if register_odp_destination_node "$dst_ip" "$dst_port" "$src_ip" "$description"; then
+        log_info "ensure_odp_node_registered: Registration completed successfully - address='$dst_address'"
+        return 0
+    fi
+    
+    # Step 3: Registration appeared to fail (likely timeout), verify actual status
+    log_debug "ensure_odp_node_registered: Step 3 - Registration appeared to fail, verifying actual status"
+    log_info "ensure_odp_node_registered: Registration returned error (possibly timeout), verifying actual registration status"
+    
+    # Wait a moment for the registration to potentially complete
+    sleep 2
+    
+    # Re-check registration status to see if it actually succeeded despite timeout
+    log_debug "ensure_odp_node_registered: Re-checking registration status after potential timeout"
+    if check_odp_destination_registered "$dst_ip" "$dst_port" "$src_ip"; then
+        log_info "ensure_odp_node_registered: Registration SUCCESS despite timeout - address='$dst_address' on source='$src_ip'"
+        return 0
+    fi
+    
+    check_result=$?
+    if [[ $check_result -eq 2 ]]; then
+        log_error "ensure_odp_node_registered: Cannot verify final registration status due to API error"
+        return 1
+    fi
+    
+    # Step 4: Registration truly failed
+    log_error "ensure_odp_node_registered: Registration failed - address='$dst_address' is not registered on source='$src_ip'"
+    return 1
 }
 
 # Helper function: Check if server supports destination flag feature (up >= 32)
@@ -17987,9 +18047,9 @@ select_storage_vms() {
         local header
         header=$(cat <<EOF
 Legend:
-order:  Start/shutdownorder
-up:     Startup delay (sec)
-down:   Shutdown timeout (sec)
+order:  Start/shutdownorder
+up:     Startup delay (sec)
+down:   Shutdown timeout (sec)
 EOF
 )
         log_debug "select_storage_vms: Final header: '$header'"

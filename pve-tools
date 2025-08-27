@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.79"
-RELEASE_DATE="2025-08-26"
+VERSION="0.80"
+RELEASE_DATE="2025-08-27"
 
 # Script mode flag
 VERSION_MODE=false
@@ -5408,12 +5408,20 @@ setup_rest_api_dialog() {
 
         # Step 2: Get password with masking
         local masked_password=$(printf '%*s' ${#temp_password} | tr ' ' '*')
-        dialog --keep-tite --title "REST API Configuration - Step 2/2" \
+        
+        # Log the FULL dialog command for manual testing
+        log_debug "=============== FULL DIALOG COMMAND FOR PASSWORD INPUT ==============="
+        log_debug "dialog --insecure --keep-tite --title \"REST API Configuration - Step 2/2\" --ok-label \"Save\" --cancel-label \"Back\" --passwordbox \"Enter REST API password (supports copy&paste):\n\" 12 70 \"\" 2>\"/tmp/test_password_input\""
+        log_debug "======================================================================"
+        
+        dialog --insecure --keep-tite --title "REST API Configuration - Step 2/2" \
                --ok-label "Save" --cancel-label "Back" \
                --passwordbox "Enter REST API password (supports copy&paste):\n" 12 70 "" \
                2> "$form_data"
 
         exit_code=$?
+        log_debug "Password dialog exit code: $exit_code"
+        log_debug "Password dialog result file size: $(stat -c%s "$form_data" 2>/dev/null || echo "0") bytes"
 
         if [ $exit_code -eq 0 ]; then
             temp_password=$(cat "$form_data")
@@ -12028,7 +12036,7 @@ nfs_new_step5_oodp_destinations() {
             
             # Prompt for storage server web GUI password
             local temp_password=$(mktemp)
-            dialog --keep-tite --title "Backup Server Authentication" \
+            dialog --insecure --keep-tite --title "Backup Server Authentication" \
                    --passwordbox "To register backup server $backup_ip, please provide the WEB GUI password for that server:" 12 70 "" 2>"$temp_password"
             local dialog_result=$?
             

@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.81"
-RELEASE_DATE="2025-08-27"
+VERSION="0.82"
+RELEASE_DATE="2025-08-28"
 
 # Script mode flag
 VERSION_MODE=false
@@ -12951,6 +12951,10 @@ create_dataset() {
     
     # Prepare JSON payload for dataset creation
     # Include direct property based on version and pool type, plus additional optimized properties
+    # TEMORARY: without 'direct' 
+    # to-do  : remove after testing
+    direct_setting="disabled" # TEMPORARY OVERRIDE - Remove after testing
+
     local json_input=$(cat <<EOF
 {
     "name": "${dataset_name}",

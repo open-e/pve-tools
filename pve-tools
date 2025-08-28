@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.82"
+VERSION="0.83"
 RELEASE_DATE="2025-08-28"
 
 # Script mode flag
@@ -7366,22 +7366,69 @@ move_storage_cloned_nfs() {
 
 # Helper functions for mode-specific confirmations
 
-# Confirm VM snapshot deletion for standard mode
-confirm_vm_snapshot_deletion() {
-    local vm_list=""
-    local vm_count=0
+# Check if any selected VMs have snapshots
+# Returns: 0 if at least one VM has snapshots, 1 if no VMs have snapshots
+any_vms_have_snapshots() {
+    log_debug "Checking if any selected VMs have snapshots"
     
-    # Build list of VMs that will lose snapshots
+    # Check each selected VM for snapshots
     for vmct_data in "${selected_vmcts[@]}"; do
         IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
         if [[ "$vm_type" == "vm" ]]; then
-            vm_list+="- VM $vmid ($name)\n"
+            log_debug "Checking snapshots for VM $vmid ($name)"
+            if vm_has_snapshots "$vmid"; then
+                log_debug "any_vms_have_snapshots: VM $vmid has snapshots"
+                return 0  # At least one VM has snapshots
+            fi
+        fi
+    done
+    
+    log_debug "any_vms_have_snapshots: No selected VMs have snapshots"
+    return 1  # No VMs have snapshots
+}
+
+# Confirm VM snapshot deletion for standard mode
+confirm_vm_snapshot_deletion() {
+    log_debug "Starting VM snapshot deletion confirmation"
+    
+    # First check if any VMs actually have snapshots
+    if ! any_vms_have_snapshots; then
+        # No VMs have snapshots, so skip the confirmation dialog entirely
+        local vm_count=0
+        for vmct_data in "${selected_vmcts[@]}"; do
+            IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
+            if [[ "$vm_type" == "vm" ]]; then
+                ((vm_count++))
+            fi
+        done
+        
+        log_info "VM standard mode: No snapshots found on any of the $vm_count selected VMs - skipping deletion confirmation"
+        return 0  # Proceed without showing confirmation dialog
+    fi
+    
+    # At least one VM has snapshots, build the list and show confirmation
+    local vm_list=""
+    local vm_count=0
+    local vms_with_snapshots=""
+    local snapshot_vm_count=0
+    
+    # Build list of all VMs and identify which ones have snapshots
+    for vmct_data in "${selected_vmcts[@]}"; do
+        IFS='|' read -r vmid vm_type name storage_name <<< "$vmct_data"
+        if [[ "$vm_type" == "vm" ]]; then
+            if vm_has_snapshots "$vmid"; then
+                vm_list+="- VM $vmid ($name) - HAS SNAPSHOTS\n"
+                vms_with_snapshots+="$vmid "
+                ((snapshot_vm_count++))
+            else
+                vm_list+="- VM $vmid ($name) - No snapshots\n"
+            fi
             ((vm_count++))
         fi
     done
     
     local confirm_input=$(mktemp)
-    dialog --inputbox "WARNING: VM Standard mode will DELETE all local snapshots (qcow2 based) for the following VMs before Disk Move:\n\n$vm_list\nThis operation is irreversible!\n\nTo confirm and proceed with VM standard migration mode, type 'delete snapshots':" 18 85 2> "$confirm_input"
+    dialog --inputbox "WARNING: VM Standard mode will DELETE all local snapshots (qcow2 based) for VMs that have them.\n\nVMs to be processed ($vm_count total, $snapshot_vm_count with snapshots):\n\n$vm_list\nSnapshot deletion is irreversible!\n\nTo confirm and proceed with VM standard migration mode, type 'delete snapshots':" 20 85 2> "$confirm_input"
     local exit_code=$?
     local confirmation=$(trimq "$(cat "$confirm_input")")
     rm -f "$confirm_input"
@@ -7392,7 +7439,7 @@ confirm_vm_snapshot_deletion() {
         return 1
     fi
     
-    log_info "User confirmed VM standard mode with snapshot deletion for $vm_count VMs"
+    log_info "User confirmed VM standard mode with snapshot deletion for $vm_count VMs ($snapshot_vm_count with snapshots: $vms_with_snapshots)"
     return 0
 }
 
@@ -7488,7 +7535,7 @@ move_storage_step2_select_mode() {
     if [[ "$selected_migration_type" == "vm" ]]; then
         # VM migration modes
         menu_options+=(
-            "standard" "Delete VM snapshots (VMs can be ON or OFF)"
+            "standard" "Do NOT preserve VM snapshots (VMs can be powered ON)"
             "preserve" "Preserve VM snapshots (VMs must be powered OFF)"
         )
     elif [[ "$selected_migration_type" == "ct" ]]; then
@@ -7996,46 +8043,124 @@ launch_disk_move() {
         log_info "Launching disk move operations for VM $vmid from $SRC to $DST on node $vm_node"
     fi
     
-    log_info "Using nohup pattern - processes will survive shell exit"
+    log_info "Using sequential disk processing to avoid VM config file lock conflicts"
     
-    # Initialize disk move PIDs array for this VM/CT
-    disk_move_pids=()
+    local disk_count=${#disks[@]}
+    local current_disk=0
 
-    # Process each disk found by gather_disks
+    # Process each disk found by gather_disks - SEQUENTIALLY to prevent lock conflicts
     for disk in "${disks[@]}"; do
-        log_info "Moving disk $disk for $type $vmid from $SRC to $DST"
+        current_disk=$((current_disk + 1))
+        log_info "Moving disk $disk for $type $vmid from $SRC to $DST ($current_disk/$disk_count)"
 
-        # Construct the appropriate move command based on type (using SSH)
+        # Execute move command and capture both output and exit code
+        local upid
+        local move_output
+        local cmd_exit_code
+        
         if [[ "$type" == "ct" ]]; then
             # For containers, use pct move-volume via SSH
-            move_cmd="ssh root@$vm_node_ip 'pct move-volume $vmid $disk $DST --delete 0'"
-            cleanup_cmd="ssh root@$vm_node_ip \"sed -i '/^unused[0-9]\\\\+:/d' '$CONFIG_DIR/$vmid.conf'\""
+            log_info "Executing: pct move-volume $vmid $disk $DST --delete 0"
+            move_output=$(ssh root@"$vm_node_ip" "pct move-volume $vmid $disk $DST --delete 0" 2>&1)
+            cmd_exit_code=$?
         else
             # For VMs, use qm move_disk via SSH
-            move_cmd="ssh root@$vm_node_ip 'qm move_disk $vmid $disk $DST --delete 0'"
-            cleanup_cmd="ssh root@$vm_node_ip \"sed -i '/^unused[0-9]\\\\+:/d' '$CONFIG_DIR/$vmid.conf'\""
+            log_info "Executing: qm move_disk $vmid $disk $DST --delete 0"
+            move_output=$(ssh root@"$vm_node_ip" "qm move_disk $vmid $disk $DST --delete 0" 2>&1)
+            cmd_exit_code=$?
         fi
-
-        # Launch disk move in background with nohup (survives shell exit)
-        # Use the pattern from user's research: nohup + PID capture + wait monitoring
-        nohup bash -c "
-            if $move_cmd >> '$LOG_FILE' 2>&1; then
-                echo \"[\$(date '+%F %T')] INFO: Successfully moved disk $disk for $type $vmid\" >> '$LOG_FILE'
-
+        
+        # Check if the command failed at SSH/execution level
+        if [[ $cmd_exit_code -ne 0 ]]; then
+            log_error "Command failed with exit code $cmd_exit_code for disk $disk"
+            log_error "Move command output: $move_output"
+            return 1
+        fi
+        
+        # Extract UPID from command output
+        upid=$(echo "$move_output" | grep -Po 'UPID:[^\s]+' | head -1)
+        
+        if [[ -n "$upid" ]]; then
+            log_info "Started disk move task $upid for disk $disk (asynchronous operation)"
+            
+            # Wait for this disk to complete before moving to next disk
+            # This prevents multiple simultaneous attempts to lock VM config file
+            if wait_for_pve_task "$vm_node_ip" "$upid"; then
+                log_info "Successfully completed move of disk $disk for $type $vmid"
+                
                 # Clean up unused entries that may be created during move
-                $cleanup_cmd >> '$LOG_FILE' 2>&1
-                echo \"[\$(date '+%F %T')] INFO: Cleaned unused entries for $type $vmid\" >> '$LOG_FILE'
+                log_info "Cleaning up unused entries for $type $vmid"
+                ssh root@"$vm_node_ip" "sed -i '/^unused[0-9]\\+:/d' '$CONFIG_DIR/$vmid.conf'" >> "$LOG_FILE" 2>&1
             else
-                echo \"[\$(date '+%F %T')] ERROR: Failed to move disk $disk for $type $vmid\" >> '$LOG_FILE'
-                exit 1
+                log_error "Failed to move disk $disk for $type $vmid"
+                log_error "Move command output: $move_output"
+                return 1
             fi
-        " >> "$LOG_FILE" 2>&1 &
-
-        # Capture PID right after launch (user's research pattern)
-        local pid=$!
-        disk_move_pids+=("$pid")
-        log_info "Started nohup disk move process for $disk with PID: $pid (survives shell exit)"
+        else
+            # No UPID found but command succeeded (exit code 0) - synchronous completion
+            log_info "Disk $disk moved synchronously - operation completed successfully"
+            log_info "Move command output: $move_output"
+            
+            # Clean up unused entries that may be created during move
+            log_info "Cleaning up unused entries for $type $vmid"
+            ssh root@"$vm_node_ip" "sed -i '/^unused[0-9]\\+:/d' '$CONFIG_DIR/$vmid.conf'" >> "$LOG_FILE" 2>&1
+        fi
     done
+    
+    log_info "All disks moved successfully for $type $vmid"
+}
+
+# Wait for a PVE task to complete by monitoring its status
+wait_for_pve_task() {
+    local node_ip="$1"
+    local upid="$2"
+    local max_wait=7200  # 2 hours max per disk
+    local elapsed=0
+    local check_interval=5
+    
+    log_info "Waiting for PVE task $upid on node $node_ip"
+    
+    while [[ $elapsed -lt $max_wait ]]; do
+        # Get task status via SSH
+        local task_json
+        task_json=$(ssh root@"$node_ip" "pvesh get /nodes/\$(hostname)/tasks/$upid/status --output-format json 2>/dev/null")
+        
+        if [[ -n "$task_json" ]]; then
+            local task_status
+            task_status=$(echo "$task_json" | grep -Po '"status"\s*:\s*"\K[^"]+' | head -1)
+            
+            case "$task_status" in
+                "stopped")
+                    local exit_status
+                    exit_status=$(echo "$task_json" | grep -Po '"exitstatus"\s*:\s*"\K[^"]+' | head -1)
+                    
+                    if [[ "$exit_status" == "OK" ]]; then
+                        log_info "Task $upid completed successfully"
+                        return 0
+                    else
+                        log_error "Task $upid failed with status: $exit_status"
+                        return 1
+                    fi
+                    ;;
+                "running")
+                    if [[ $((elapsed % 60)) -eq 0 ]]; then  # Log every minute
+                        log_info "Task $upid still running (${elapsed}s elapsed)"
+                    fi
+                    ;;
+                *)
+                    log_info "Task $upid status: $task_status (${elapsed}s elapsed)"
+                    ;;
+            esac
+        else
+            log_debug "Cannot query task status for $upid (${elapsed}s elapsed)"
+        fi
+        
+        sleep $check_interval
+        elapsed=$((elapsed + check_interval))
+    done
+    
+    log_error "Task $upid timed out after $max_wait seconds"
+    return 1
 }
 
 wait_for_disk_migration_completion() {
@@ -8044,45 +8169,54 @@ wait_for_disk_migration_completion() {
     # Detect type for proper logging
     local type=$(vm_type "$vmid")
 
-    log_info "Waiting for disk migration to complete for $type $vmid"
-    log_info "Waiting for ${#disk_move_pids[@]} nohup disk move processes: ${disk_move_pids[*]}"
-    log_info "These processes will survive shell exit and continue running"
+    # With the new sequential disk processing approach, disk migration is now synchronous
+    # The launch_disk_move function waits for each disk to complete before proceeding
+    # So when this function is called, all disks have already been moved successfully
+    # (or launch_disk_move would have returned with an error)
+    
+    log_info "Disk migration verification for $type $vmid"
+    log_info "All disks have been processed synchronously - no background processes to wait for"
+    
+    # The synchronous approach means migration is complete when we reach this point
+    return 0
+}
 
-    # Use polling pattern from user's research for nohup processes
-    local completed=0
-    local failed=0
+# Check if a VM has any snapshots
+# Returns: 0 if VM has snapshots, 1 if no snapshots or error
+vm_has_snapshots() {
+    local vmid="$1"
+    local vm_node vm_node_ip
     
-    for pid in "${disk_move_pids[@]}"; do
-        log_info "Monitoring nohup process PID: $pid using kill -0 polling"
-        
-        # Polling loop (from user's research)
-        while kill -0 "$pid" 2>/dev/null; do
-            log_info "PID $pid still running... ($(date '+%F %T'))"
-            sleep 5
-        done
-        
-        # Reap it and fetch the real exit status (from user's research)
-        if wait "$pid" 2>/dev/null; then
-            log_info "Nohup disk move process $pid completed successfully"
-            ((completed++))
-        else
-            local exit_code=$?
-            log_error "Nohup disk move process $pid failed with exit code: $exit_code"
-            ((failed++))
-        fi
-    done
-
-    log_info "Disk migration completed for $type $vmid: $completed successful, $failed failed"
-    log_info "All nohup processes monitored and reaped successfully"
+    log_debug "Checking if VM $vmid has snapshots"
     
-    # Reset the PIDs array for next VM/CT
-    disk_move_pids=()
-    
-    # Return failure if any disk moves failed
-    if [[ $failed -gt 0 ]]; then
+    # Find which node the VM is on
+    vm_node=$(on_which_host_vmct_is "$vmid")
+    if [[ -z "$vm_node" ]]; then
+        log_error "vm_has_snapshots: Cannot find node for VM $vmid"
         return 1
     fi
-    return 0
+    
+    # Get IP for the node
+    vm_node_ip=$(host_ip "$vm_node")
+    if [[ -z "$vm_node_ip" ]]; then
+        log_error "vm_has_snapshots: Cannot resolve IP for node '$vm_node'"
+        return 1
+    fi
+    
+    # Get snapshot list using SSH (same logic as delete_snapshots function)
+    local snapshot_count=0
+    local snaps=()
+    mapfile -t snaps < <(ssh root@"$vm_node_ip" "qm listsnapshot '$vmid'" < /dev/null 2>/dev/null | awk '/`->/ {print $2}' | grep -v '^current$' || true)
+    
+    snapshot_count=${#snaps[@]}
+    
+    if [[ $snapshot_count -gt 0 ]]; then
+        log_debug "vm_has_snapshots: VM $vmid has $snapshot_count snapshot(s): ${snaps[*]}"
+        return 0  # VM has snapshots
+    else
+        log_debug "vm_has_snapshots: VM $vmid has no snapshots"
+        return 1  # VM has no snapshots
+    fi
 }
 
 delete_snapshots() {
@@ -18786,8 +18920,22 @@ sub migrate_vm_standard {
 
     $self->delete_vm_snapshots($vmid);
     my $disks = $self->get_vm_disks($vmid);
+    
+    # Process disks sequentially to avoid VM config file lock conflicts
+    # Multiple concurrent move_disk operations on the same VM cause:
+    # "TASK ERROR: can't lock file '/var/lock/qemu-server/lock-XXX.conf' - got timeout"
+    my $disk_count = scalar(@$disks);
+    my $current_disk = 0;
+    
     for my $d ( @$disks ) {
+        $current_disk++;
+        print "### PVE::Worker::update_progress " . (10 + ($current_disk * 60 / $disk_count)) . " Moving disk $d for VM $vmid ($current_disk/$disk_count)\n";
+        
+        # Move disk and wait for completion before proceeding to next disk
+        # This prevents multiple simultaneous attempts to lock the VM config file
         $self->move_disk_standard( $vmid, $d );
+        
+        # The wait_for_task in move_disk_standard ensures completion
     }
 }
 

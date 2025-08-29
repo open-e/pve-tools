@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.83"
-RELEASE_DATE="2025-08-28"
+VERSION="0.84"
+RELEASE_DATE="2025-08-29"
 
 # Script mode flag
 VERSION_MODE=false
@@ -1389,7 +1389,7 @@ check_pve_config_backup_status() {
     fi
     
     # Final status check
-    dialog --msgbox "pve-config-backup status check complete.\nTotal nodes: $total_nodes\nAlready running: $ok_count\nInstalled: $install_count\nStarted: $start_count" 12 60
+    dialog --msgbox "pve-config-backup status check complete.\n\nTotal nodes:$(sep 6)$total_nodes\nAlready running:$(sep 2)$ok_count\nInstalled:$(sep 8)$install_count\nStarted:$(sep 10)$start_count" 12 60
 }
 
 # Install pve-config-backup on specified nodes
@@ -1622,7 +1622,7 @@ ENDSCRIPT
     
     # Only show dialog if action was taken (installations or starts)
     if [ "$installed" -gt 0 ] || [ "$started" -gt 0 ]; then
-        dialog --msgbox "pve-config-backup setup complete on HA nodes.\nTotal nodes: $total_nodes\nAlready running: $already_running\nInstalled: $installed\nStarted: $started" 12 60
+        dialog --msgbox "pve-config-backup setup complete on HA nodes.\n\nTotal nodes:$(sep 6)$total_nodes\nAlready running:$(sep 2)$already_running\nInstalled:$(sep 8)$installed\nStarted:$(sep 10)$started" 12 60
     fi
     
     return 0
@@ -3728,7 +3728,7 @@ ENDSCRIPT
     log_info "pve-config-backup update complete - Total: $total_nodes, Updated: $updated, Failed: $failed"
     
     if [ $updated -gt 0 ]; then
-        dialog --msgbox "pve-config-backup update complete!\nTotal nodes: $total_nodes\nUpdated: $updated\nFailed: $failed\n\nNew version: $remote_version" 12 60
+        dialog --msgbox "pve-config-backup update complete!\n\nTotal nodes:$(sep 6)$total_nodes\nUpdated:$(sep 10)$updated\nFailed:$(sep 11)$failed\n\nNew version:$(sep 6)$remote_version" 12 60
     else
         dialog --msgbox "pve-config-backup update failed on all nodes.\nPlease check logs for details." 10 50
     fi
@@ -7366,6 +7366,18 @@ move_storage_cloned_nfs() {
 
 # Helper functions for mode-specific confirmations
 
+# Generate separator string with specified number of non-breaking spaces
+# Usage: sep 10  # returns 10 non-breaking spaces
+sep() {
+    local count=${1:-1}
+    local nbsp=$'\u00A0'
+    local result=""
+    for ((i=0; i<count; i++)); do
+        result="${result}${nbsp}"
+    done
+    echo "${result}"
+}
+
 # Check if any selected VMs have snapshots
 # Returns: 0 if at least one VM has snapshots, 1 if no VMs have snapshots
 any_vms_have_snapshots() {
@@ -8937,7 +8949,7 @@ update_connected_storage_servers() {
         log_debug "Processing IP: $ip"
         
         # Skip non-IP entries (special menu options)
-        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
+        if [[ "$ip" == "Scan network for $PRODUCT" || "$ip" == "Enter new IP" || "$ip" == "Unregister IP" ]]; then
             continue
         fi
         
@@ -9782,7 +9794,7 @@ manage_custom_ips() {
         local ip="${custom_ips_array[i]}"
         local hostname
         local vip_info
-        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
+        if [[ "$ip" == "Scan network for $PRODUCT" || "$ip" == "Enter new IP" || "$ip" == "Unregister IP" ]]; then
             hostname=""
             menu_items+=("$i" "$ip")
         else
@@ -9838,9 +9850,9 @@ get_current_storage_servers_ip() {
     fi
     
     # Always add special menu options
-    uniq_ips+=("Scan network for $PRODUCT IP")
+    uniq_ips+=("Scan network for $PRODUCT")
     uniq_ips+=("Enter new IP")
-    uniq_ips+=("Unregister IPs")
+    uniq_ips+=("Unregister IP")
 
     printf '%s\n' "${uniq_ips[@]}"
 }
@@ -10345,6 +10357,35 @@ get_vip_info_for_ip() {
     return 0
 }
 
+# Parse VIP info and return separated components
+# Input: "VIP of Pool-0 (node-a)" or "IP (node-backup)"
+# Output: Sets global variables: parsed_hostname, parsed_vip_desc
+parse_vip_info() {
+    local vip_info="$1"
+    
+    # Extract hostname from parentheses using parameter expansion
+    if [[ "$vip_info" == *"("* && "$vip_info" == *")" ]]; then
+        # Extract everything inside the last parentheses
+        parsed_hostname="${vip_info##*\(}"
+        parsed_hostname="${parsed_hostname%\)*}"
+        
+        # Remove the hostname part to get VIP description
+        local vip_part="${vip_info%% \(*}"
+        
+        # Check if it's a VIP or just an IP
+        if [[ "$vip_part" == "VIP of "* ]]; then
+            parsed_vip_desc="$vip_part"  # Keep the full VIP description including "VIP of "
+        else
+            parsed_vip_desc=""  # Empty for non-VIP entries
+        fi
+    else
+        parsed_hostname="Unknown"
+        parsed_vip_desc=""
+    fi
+    
+    log_debug "parse_vip_info: Input='$vip_info' -> hostname='$parsed_hostname', vip_desc='$parsed_vip_desc'"
+}
+
 network_scan_for_storage_servers_ip() {
     log_debug "network_scan_for_storage_servers_ip: Function started"
     
@@ -10352,7 +10393,7 @@ network_scan_for_storage_servers_ip() {
     local registered_ips=()
     local line
     while IFS= read -r line; do
-        if [[ -n "$line" && "$line" != "Scan network for $PRODUCT IP" && "$line" != "Enter new IP" && "$line" != "Unregister IPs" ]]; then
+        if [[ -n "$line" && "$line" != "Scan network for $PRODUCT" && "$line" != "Enter new IP" && "$line" != "Unregister IP" ]]; then
             registered_ips+=("$line")
         fi
     done < <(get_current_storage_servers_ip)
@@ -10603,7 +10644,7 @@ nfs_step1_select_ip() {
     local ip_data=()  # Array to store IP info for sorting
     
     for ip in "${ips[@]}"; do
-        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
+        if [[ "$ip" == "Scan network for $PRODUCT" || "$ip" == "Enter new IP" || "$ip" == "Unregister IP" ]]; then
             special_options+=("$ip")
         elif [[ -n "$ip" ]]; then  # Only process non-empty IP addresses
             actual_ips+=("$ip")
@@ -10657,37 +10698,82 @@ nfs_step1_select_ip() {
     # Replace original ips array with sorted one
     ips=("${sorted_ips[@]}")
     
-    # Build menu items with proper display formatting
+    # Build menu items with new column format: IP | (hostname) | VIP info | [node-type]
+    local nbsp=$'\u00A0'  # non-breaking space for dialog column alignment
     local i
+    local ip_data_array=()  # Store parsed data for width calculation
+    
+    # First pass: collect all data
     for ((i=0; i<${#ips[@]}; i++)); do
         local ip="${ips[i]}"
-        local hostname
-        local node_role
         
         # Check if this is a special menu option (not an actual IP)
-        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
-            # Special menu options - don't show role
-            menu_items+=("$i" "$ip")
+        if [[ "$ip" == "Scan network for $PRODUCT" || "$ip" == "Enter new IP" || "$ip" == "Unregister IP" ]]; then
+            ip_data_array+=("$i|special|$ip||||")
         else
-            # Regular IP addresses - show VIP info, hostname, and role
-            hostname=$(get_hostname_for_ip "$ip")
-            node_role=$(get_node_role_for_ip "$ip")
+            # Regular IP addresses - parse all components
+            local hostname=$(get_hostname_for_ip "$ip")
+            local node_role=$(get_node_role_for_ip "$ip")
             local vip_info=$(get_vip_info_for_ip "$ip" "$hostname")
             
-            # Build display string with IP, VIP info (replacing hostname), and role
-            if [[ -n "$hostname" && "$hostname" != "Unknown" ]]; then
-                if [[ -n "$node_role" && "$node_role" != "unassigned" ]]; then
-                    menu_items+=("$i" "$(printf "%-16s %-35s [%s]" "$ip" "$vip_info" "$node_role")")
-                else
-                    menu_items+=("$i" "$(printf "%-16s %-35s [unassigned]" "$ip" "$vip_info")")
-                fi
-            else
-                if [[ -n "$node_role" && "$node_role" != "unassigned" ]]; then
-                    menu_items+=("$i" "$(printf "%-16s %-35s [%s]" "$ip" "$vip_info" "$node_role")")
-                else
-                    menu_items+=("$i" "$(printf "%-16s %-35s [unassigned]" "$ip" "$vip_info")")
-                fi
+            # Parse VIP info to separate components
+            parse_vip_info "$vip_info"
+            local parsed_hostname_local="$parsed_hostname"
+            local parsed_vip_desc_local="$parsed_vip_desc"
+            
+            # Handle unassigned role
+            if [[ -z "$node_role" || "$node_role" == "unassigned" ]]; then
+                node_role="unassigned"
             fi
+            
+            # Store data: index|type|ip|hostname|vip_desc|node_role
+            ip_data_array+=("$i|ip|$ip|$parsed_hostname_local|$parsed_vip_desc_local|$node_role")
+        fi
+    done
+    
+    # Calculate column widths
+    local max_ip_width=15  # minimum width for IP
+    local max_hostname_width=12  # minimum width for hostname
+    local max_vip_width=20  # minimum width for VIP description
+    local max_role_width=15  # minimum width for role
+    
+    for data in "${ip_data_array[@]}"; do
+        IFS='|' read -r index type ip hostname vip_desc role <<< "$data"
+        if [[ "$type" == "ip" ]]; then
+            # Calculate required widths
+            [[ ${#ip} -gt $max_ip_width ]] && max_ip_width=${#ip}
+            [[ ${#hostname} -gt $max_hostname_width ]] && max_hostname_width=${#hostname}
+            [[ ${#vip_desc} -gt $max_vip_width ]] && max_vip_width=${#vip_desc}
+            [[ ${#role} -gt $max_role_width ]] && max_role_width=${#role}
+        fi
+    done
+    
+    # Second pass: build formatted menu items
+    for data in "${ip_data_array[@]}"; do
+        IFS='|' read -r index type ip hostname vip_desc role <<< "$data"
+        
+        if [[ "$type" == "special" ]]; then
+            # Special menu options - no formatting
+            menu_items+=("$index" "$ip")
+        else
+            # Build formatted string: IP + 2 spaces + (hostname) + 2 spaces + VIP info + 2 spaces + [role]
+            local ip_part=$(printf "%-${max_ip_width}s" "$ip")
+            local hostname_part="($hostname)"
+            local hostname_padded=$(printf "%-$((max_hostname_width + 2))s" "$hostname_part")  # +2 for parentheses
+            
+            local vip_part=""
+            if [[ -n "$vip_desc" ]]; then
+                vip_part=$(printf "%-${max_vip_width}s" "$vip_desc")
+            else
+                vip_part=$(printf "%-${max_vip_width}s" "")
+            fi
+            
+            local role_part="[$role]"
+            
+            # Combine with non-breaking spaces for proper alignment
+            local display_line="${ip_part}${nbsp}${nbsp}${hostname_padded}${nbsp}${nbsp}${vip_part}${nbsp}${nbsp}${role_part}"
+            
+            menu_items+=("$index" "$display_line")
         fi
     done
 
@@ -10709,8 +10795,8 @@ nfs_step1_select_ip() {
     case $dialog_exit_code in
         0)  # Next
             selected_nfs_ip_index="$selected_option"
-            if [[ "${ips[selected_option]}" == "Scan network for $PRODUCT IP" ]]; then
-                log_debug "nfs_step1_select_ip: User selected 'Scan network for $PRODUCT IP', starting network scan"
+            if [[ "${ips[selected_option]}" == "Scan network for $PRODUCT" ]]; then
+                log_debug "nfs_step1_select_ip: User selected 'Scan network for $PRODUCT', starting network scan"
                 network_scan_for_storage_servers_ip
                 local scan_result=$?
                 if [[ $scan_result -eq 0 ]]; then
@@ -10798,7 +10884,7 @@ nfs_step1_select_ip() {
                     return 2  # Retry same step
                 fi
                 return 0
-            elif [[ "${ips[selected_option]}" == "Unregister IPs" ]]; then
+            elif [[ "${ips[selected_option]}" == "Unregister IP" ]]; then
                 manage_custom_ips
                 return 2  # Retry same step
             else
@@ -11054,11 +11140,11 @@ nfs_step4_select_snapshot() {
 nfs_step5_summary() {
     local clone_name=$(make_clone_name "$selected_pool" "$selected_dataset" "$selected_snapshot" "$selected_pve_storage")
     local summary_text="Summary of selections:\n\n"
-    summary_text+="NFS Server IP: $selected_nfs_ip\n"
-    summary_text+="Pool: $selected_pool\n"
-    summary_text+="Dataset: $selected_dataset\n"
-    summary_text+="Snapshot: $selected_snapshot\n"
-    summary_text+="Clone name: $clone_name\n\n"
+    summary_text+="NFS Server IP:$(sep 2)$selected_nfs_ip\n"
+    summary_text+="Pool:$(sep 11)$selected_pool\n"
+    summary_text+="Dataset:$(sep 8)$selected_dataset\n"
+    summary_text+="Snapshot:$(sep 7)$selected_snapshot\n"
+    summary_text+="Clone name:$(sep 5)$clone_name\n\n"
     summary_text+="Click 'Apply' to create the cloned NFS storage,\nor click 'Back' to modify your selections."
 
     dialog --keep-tite --title "Step 5/$nfs_total_steps: Confirmation" \
@@ -11584,7 +11670,7 @@ perform_clone_and_setup() {
 
     set_readonly_conf_files "$clone_name"
 
-    dialog --msgbox "Clone and NFS setup completed successfully!\n\nPool: $selected_pool\nDataset: $selected_dataset\nSnapshot: $selected_snapshot\nClone: $clone_name\nNFS Share: $clone_name\nProxmox VE Storage: $clone_name" 14 70
+    dialog --msgbox "Clone and NFS setup completed successfully!\n\nPool:$(sep 16)$selected_pool\nDataset:$(sep 13)$selected_dataset\nSnapshot:$(sep 12)$selected_snapshot\nClone:$(sep 15)$clone_name\nNFS Share:$(sep 11)$clone_name\nProxmox VE Storage:$(sep 2)$clone_name" 14 70
 }
 
 add_nfs_storage_wizard() {
@@ -12800,17 +12886,17 @@ Export: $export_path" \
     local destinations_summary=""
     if [[ -n "$oodp_destinations_json" ]]; then
         local dest_count=$(echo "$oodp_destinations_json" | grep -o '"dataset"' | wc -l)
-        destinations_summary="\nDestination datasets: $dest_count created"
+        destinations_summary="\nDestination datasets:$(sep 4)$dest_count created"
     fi
     
     dialog --title "Setup Complete!" --msgbox \
 "NFS storage setup completed successfully!\n\n\
 STORAGE DETAILS:\n\
-Storage Name: $new_storage_name\n\
-Server: $selected_nfs_ip\n\
-Pool: $selected_pool\n\
-Dataset: $selected_dataset\n\
-Path: /mnt/pve/$new_storage_name$destinations_summary\n\n\
+Storage Name:$(sep 4)$new_storage_name\n\
+Server:$(sep 10)$selected_nfs_ip\n\
+Pool:$(sep 12)$selected_pool\n\
+Dataset:$(sep 9)$selected_dataset\n\
+Path:$(sep 12)/mnt/pve/$new_storage_name$destinations_summary\n\n\
 ODP STATUS:\n\
 $oodp_status\n\n\
 The storage is now available for use in Proxmox VE." \
@@ -16458,7 +16544,7 @@ delete_cloned_nfs_storage_wizard() {
             esac
         else
             # No VMs/CTs using this storage, proceed
-            log_info "No VMs/CTs are using storage '$selected_storage'"
+            log_info "No VMs/CTs are using storage $selected_storage"
             break
         fi
     done
@@ -16476,16 +16562,14 @@ delete_cloned_nfs_storage_wizard() {
     fi
 
     # Show progress dialog
-    dialog --infobox "Deleting cloned NFS storage '$selected_storage'...
-
-This may take a moment." 8 50
+    dialog --infobox "Deleting cloned NFS storage $selected_storage...\n\nThis may take a moment." 8 50
 
     # Execute deletion
     if delete_pve_NFS_storage "$selected_storage"; then
-        dialog --msgbox "Successfully deleted cloned NFS storage '$selected_storage'.\n\nCleanup finished.\nReview logs in:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details." 12 70
+        dialog --msgbox "Successfully deleted cloned NFS storage $selected_storage.\n\nCleanup finished.\nReview logs in:\n$LOGS_DIR/pve-nfs-cleanup-*.log\nfor details." 12 70
         return 0
     else
-        dialog --msgbox "Error: Failed to delete cloned NFS storage '$selected_storage'. Check the log file for details." 8 70
+        dialog --msgbox "Error: Failed to delete cloned NFS storage $selected_storage. Check the log file for details." 8 70
         return 1
     fi
 }
@@ -16648,9 +16732,7 @@ delete_unused_nfs_storage_wizard() {
     fi
 
     # Show progress dialog
-    dialog --infobox "Deleting unused NFS storage '$selected_storage'...
-
-This may take a moment." 8 50
+    dialog --infobox "Deleting unused NFS storage $selected_storage...\n\nThis may take a moment." 8 50
 
     # Execute deletion using the specialized function for unused storage
     if delete_unused_pve_nfs_storage "$selected_storage"; then
@@ -19270,7 +19352,7 @@ initial_ip_selection_menu() {
     local ip_data=()  # Array to store IP info for sorting
     
     for ip in "${ips[@]}"; do
-        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
+        if [[ "$ip" == "Scan network for $PRODUCT" || "$ip" == "Enter new IP" || "$ip" == "Unregister IP" ]]; then
             special_options+=("$ip")
         elif [[ -n "$ip" ]]; then  # Only process non-empty IP addresses
             actual_ips+=("$ip")
@@ -19324,37 +19406,82 @@ initial_ip_selection_menu() {
     # Replace original ips array with sorted one
     ips=("${sorted_ips[@]}")
     
-    # Build menu items with proper display formatting
+    # Build menu items with new column format: IP | (hostname) | VIP info | [node-type]
+    local nbsp=$'\u00A0'  # non-breaking space for dialog column alignment
     local i
+    local ip_data_array=()  # Store parsed data for width calculation
+    
+    # First pass: collect all data
     for ((i=0; i<${#ips[@]}; i++)); do
         local ip="${ips[i]}"
-        local hostname
-        local node_role
         
         # Check if this is a special menu option (not an actual IP)
-        if [[ "$ip" == "Scan network for $PRODUCT IP" || "$ip" == "Enter new IP" || "$ip" == "Unregister IPs" ]]; then
-            # Special menu options - don't show role
-            menu_items+=("$i" "$ip")
+        if [[ "$ip" == "Scan network for $PRODUCT" || "$ip" == "Enter new IP" || "$ip" == "Unregister IP" ]]; then
+            ip_data_array+=("$i|special|$ip||||")
         else
-            # Regular IP addresses - show VIP info, hostname, and role
-            hostname=$(get_hostname_for_ip "$ip")
-            node_role=$(get_node_role_for_ip "$ip")
+            # Regular IP addresses - parse all components
+            local hostname=$(get_hostname_for_ip "$ip")
+            local node_role=$(get_node_role_for_ip "$ip")
             local vip_info=$(get_vip_info_for_ip "$ip" "$hostname")
             
-            # Build display string with IP, VIP info (replacing hostname), and role
-            if [[ -n "$hostname" && "$hostname" != "Unknown" ]]; then
-                if [[ -n "$node_role" && "$node_role" != "unassigned" ]]; then
-                    menu_items+=("$i" "$(printf "%-16s %-35s [%s]" "$ip" "$vip_info" "$node_role")")
-                else
-                    menu_items+=("$i" "$(printf "%-16s %-35s [unassigned]" "$ip" "$vip_info")")
-                fi
-            else
-                if [[ -n "$node_role" && "$node_role" != "unassigned" ]]; then
-                    menu_items+=("$i" "$(printf "%-16s %-35s [%s]" "$ip" "$vip_info" "$node_role")")
-                else
-                    menu_items+=("$i" "$(printf "%-16s %-35s [unassigned]" "$ip" "$vip_info")")
-                fi
+            # Parse VIP info to separate components
+            parse_vip_info "$vip_info"
+            local parsed_hostname_local="$parsed_hostname"
+            local parsed_vip_desc_local="$parsed_vip_desc"
+            
+            # Handle unassigned role
+            if [[ -z "$node_role" || "$node_role" == "unassigned" ]]; then
+                node_role="unassigned"
             fi
+            
+            # Store data: index|type|ip|hostname|vip_desc|node_role
+            ip_data_array+=("$i|ip|$ip|$parsed_hostname_local|$parsed_vip_desc_local|$node_role")
+        fi
+    done
+    
+    # Calculate column widths
+    local max_ip_width=15  # minimum width for IP
+    local max_hostname_width=12  # minimum width for hostname
+    local max_vip_width=20  # minimum width for VIP description
+    local max_role_width=15  # minimum width for role
+    
+    for data in "${ip_data_array[@]}"; do
+        IFS='|' read -r index type ip hostname vip_desc role <<< "$data"
+        if [[ "$type" == "ip" ]]; then
+            # Calculate required widths
+            [[ ${#ip} -gt $max_ip_width ]] && max_ip_width=${#ip}
+            [[ ${#hostname} -gt $max_hostname_width ]] && max_hostname_width=${#hostname}
+            [[ ${#vip_desc} -gt $max_vip_width ]] && max_vip_width=${#vip_desc}
+            [[ ${#role} -gt $max_role_width ]] && max_role_width=${#role}
+        fi
+    done
+    
+    # Second pass: build formatted menu items
+    for data in "${ip_data_array[@]}"; do
+        IFS='|' read -r index type ip hostname vip_desc role <<< "$data"
+        
+        if [[ "$type" == "special" ]]; then
+            # Special menu options - no formatting
+            menu_items+=("$index" "$ip")
+        else
+            # Build formatted string: IP + 2 spaces + (hostname) + 2 spaces + VIP info + 2 spaces + [role]
+            local ip_part=$(printf "%-${max_ip_width}s" "$ip")
+            local hostname_part="($hostname)"
+            local hostname_padded=$(printf "%-$((max_hostname_width + 2))s" "$hostname_part")  # +2 for parentheses
+            
+            local vip_part=""
+            if [[ -n "$vip_desc" ]]; then
+                vip_part=$(printf "%-${max_vip_width}s" "$vip_desc")
+            else
+                vip_part=$(printf "%-${max_vip_width}s" "")
+            fi
+            
+            local role_part="[$role]"
+            
+            # Combine with non-breaking spaces for proper alignment
+            local display_line="${ip_part}${nbsp}${nbsp}${hostname_padded}${nbsp}${nbsp}${vip_part}${nbsp}${nbsp}${role_part}"
+            
+            menu_items+=("$index" "$display_line")
         fi
     done
 
@@ -19377,8 +19504,8 @@ initial_ip_selection_menu() {
 
     case $dialog_exit_code in
         0)  # Next
-            if [[ "${ips[selected_option]}" == "Scan network for $PRODUCT IP" ]]; then
-                log_debug "initial_ip_selection_menu: User selected 'Scan network for $PRODUCT IP', starting network scan"
+            if [[ "${ips[selected_option]}" == "Scan network for $PRODUCT" ]]; then
+                log_debug "initial_ip_selection_menu: User selected 'Scan network for $PRODUCT', starting network scan"
                 network_scan_for_storage_servers_ip
                 local scan_result=$?
                 if [[ $scan_result -eq 0 ]]; then
@@ -19454,7 +19581,7 @@ initial_ip_selection_menu() {
                     # Return to menu to allow selection of the newly added IP
                     return 2  # Retry same step
                 done
-            elif [[ "${ips[selected_option]}" == "Unregister IPs" ]]; then
+            elif [[ "${ips[selected_option]}" == "Unregister IP" ]]; then
                 manage_custom_ips
                 return 2  # Retry same step
             else

@@ -5,4 +5,8 @@ BACKGROUND_PROCESS_SURVIVAL_SOLUTION.md
 .claude/
 .vscode/
 *.sh
+commands/
+.agent-os/
+pve-tools.log
+AGENTS.md
 

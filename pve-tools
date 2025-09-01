@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.85"
+VERSION="0.86"
 RELEASE_DATE="2025-09-01"
 
 # Script mode flag
@@ -53,6 +53,9 @@ LOG_FILE="$LOGS_DIR/$(basename "$0" .sh).log"
 declare -A API_POOLS_CACHE
 declare -A API_NAS_VOLUMES_CACHE
 API_CACHE_INITIALIZED=false
+
+# Snapshot data cache to avoid redundant API calls
+declare -A CACHED_SNAPSHOT_DATA  # Format: "pool/dataset" -> JSON response
 
 # Script state variables
 selected_confs=()  # Array of selected config files
@@ -10102,7 +10105,9 @@ get_snapshots_with_times() {
     local pool_name="$1"
     local dataset_name="$2"
     local response
-    local url="https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc"
+    local cache_key="${pool_name}/${dataset_name}"
+    # PERFORMANCE FIX: Get ALL snapshots, sorted by name descending (newest first)
+    local url="https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=desc"
 
     # Log the FULL curl command for manual testing
     log_debug "=============== FULL CURL COMMAND FOR GET SNAPSHOTS WITH TIMES ==============="
@@ -10123,6 +10128,10 @@ get_snapshots_with_times() {
         return 1
     fi
 
+    # Cache the response for later use by extract_timestamp_from_snapname
+    CACHED_SNAPSHOT_DATA["$cache_key"]="$response"
+    log_debug "get_snapshots_with_times: Cached snapshot data for $cache_key"
+
     printf '%s' "$response" | python3 -c '
 import sys, json
 try:
@@ -10131,67 +10140,48 @@ try:
     if not entries:
         sys.exit(1)
 
-    # Create list of snapshots with creation timestamps
-    snapshots = []
+    # PERFORMANCE FIX: Only output snapshot names (no timestamp processing)
+    # Age will be calculated from snapshot name directly
     for s in entries:
         name = s.get("name")
-        creation = s.get("properties", {}).get("creation")
-        if name and creation:
-            snapshots.append((int(creation), name))
-
-    # Sort by creation timestamp in descending order (newest first)
-    snapshots.sort(reverse=True)
-
-    # Print snapshot names and creation times tab-separated
-    for creation, name in snapshots:
-        print(f"{name}\t{creation}")
+        if name:
+            # Output name with placeholder timestamp for compatibility
+            print(f"{name}\t0")
 except Exception:
     sys.exit(1)
 '
 }
 
-get_current_timestamp() {
-    date +%s
-}
+# Calculate snapshot age using epoch time (optimized version)
+# Args: $1 = snapshot name (e.g., "autosnap_2025-08-29-050900")  
+# Returns: formatted age string like "2d 3h 15min" or error message
+snap_age() {
+    local snap_name="$1"
+    local ts="${snap_name#autosnap_}"
 
-calculate_age_seconds() {
-    local current_time="$1"
-    local creation_time="$2"
-    echo $((current_time - creation_time))
-}
+    # Reformat "YYYY-MM-DD-HHMMSS" → "YYYY-MM-DD HH:MM:SS"
+    local ts_fmt="${ts:0:10} ${ts:11:2}:${ts:13:2}:${ts:15:2}"
 
-format_age_human() {
-    local age_seconds="$1"
-    local age_minutes=$((age_seconds / 60))
-    local age_hours=$((age_minutes / 60))
-    local age_days=$((age_hours / 24))
-    local age_years=$((age_days / 365))
-    local output=""
-    
-    if [[ $age_minutes -lt 60 ]]; then
-        echo "${age_minutes}min"
-    elif [[ $age_hours -lt 24 ]]; then
-        local remaining_minutes=$((age_minutes % 60))
-        output="${age_hours}h"
-        [[ $remaining_minutes -gt 0 ]] && output+=" ${remaining_minutes}min"
-        echo "$output"
-    elif [[ $age_days -lt 365 ]]; then
-        local remaining_hours=$((age_hours % 24))
-        local remaining_minutes=$((age_minutes % 60))
-        output="${age_days}d"
-        [[ $remaining_hours -gt 0 ]] && output+=" ${remaining_hours}h"
-        [[ $remaining_minutes -gt 0 ]] && output+=" ${remaining_minutes}min"
-        echo "$output"
-    else
-        local remaining_days=$((age_days % 365))
-        local remaining_hours=$((age_hours % 24))
-        local remaining_minutes=$((age_minutes % 60))
-        output="${age_years}y"
-        [[ $remaining_days -gt 0 ]] && output+=" ${remaining_days}d"
-        [[ $remaining_hours -gt 0 ]] && output+=" ${remaining_hours}h"
-        [[ $remaining_minutes -gt 0 ]] && output+=" ${remaining_minutes}min"
-        echo "$output"
-    fi
+    # Convert snapshot timestamp to epoch
+    local snap_epoch
+    snap_epoch=$(date -d "$ts_fmt" +%s) || { echo "invalid"; return 1; }
+
+    local now_epoch=$(date +%s)
+    local diff=$((now_epoch - snap_epoch))
+    (( diff < 0 )) && { echo "future"; return 1; }
+
+    # Integer math only
+    local days=$(( diff / 86400 ))
+    local hours=$(( (diff % 86400) / 3600 ))
+    local mins=$(( (diff % 3600) / 60 ))
+
+    local out=""
+    (( days ))  && out+="${days}d "
+    (( hours )) && out+="${hours}h "
+    (( mins ))  && out+="${mins}min"
+
+    [[ -z "$out" ]] && out="0min"
+    echo "$out"
 }
 
 # Get PVE storage name for a given dataset path
@@ -11133,22 +11123,14 @@ nfs_step4_select_snapshot() {
         return 2  # Go back
     fi
 
-    local current_time
-    current_time=$(get_current_timestamp)
-    
+    # PERFORMANCE FIX: Calculate age directly from snapshot names using snap_age() function
     local i
     for ((i=0; i<${#snapshots[@]}; i++)); do
         local snapshot_name="${snapshots[i]}"
-        local creation_time="${snapshot_times[i]}"
-        local age_text=""
+        local age_text
         
-        if [[ -n "$creation_time" ]]; then
-            local age_seconds
-            age_seconds=$(calculate_age_seconds "$current_time" "$creation_time")
-            age_text=$(format_age_human "$age_seconds")
-        else
-            age_text="unknown"
-        fi
+        # Calculate age using the optimized snap_age() function
+        age_text=$(snap_age "$snapshot_name")
         
         # Use non-breaking spaces for proper column alignment in dialog
         local nbsp=$'\u00A0'  # non-breaking space
@@ -11222,13 +11204,28 @@ extract_timestamp_from_snapname() {
         echo "${day_part}-${hourmin}"
     else
         local response
-        log_debug "curl -k -s --connect-timeout 5 --max-time 30 -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' 'https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc'"
-        response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
-            "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=asc")
-        local curl_exit=$?
-        if [[ $curl_exit -ne 0 ]]; then
-            log_error "extract_timestamp_from_snapname: Failed to connect to server for snapshot creation time"
-            return 1
+        local cache_key="${pool_name}/${dataset_name}"
+        
+        # Check if we have cached snapshot data first (performance optimization)
+        if [[ -n "${CACHED_SNAPSHOT_DATA[$cache_key]:-}" ]]; then
+            response="${CACHED_SNAPSHOT_DATA[$cache_key]}"
+            log_debug "extract_timestamp_from_snapname: Using cached snapshot data for $cache_key"
+        else
+            # Fallback to API call if no cached data available
+            log_debug "extract_timestamp_from_snapname: No cached data, making API call for $cache_key"
+            log_debug "curl -k -s --connect-timeout 5 --max-time 30 -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' 'https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=desc'"
+            response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
+                "https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=desc")
+            local curl_exit=$?
+            if [[ $curl_exit -ne 0 ]]; then
+                log_error "extract_timestamp_from_snapname: Failed to connect to server for snapshot creation time"
+                return 1
+            fi
+            
+            if [[ -z "$response" ]]; then
+                log_error "extract_timestamp_from_snapname: Empty response from server"
+                return 1
+            fi
         fi
 
         local creation
@@ -11734,6 +11731,11 @@ add_nfs_storage_wizard() {
     selected_dataset_index=""
     selected_snapshot_index=""
     nfs_current_step=1
+    
+    # Clear snapshot data cache for fresh session
+    unset CACHED_SNAPSHOT_DATA
+    declare -A CACHED_SNAPSHOT_DATA
+    log_debug "add_nfs_storage_wizard: Cleared snapshot data cache"
 
     while true; do
         case $nfs_current_step in

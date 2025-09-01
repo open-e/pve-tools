@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.84"
-RELEASE_DATE="2025-08-29"
+VERSION="0.85"
+RELEASE_DATE="2025-09-01"
 
 # Script mode flag
 VERSION_MODE=false
@@ -5386,7 +5386,7 @@ setup_rest_api_dialog() {
     local temp_port="$rest_api_port"
 
     # Step 1: Get username and port
-    dialog --keep-tite --title "REST API Configuration - Step 1/2" \
+    dialog --keep-tite --title "$PRODUCT REST API Configuration - Step 1/2" \
            --ok-label "Next" --cancel-label "Back" \
            --form "Configure $PRODUCT REST API settings:" 10 60 2 \
            "User:" 1 1 "$temp_user" 1 20 20 0 \
@@ -8973,10 +8973,10 @@ update_connected_storage_servers() {
             if connection_state=$(grep "^connection_state=" "$info_file" 2>/dev/null | cut -d'=' -f2) && \
                last_check_timestamp=$(grep "^last_check_timestamp=" "$info_file" 2>/dev/null | cut -d'=' -f2); then
                 
-                # If disconnected and checked within last 5 minutes (300 seconds), skip API call
+                # Cache ALL servers (connected/disconnected) for 60 seconds to improve performance
                 local time_diff=$((current_timestamp - last_check_timestamp))
-                if [[ "$connection_state" == "disconnected" && $time_diff -lt 300 ]]; then
-                    log_debug "Skipping API call for $ip (disconnected $time_diff seconds ago)"
+                if [[ $time_diff -lt 60 ]]; then
+                    log_debug "Using cached info for $ip ($connection_state, $time_diff seconds ago)"
                     skip_api_call=true
                 fi
             fi
@@ -10284,6 +10284,22 @@ get_vip_info_for_ip() {
     
     log_debug "get_vip_info_for_ip: Checking VIP status for IP '$target_ip' with hostname '$hostname'"
     
+    # Check cache first - VIP info cached for 5 minutes
+    local vip_cache_file="/tmp/vip_info_$target_ip"
+    local current_timestamp=$(date +%s)
+    
+    if [[ -f "$vip_cache_file" ]]; then
+        local cache_timestamp
+        cache_timestamp=$(head -1 "$vip_cache_file" 2>/dev/null | cut -d':' -f1)
+        if [[ -n "$cache_timestamp" && $((current_timestamp - cache_timestamp)) -lt 300 ]]; then
+            local cached_result
+            cached_result=$(sed '1d' "$vip_cache_file")
+            log_debug "get_vip_info_for_ip: Using cached VIP info for $target_ip"
+            echo "$cached_result"
+            return 0
+        fi
+    fi
+    
     # First, get all pools to determine which pools to check for VIPs
     local pools_response
     log_debug "get_vip_info_for_ip: Getting pools list from '$target_ip:$rest_api_port'"
@@ -10296,7 +10312,11 @@ get_vip_info_for_ip() {
     
     if [[ $curl_exit -ne 0 ]]; then
         log_debug "get_vip_info_for_ip: Failed to connect to API at $target_ip:$rest_api_port (curl exit code: $curl_exit)"
-        echo "IP ($hostname)"
+        local result="IP ($hostname)"
+        # Cache failed connection for 60 seconds (shorter than successful checks)
+        echo "$current_timestamp:cached" > "$vip_cache_file"
+        echo "$result" >> "$vip_cache_file"
+        echo "$result"
         return 1
     fi
     
@@ -10306,7 +10326,11 @@ get_vip_info_for_ip() {
     
     if [[ -z "$pool_names" ]]; then
         log_debug "get_vip_info_for_ip: No pools found in response"
-        echo "IP ($hostname)"
+        local result="IP ($hostname)"
+        # Cache no-pools result for 5 minutes
+        echo "$current_timestamp:cached" > "$vip_cache_file"
+        echo "$result" >> "$vip_cache_file"
+        echo "$result"
         return 1
     fi
     
@@ -10342,7 +10366,11 @@ get_vip_info_for_ip() {
                 
                 if [[ "$vip_addr" == "$target_ip" ]]; then
                     log_debug "get_vip_info_for_ip: Found match - IP '$target_ip' is VIP of pool '$pool_name'"
-                    echo "VIP of $pool_name ($hostname)"
+                    local result="VIP of $pool_name ($hostname)"
+                    # Cache the result for 5 minutes
+                    echo "$current_timestamp:cached" > "$vip_cache_file"
+                    echo "$result" >> "$vip_cache_file"
+                    echo "$result"
                     return 0
                 fi
             done <<< "$vip_addresses"
@@ -10353,7 +10381,11 @@ get_vip_info_for_ip() {
     
     # If we get here, the IP is not a VIP
     log_debug "get_vip_info_for_ip: IP '$target_ip' is not a VIP"
-    echo "IP ($hostname)"
+    local result="IP ($hostname)"
+    # Cache the result for 5 minutes
+    echo "$current_timestamp:cached" > "$vip_cache_file"
+    echo "$result" >> "$vip_cache_file"
+    echo "$result"
     return 0
 }
 
@@ -10642,6 +10674,20 @@ nfs_step1_select_ip() {
     local actual_ips=()
     local special_options=()
     local ip_data=()  # Array to store IP info for sorting
+    
+    # Count actual IPs for progress indication
+    local actual_ip_count=0
+    for ip in "${ips[@]}"; do
+        if [[ "$ip" != "Scan network for $PRODUCT" && "$ip" != "Enter new IP" && "$ip" != "Unregister IP" && -n "$ip" ]]; then
+            ((actual_ip_count++))
+        fi
+    done
+    
+    # Show progress indicator if we have actual IPs to process
+    if [[ $actual_ip_count -gt 0 ]]; then
+        dialog --infobox "Loading storage server details ($actual_ip_count servers)..." 3 60
+        sleep 0.5  # Brief pause so users can see the loading message
+    fi
     
     for ip in "${ips[@]}"; do
         if [[ "$ip" == "Scan network for $PRODUCT" || "$ip" == "Enter new IP" || "$ip" == "Unregister IP" ]]; then
@@ -11781,9 +11827,7 @@ add_nfs_storage_wizard() {
 add_new_nfs_storage_wizard() {
     log_info "Starting add new NFS storage wizard"
     
-    # Update connected storage servers information
-    update_connected_storage_servers
-    log_debug "add_new_nfs_storage_wizard: Finished update_connected_storage_servers"
+    # Note: Server info already updated in main() - no need to update again for faster startup
     
     # Reset wizard variables
     selected_nfs_ip=""

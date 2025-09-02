@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.86"
-RELEASE_DATE="2025-09-01"
+VERSION="0.87"
+RELEASE_DATE="2025-09-02"
 
 # Script mode flag
 VERSION_MODE=false
@@ -10101,88 +10101,48 @@ except Exception:
 '
 }
 
-get_snapshots_with_times() {
-    local pool_name="$1"
-    local dataset_name="$2"
-    local response
-    local cache_key="${pool_name}/${dataset_name}"
-    # PERFORMANCE FIX: Get ALL snapshots, sorted by name descending (newest first)
-    local url="https://$selected_nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes/$dataset_name/snapshots?page=0&per_page=0&sort_by=name&order=desc"
+# list_snaps [host] [port] [pool] [nas_volume] [user] [pass]
+# Outputs lines: "<name>  <age>"
+list_snaps() {
+  local host="$1"
+  local port="$2"
+  local pool="$3"
+  local vol="$4"
+  local user="$5"
+  local pass="$6"
 
-    # Log the FULL curl command for manual testing
-    log_debug "=============== FULL CURL COMMAND FOR GET SNAPSHOTS WITH TIMES ==============="
-    log_debug "curl -k -s --connect-timeout 5 --max-time 30 -X GET -u '${rest_api_user}:${rest_api_password}' -H 'Content-Type: application/json' '$url'"
-    log_debug "=============================================================================="
+  local now_epoch
+  now_epoch="$(date +%s)"
 
-    response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" -H 'Content-Type: application/json' \
-        "$url")
+  curl -k -sS --connect-timeout 5 --max-time 30 \
+    -u "${user}:${pass}" -H 'Content-Type: application/json' \
+    "https://${host}:${port}/api/v4/pools/${pool}/nas-volumes/${vol}/snapshots?page=0&per_page=0&sort_by=creation&order=desc" \
+  | jq -r --argjson NOW "$now_epoch" '
+      # Age formatter: "Dd Hh Mmin"; skip zeros; "0min" if all zero; "future" if negative
+      def age($d):
+        if $d < 0 then "future"
+        else
+          ( ($d/86400|floor) as $dys
+          | ($d%86400/3600|floor) as $hrs
+          | ($d%3600/60|floor) as $min
+          | [ (if $dys>0 then "\($dys)d" else empty end),
+              (if $hrs>0 then "\($hrs)h" else empty end),
+              (if $min>0 then "\($min)min" else empty end) ] as $p
+          | if ($p|length)==0 then "0min" else $p|join(" ") end )
+        end;
 
-    local curl_exit=$?
-    if [[ $curl_exit -ne 0 ]]; then
-        log_error "get_snapshots_with_times: Failed to connect to server for snapshots"
-        return 1
-    fi
-
-    if [[ -z "$response" ]]; then
-        log_error "get_snapshots_with_times: Empty response from server (snapshots)"
-        return 1
-    fi
-
-    # Cache the response for later use by extract_timestamp_from_snapname
-    CACHED_SNAPSHOT_DATA["$cache_key"]="$response"
-    log_debug "get_snapshots_with_times: Cached snapshot data for $cache_key"
-
-    printf '%s' "$response" | python3 -c '
-import sys, json
-try:
-    data = json.load(sys.stdin)
-    entries = data.get("data", {}).get("entries", [])
-    if not entries:
-        sys.exit(1)
-
-    # PERFORMANCE FIX: Only output snapshot names (no timestamp processing)
-    # Age will be calculated from snapshot name directly
-    for s in entries:
-        name = s.get("name")
-        if name:
-            # Output name with placeholder timestamp for compatibility
-            print(f"{name}\t0")
-except Exception:
-    sys.exit(1)
-'
+      # {"data":{"entries":[...]}} → array
+      (.data.entries // .entries // .snapshots // [])
+      | map(select(.name and (.properties.creation)))
+      | map(select(.name|test("^autosnap_")))
+      | sort_by(.properties.creation) | reverse
+      | .[]
+      | "\(.name)\t\(age($NOW - (.properties.creation)))"
+    ' \
+  | awk -F'\t' '{printf "%s  %s\n", $1, $2}'
 }
 
-# Calculate snapshot age using epoch time (optimized version)
-# Args: $1 = snapshot name (e.g., "autosnap_2025-08-29-050900")  
-# Returns: formatted age string like "2d 3h 15min" or error message
-snap_age() {
-    local snap_name="$1"
-    local ts="${snap_name#autosnap_}"
 
-    # Reformat "YYYY-MM-DD-HHMMSS" → "YYYY-MM-DD HH:MM:SS"
-    local ts_fmt="${ts:0:10} ${ts:11:2}:${ts:13:2}:${ts:15:2}"
-
-    # Convert snapshot timestamp to epoch
-    local snap_epoch
-    snap_epoch=$(date -d "$ts_fmt" +%s) || { echo "invalid"; return 1; }
-
-    local now_epoch=$(date +%s)
-    local diff=$((now_epoch - snap_epoch))
-    (( diff < 0 )) && { echo "future"; return 1; }
-
-    # Integer math only
-    local days=$(( diff / 86400 ))
-    local hours=$(( (diff % 86400) / 3600 ))
-    local mins=$(( (diff % 3600) / 60 ))
-
-    local out=""
-    (( days ))  && out+="${days}d "
-    (( hours )) && out+="${hours}h "
-    (( mins ))  && out+="${mins}min"
-
-    [[ -z "$out" ]] && out="0min"
-    echo "$out"
-}
 
 # Get PVE storage name for a given dataset path
 # Args: $1 = server IP, $2 = dataset name (can be "Pool-0/dataset1" or just "dataset1")
@@ -11111,31 +11071,23 @@ nfs_step3_select_dataset() {
 }
 
 nfs_step4_select_snapshot() {
-    local line snapshots=() snapshot_times=() menu_items=()
+    local snapshots=() menu_items=()
+    local i=0
     
-    while IFS=$'\t' read -r snapshot_name creation_time; do
+    # Use the new list_snaps() function to get formatted snapshot data
+    while IFS='  ' read -r snapshot_name age_text; do
         snapshots+=("$snapshot_name")
-        snapshot_times+=("$creation_time")
-    done < <(get_snapshots_with_times "$selected_pool" "$selected_dataset")
+        
+        # Use non-breaking spaces for proper column alignment in dialog
+        local nbsp=$'\u00A0'  # non-breaking space
+        menu_items+=("$i" "$snapshot_name${nbsp}${nbsp}${nbsp}${nbsp}$age_text")
+        ((i++))
+    done < <(list_snaps "$selected_nfs_ip" "$rest_api_port" "$selected_pool" "$selected_dataset" "$rest_api_user" "$rest_api_password")
 
     if [ "${#snapshots[@]}" -eq 0 ]; then
         dialog --msgbox "No snapshots found in dataset $selected_dataset\n\nPool: $selected_pool\nDataset: $selected_dataset" 10 60
         return 2  # Go back
     fi
-
-    # PERFORMANCE FIX: Calculate age directly from snapshot names using snap_age() function
-    local i
-    for ((i=0; i<${#snapshots[@]}; i++)); do
-        local snapshot_name="${snapshots[i]}"
-        local age_text
-        
-        # Calculate age using the optimized snap_age() function
-        age_text=$(snap_age "$snapshot_name")
-        
-        # Use non-breaking spaces for proper column alignment in dialog
-        local nbsp=$'\u00A0'  # non-breaking space
-        menu_items+=("$i" "$snapshot_name${nbsp}${nbsp}${nbsp}${nbsp}$age_text")
-    done
 
     local dialog_selected=$(mktemp)
     local extra_button

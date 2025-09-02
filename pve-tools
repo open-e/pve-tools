@@ -27,7 +27,7 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.87"
+VERSION="0.88"
 RELEASE_DATE="2025-09-02"
 
 # Script mode flag
@@ -574,11 +574,44 @@ get_dataset_pool_name_cached() {
 
     log_debug "get_dataset_pool_name_cached: Looking for dataset '$dataset_name' on IP '$nfs_ip'"
 
-    # Get cached pools
+    # Get cached pools, with fallback to direct API call
     local pools
     if ! pools=$(get_cached_pools "$nfs_ip"); then
-        log_debug "get_dataset_pool_name_cached: No cached pools list available for IP $nfs_ip"
-        return 1
+        log_debug "get_dataset_pool_name_cached: No cached pools list available for IP $nfs_ip, trying direct API call"
+        
+        # Fallback: Make direct API call to get pools
+        local url="https://$nfs_ip:$rest_api_port/api/v4/pools"
+        local response
+        response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" \
+            -H 'Content-Type: application/json' \
+            "$url" 2>/dev/null)
+        
+        local curl_exit=$?
+        if [[ $curl_exit -ne 0 ]]; then
+            log_debug "get_dataset_pool_name_cached: Direct API call failed for IP $nfs_ip"
+            return 1
+        fi
+        
+        # Parse pools from direct API response
+        pools=$(printf '%s' "$response" | python3 -c "
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    pools = data.get('data', [])
+    for pool in pools:
+        name = pool.get('name')
+        if name:
+            print(name)
+except:
+    sys.exit(1)
+" 2>/dev/null)
+        
+        if [[ -z "$pools" ]]; then
+            log_debug "get_dataset_pool_name_cached: No pools found via direct API call for IP $nfs_ip"
+            return 1
+        fi
+        
+        log_debug "get_dataset_pool_name_cached: Using direct API call results for IP $nfs_ip"
     fi
 
     # Loop through each pool and check if dataset exists
@@ -587,10 +620,24 @@ get_dataset_pool_name_cached() {
             continue
         fi
 
-        # Get cached nas-volumes for this pool
+        # Get cached nas-volumes for this pool, with fallback to direct API call
         local response
         if ! response=$(get_cached_nas_volumes "$nfs_ip" "$pool_name"); then
-            continue  # Skip this pool if we can't get cached data
+            log_debug "get_dataset_pool_name_cached: No cached nas-volumes for pool $pool_name, trying direct API call"
+            
+            # Fallback: Make direct API call to get nas-volumes for this pool
+            local nas_url="https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes"
+            response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" \
+                -H 'Content-Type: application/json' \
+                "$nas_url" 2>/dev/null)
+            
+            local nas_curl_exit=$?
+            if [[ $nas_curl_exit -ne 0 ]]; then
+                log_debug "get_dataset_pool_name_cached: Direct nas-volumes API call failed for pool $pool_name"
+                continue  # Skip this pool if direct API call also fails
+            fi
+            
+            log_debug "get_dataset_pool_name_cached: Using direct API call for nas-volumes in pool $pool_name"
         fi
 
         # Check if dataset exists in this pool
@@ -647,11 +694,24 @@ is_clone_cached() {
 
     log_debug "is_clone_cached: Checking if '$volume_name' is a clone on IP '$nfs_ip'"
 
-    # Get cached nas-volumes data for this pool
+    # Get cached nas-volumes data for this pool, with fallback to direct API call
     local response
     if ! response=$(get_cached_nas_volumes "$nfs_ip" "$pool_name"); then
-        log_error "is_clone_cached: Failed to get cached nas-volumes data"
-        return 1
+        log_debug "is_clone_cached: No cached nas-volumes for pool $pool_name, trying direct API call"
+        
+        # Fallback: Make direct API call to get nas-volumes for this pool
+        local nas_url="https://$nfs_ip:$rest_api_port/api/v4/pools/$pool_name/nas-volumes"
+        response=$(curl -k -s --connect-timeout 5 --max-time 30 -X GET -u "${rest_api_user}:${rest_api_password}" \
+            -H 'Content-Type: application/json' \
+            "$nas_url" 2>/dev/null)
+        
+        local nas_curl_exit=$?
+        if [[ $nas_curl_exit -ne 0 ]]; then
+            log_error "is_clone_cached: Direct nas-volumes API call failed for pool $pool_name"
+            return 1
+        fi
+        
+        log_debug "is_clone_cached: Using direct API call for nas-volumes in pool $pool_name"
     fi
 
     # Parse JSON response to find the dataset and check its origin
@@ -4485,9 +4545,9 @@ perform_nfs_service_checkup() {
                 ;;
         esac
         
-        # Format output with proper alignment
+        # Format output with proper alignment (using same total width as OODP sections)
         local status_length=${#status_text}
-        local padding=$((104 - ${#header_line} - status_length))
+        local padding=$((95 - ${#header_line} - status_length))
         if [ $padding -lt 1 ]; then padding=1; fi
         
         printf "%s%*s%s\n" "$header_line" $padding "" "$status_text" >> "$temp_file"
@@ -6222,7 +6282,11 @@ get_available_vmct_id() {
 all_mnt_confs() {
     log_debug "Getting all mounted configuration files"
     
-    find /mnt/pve/*/images/* -maxdepth 1 -name '*.conf' 2>/dev/null | sort
+    # Find both .conf and .conf.clone files
+    {
+        find /mnt/pve/*/images/* -maxdepth 1 -name '*.conf.clone' 2>/dev/null
+        find /mnt/pve/*/images/* -maxdepth 1 -name '*.conf' 2>/dev/null
+    } | sort
     
     return 0
 }
@@ -6350,13 +6414,19 @@ get_cloned_config_file_list() {
                 if [[ -n "$vm_id" ]]; then
                     # Look for corresponding config file in the same directory
                     local vm_dir=$(dirname "$disk_file")
-                    local config_file="$vm_dir/$vm_id.conf"
-                    log_debug "get_cloned_config_file_list: Looking for config file '$config_file'"
+                    local config_file="$vm_dir/$vm_id.conf.clone"
+                    local fallback_config_file="$vm_dir/$vm_id.conf"
+                    
+                    # Check for .conf.clone file first (renamed files)
                     if [[ -f "$config_file" ]]; then
-                        log_debug "get_cloned_config_file_list: Adding config file '$config_file' to list"
+                        log_debug "get_cloned_config_file_list: Found .clone config file '$config_file'"
                         config_files+=("$config_file")
+                    # Fall back to .conf file (for backward compatibility)
+                    elif [[ -f "$fallback_config_file" ]]; then
+                        log_debug "get_cloned_config_file_list: Found fallback config file '$fallback_config_file'"
+                        config_files+=("$fallback_config_file")
                     else
-                        log_debug "get_cloned_config_file_list: Config file '$config_file' not found"
+                        log_debug "get_cloned_config_file_list: No config file found for VM ID '$vm_id'"
                     fi
                 else
                     log_debug "get_cloned_config_file_list: Could not extract VM ID from '$disk_file'"
@@ -6767,15 +6837,22 @@ restore_ct() {
         ctid="$new_ctid"
         log_info "Using new CT ID: $ctid for restoration"
     else
-        ctid="$(echo "$src_conf" | awk -F'/' '{print $(NF-1)}')"
+        # Handle both .conf and .conf.clone extensions when extracting CT ID
+        local conf_basename=$(basename "$src_conf")
+        if [[ "$conf_basename" =~ ^([0-9]+)\.conf(\.clone)?$ ]]; then
+            ctid="${BASH_REMATCH[1]}"
+        else
+            # Fallback to old method
+            ctid="$(echo "$src_conf" | awk -F'/' '{print $(NF-1)}')"
+        fi
         log_info "Using original CT ID: $ctid for restoration"
     fi
     
     local dst_conf="/etc/pve/nodes/${host_name}/lxc/${ctid}.conf"
     
-    log_info "Restoring CT $ctid from $src_conf to $dst_conf"
+    log_info "Restoring CT $ctid from $src_conf to $dst_conf (source may have .clone extension)"
     
-    # Copy configuration file
+    # Copy configuration file (destination is always .conf, not .conf.clone)
     if ! cp "$src_conf" "$dst_conf"; then
         log_error "Failed to copy CT configuration from $src_conf to $dst_conf"
         return 1
@@ -6881,15 +6958,22 @@ restore_vm() {
         vmid="$new_vmid"
         log_info "Using new VM ID: $vmid for restoration"
     else
-        vmid="$(echo "$src_conf" | awk -F'/' '{print $(NF-1)}')"
+        # Handle both .conf and .conf.clone extensions when extracting VM ID
+        local conf_basename=$(basename "$src_conf")
+        if [[ "$conf_basename" =~ ^([0-9]+)\.conf(\.clone)?$ ]]; then
+            vmid="${BASH_REMATCH[1]}"
+        else
+            # Fallback to old method
+            vmid="$(echo "$src_conf" | awk -F'/' '{print $(NF-1)}')"
+        fi
         log_info "Using original VM ID: $vmid for restoration"
     fi
     
     local dst_conf="/etc/pve/nodes/${host_name}/qemu-server/${vmid}.conf"
     
-    log_info "Restoring VM $vmid from $src_conf to $dst_conf"
+    log_info "Restoring VM $vmid from $src_conf to $dst_conf (source may have .clone extension)"
     
-    # Copy configuration file
+    # Copy configuration file (destination is always .conf, not .conf.clone)
     if ! cp "$src_conf" "$dst_conf"; then
         log_error "Failed to copy VM configuration from $src_conf to $dst_conf"
         return 1
@@ -11436,7 +11520,8 @@ wait_for_config_files() {
     log_info "Waiting for VM/CT config files to be discoverable in storage '$storage_name'..."
     
     while [[ $wait_time -lt $max_wait ]]; do
-        local config_count=$(ls -1 /mnt/pve/"$storage_name"/images/*/*.conf 2>/dev/null | wc -l)
+        # Check for both .conf and .conf.clone files
+        local config_count=$({ ls -1 /mnt/pve/"$storage_name"/images/*/*.conf.clone 2>/dev/null || true; ls -1 /mnt/pve/"$storage_name"/images/*/*.conf 2>/dev/null || true; } | wc -l)
         if [[ $config_count -gt 0 ]]; then
             log_info "Found $config_count config files in storage '$storage_name'"
             return 0
@@ -11451,11 +11536,11 @@ wait_for_config_files() {
     return 0
 }
 
-set_readonly_conf_files() {
+rename_conf_files_for_protection() {
     local storage_name="$1"
     local conf_path="/mnt/pve/$storage_name/images"
     
-    log_info "Setting read-only permissions on conf files in storage '$storage_name'..."
+    log_info "Renaming conf files to .clone extension for protection in storage '$storage_name'..."
     
     # Check if the images directory exists
     if [[ ! -d "$conf_path" ]]; then
@@ -11463,7 +11548,7 @@ set_readonly_conf_files() {
         return 0
     fi
     
-    # Find all .conf files and set read-only attribute
+    # Find all .conf files and rename them to .conf.clone
     local conf_files=()
     local conf_count=0
     
@@ -11473,29 +11558,30 @@ set_readonly_conf_files() {
     done < <(find "$conf_path" -name "*.conf" -type f -print0 2>/dev/null)
     
     if [[ $conf_count -eq 0 ]]; then
-        log_info "No conf files found in '$conf_path' - nothing to set read-only"
+        log_info "No conf files found in '$conf_path' - nothing to rename"
         return 0
     fi
     
-    log_info "Found $conf_count conf files, setting read-only permissions..."
+    log_info "Found $conf_count conf files, renaming to .clone extension..."
     
     local success_count=0
     local error_count=0
     
     for conf_file in "${conf_files[@]}"; do
-        if chmod 444 "$conf_file" 2>/dev/null; then
-            log_debug "Set read-only permissions on: $conf_file"
+        local clone_file="${conf_file}.clone"
+        if mv "$conf_file" "$clone_file" 2>/dev/null; then
+            log_debug "Renamed conf file: $conf_file -> $clone_file"
             ((success_count++))
         else
-            log_error "Failed to set read-only permissions on: $conf_file"
+            log_error "Failed to rename conf file: $conf_file"
             ((error_count++))
         fi
     done
     
     if [[ $error_count -eq 0 ]]; then
-        log_info "Successfully set read-only permissions on $success_count conf files"
+        log_info "Successfully renamed $success_count conf files to .clone extension"
     else
-        log_error "Set read-only permissions on $success_count files, $error_count failed"
+        log_error "Renamed $success_count conf files, $error_count failed"
     fi
     
     return 0
@@ -11661,9 +11747,9 @@ perform_clone_and_setup() {
 
     wait_for_config_files "$clone_name"
 
-    dialog --title "Processing..." --infobox "Setting read-only permissions on conf files..." 6 50
+    dialog --title "Processing..." --infobox "Renaming conf files for protection..." 6 50
 
-    set_readonly_conf_files "$clone_name"
+    rename_conf_files_for_protection "$clone_name"
 
     dialog --msgbox "Clone and NFS setup completed successfully!\n\nPool:$(sep 16)$selected_pool\nDataset:$(sep 13)$selected_dataset\nSnapshot:$(sep 12)$selected_snapshot\nClone:$(sep 15)$clone_name\nNFS Share:$(sep 11)$clone_name\nProxmox VE Storage:$(sep 2)$clone_name" 14 70
 }

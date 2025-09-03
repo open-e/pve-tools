@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.88"
-RELEASE_DATE="2025-09-02"
+VERSION="0.89"
+RELEASE_DATE="2025-09-03"
 
 # Script mode flag
 VERSION_MODE=false
@@ -761,6 +761,14 @@ except Exception as e:
 check_and_install_dependencies() {
     log_info "Checking system dependencies and environment"
     
+    # 0. Update package lists (continue if fails)
+    log_info "Updating package lists"
+    if ! apt-get update >/dev/null 2>&1; then
+        log_info "Package update failed, continuing with existing package cache"
+    else
+        log_info "Package lists updated successfully"
+    fi
+    
     # 1. Check Proxmox VE environment first
     log_info "Validating Proxmox VE environment"
     if ! command -v qm >/dev/null 2>&1 || ! command -v pct >/dev/null 2>&1 || ! command -v ha-manager >/dev/null 2>&1; then
@@ -777,7 +785,7 @@ check_and_install_dependencies() {
         echo "Installing required dialog package. Please wait..." >&2
         
         # Update package list and install dialog
-        if ! apt-get update >/dev/null 2>&1 || ! apt-get install -y dialog >/dev/null 2>&1; then
+        if ! apt-get install -y dialog >/dev/null 2>&1; then
             echo "Error: Failed to install dialog package. Please install manually: apt-get install dialog" >&2
             log_error "Failed to install dialog via apt-get"
             exit 1
@@ -802,7 +810,7 @@ check_and_install_dependencies() {
         
         # Try different package managers
         if command -v apt-get >/dev/null 2>&1; then
-            apt-get update >/dev/null 2>&1 && apt-get install -y jq >/dev/null 2>&1
+            apt-get install -y jq >/dev/null 2>&1
         elif command -v yum >/dev/null 2>&1; then
             yum install -y jq >/dev/null 2>&1
         elif command -v dnf >/dev/null 2>&1; then
@@ -832,7 +840,7 @@ check_and_install_dependencies() {
         
         # Try different package managers
         if command -v apt-get >/dev/null 2>&1; then
-            apt-get update >/dev/null 2>&1 && apt-get install -y python3 >/dev/null 2>&1
+            apt-get install -y python3 >/dev/null 2>&1
         elif command -v yum >/dev/null 2>&1; then
             yum install -y python3 >/dev/null 2>&1
         elif command -v dnf >/dev/null 2>&1; then

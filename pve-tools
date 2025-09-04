@@ -27,8 +27,8 @@ export NCURSES_NO_UTF8_ACS=1
 DEBUG_MODE=false
 
 # Version information - RELEASE_DATE and VERSION automatically managed during commits (Option B logic)
-VERSION="0.89"
-RELEASE_DATE="2025-09-03"
+VERSION="0.90"
+RELEASE_DATE="2025-09-04"
 
 # Script mode flag
 VERSION_MODE=false
@@ -132,11 +132,8 @@ cleanup_and_exit() {
     exit 0
 }
 
-# Setup trap handlers for cleanup
-trap cleanup_and_exit EXIT
-trap cleanup_and_exit SIGINT
-trap cleanup_and_exit SIGTERM
-trap cleanup_and_exit SIGTSTP
+# Note: Trap handlers are set up in main() function after critical dependency checking
+# to avoid clearing error messages during startup failures
 
 # STORAGE IP MAPPING
 
@@ -348,6 +345,8 @@ init_debug_error_capture() {
                 '^return( [0-9]+| \$[a-zA-Z_][a-zA-Z0-9_]*)?$'  # explicit return statements with numbers or variables
                 '=[^=]*\$\('               # command substitutions (var=$(cmd))
                 '^curl'                     # curl commands (expected to fail during network scanning)
+                '^ssh'                      # ssh commands (expected to return non-zero for remote command failures)
+                '\$\(ssh'                   # ssh in command substitutions
             )
             
             local should_skip=false
@@ -1628,9 +1627,29 @@ if [ ! -f /usr/local/sbin/pve-config-backup ]; then
     if [ \$? -eq 0 ] && [ -f /usr/local/sbin/pve-config-backup ]; then
         chmod +x /usr/local/sbin/pve-config-backup
         /usr/local/sbin/pve-config-backup install >/dev/null 2>&1
-        if [ \$? -eq 0 ]; then
-            echo "INSTALLED"
-            exit 0
+        install_result=\$?
+        
+        if [ \$install_result -eq 0 ]; then
+            # Wait for systemd service to be fully registered after install
+            sleep 2
+            # Verify installation health - check if it can execute properly
+            /usr/local/sbin/pve-config-backup status >/dev/null 2>&1
+            health_check_result=\$?
+            
+            case \$health_check_result in
+                0|1)  # 0=running, 1=stopped but healthy
+                    echo "INSTALLED"
+                    exit 0
+                    ;;
+                127)  # Missing dependencies
+                    echo "DEPENDENCY_ERROR"
+                    exit 127
+                    ;;
+                *)  # Other execution error
+                    echo "EXECUTION_ERROR"
+                    exit \$health_check_result
+                    ;;
+            esac
         else
             echo "INSTALL_FAILED"
             exit 1
@@ -1641,25 +1660,76 @@ if [ ! -f /usr/local/sbin/pve-config-backup ]; then
     fi
 fi
 
-# Check daemon status
-status_output=\$(/usr/local/sbin/pve-config-backup status 2>/dev/null)
-if echo "\$status_output" | grep -q "Active: active (running)"; then
-    echo "ALREADY_RUNNING"
-elif echo "\$status_output" | grep -q "Active: inactive (dead)"; then
-    # Start the daemon
-    /usr/local/sbin/pve-config-backup start >/dev/null 2>&1
-    if [ \$? -eq 0 ]; then
-        echo "STARTED"
+# Check daemon status with proper error handling
+status_result=\$(/usr/local/sbin/pve-config-backup status 2>&1)
+status_check_result=\$?
+
+# Check if the error is specifically about service not being found
+if echo "\$status_result" | grep -q 'Unit.*could not be found\|Unit.*not found\|service could not be found'; then
+    # Service not found - try to reinstall even if script file exists
+    echo "SERVICE_NOT_FOUND - attempting reinstallation"
+    /usr/local/sbin/pve-config-backup install >/dev/null 2>&1
+    install_result=\$?
+    
+    if [ \$install_result -eq 0 ]; then
+        # Wait for systemd service to be fully registered after install
+        sleep 2
+        # Try status again after reinstallation
+        /usr/local/sbin/pve-config-backup status >/dev/null 2>&1
+        recheck_result=\$?
+        
+        case \$recheck_result in
+            0)  # Now running
+                echo "REINSTALLED_RUNNING"
+                exit 0
+                ;;
+            1)  # Installed but stopped - try to start
+                /usr/local/sbin/pve-config-backup start >/dev/null 2>&1
+                if [ \$? -eq 0 ]; then
+                    echo "REINSTALLED_STARTED"
+                    exit 0
+                else
+                    echo "REINSTALL_START_FAILED"
+                    exit 1
+                fi
+                ;;
+            *)  # Still failing after reinstall
+                echo "REINSTALL_FAILED"
+                exit 1
+                ;;
+        esac
     else
-        echo "START_FAILED"
+        echo "REINSTALL_FAILED"
         exit 1
     fi
-else
-    echo "STATUS_UNKNOWN"
-    exit 1
 fi
+
+case \$status_check_result in
+    0)  # Daemon is running
+        echo "ALREADY_RUNNING"
+        exit 0
+        ;;
+    1)  # Daemon is stopped but command works - try to start it
+        /usr/local/sbin/pve-config-backup start >/dev/null 2>&1
+        if [ \$? -eq 0 ]; then
+            echo "STARTED"
+            exit 0
+        else
+            echo "START_FAILED"
+            exit 1
+        fi
+        ;;
+    127)  # Missing dependencies
+        echo "DEPENDENCY_ERROR"
+        exit 127
+        ;;
+    *)  # Other execution error
+        echo "EXECUTION_ERROR"
+        exit \$status_check_result
+        ;;
+esac
 ENDSCRIPT
-        2>/dev/null)
+        ) 2>/dev/null
         
         case "$result" in
             "INSTALLED")
@@ -1674,29 +1744,141 @@ ENDSCRIPT
                 log_info "Node $node: pve-config-backup already running"
                 echo "ALREADY_RUNNING" >> /tmp/node_results
                 ;;
+            "REINSTALLED_RUNNING")
+                log_info "Node $node: pve-config-backup service was missing, reinstalled and is now running"
+                echo "REINSTALLED_RUNNING" >> /tmp/node_results
+                ;;
+            "REINSTALLED_STARTED")
+                log_info "Node $node: pve-config-backup service was missing, reinstalled and started"
+                echo "REINSTALLED_STARTED" >> /tmp/node_results
+                ;;
+            "DEPENDENCY_ERROR")
+                log_error "Node $node: pve-config-backup has missing dependencies - VM config backup not working"
+                echo "DEPENDENCY_ERROR" >> /tmp/node_results
+                ;;
+            "EXECUTION_ERROR")
+                log_error "Node $node: pve-config-backup execution failed - VM config backup not working"
+                echo "EXECUTION_ERROR" >> /tmp/node_results
+                ;;
+            "REINSTALL_FAILED"|"REINSTALL_START_FAILED")
+                log_error "Node $node: pve-config-backup service not found and reinstallation failed - $result"
+                echo "REINSTALL_FAILED" >> /tmp/node_results
+                ;;
             *)
-                log_error "Node $node: Failed to ensure pve-config-backup is running"
+                log_error "Node $node: Failed to ensure pve-config-backup is running - $result"
                 echo "FAILED" >> /tmp/node_results
                 ;;
         esac
     done < <(echo "$node_list")
     
     # Count results
+    local dependency_errors=0
+    local execution_errors=0
+    local failed=0
+    
     if [ -f /tmp/node_results ]; then
         installed=$(grep -c "INSTALLED" /tmp/node_results)
         started=$(grep -c "STARTED" /tmp/node_results)
         already_running=$(grep -c "ALREADY_RUNNING" /tmp/node_results)
+        local reinstalled_running=$(grep -c "REINSTALLED_RUNNING" /tmp/node_results)
+        local reinstalled_started=$(grep -c "REINSTALLED_STARTED" /tmp/node_results)
+        dependency_errors=$(grep -c "DEPENDENCY_ERROR" /tmp/node_results)
+        execution_errors=$(grep -c "EXECUTION_ERROR" /tmp/node_results)
+        local reinstall_failed=$(grep -c "REINSTALL_FAILED" /tmp/node_results)
+        failed=$(grep -c "FAILED" /tmp/node_results)
         rm -f /tmp/node_results
     fi
     
-    log_info "pve-config-backup setup complete on HA nodes - Total: $total_nodes, Already running: $already_running, Installed: $installed, Started: $started"
+    log_info "pve-config-backup setup complete on HA nodes - Total: $total_nodes, Already running: $already_running, Installed: $installed, Started: $started, Reinstalled: $((reinstalled_running + reinstalled_started)), Dependency errors: $dependency_errors, Execution errors: $execution_errors, Reinstall failed: $reinstall_failed, Other failures: $failed"
     
-    # Only show dialog if action was taken (installations or starts)
-    if [ "$installed" -gt 0 ] || [ "$started" -gt 0 ]; then
-        dialog --msgbox "pve-config-backup setup complete on HA nodes.\n\nTotal nodes:$(sep 6)$total_nodes\nAlready running:$(sep 2)$already_running\nInstalled:$(sep 8)$installed\nStarted:$(sep 10)$started" 12 60
+    # Check for critical errors that affect VM config backup functionality
+    local total_errors=$((dependency_errors + execution_errors + reinstall_failed + failed))
+    if [ "$total_errors" -gt 0 ]; then
+        local error_msg="CRITICAL: pve-config-backup has errors on $total_errors nodes - VM config backup is not working properly!"
+        log_error "$error_msg"
+        
+        # Create error status file for main() function to detect
+        echo "CRITICAL_ERROR:BACKUP_SERVICE_FAILED" > /tmp/pve-config-backup-critical-error
+        echo "$error_msg" >> /tmp/pve-config-backup-critical-error
+        echo "Nodes with dependency errors: $dependency_errors" >> /tmp/pve-config-backup-critical-error
+        echo "Nodes with execution errors: $execution_errors" >> /tmp/pve-config-backup-critical-error
+        echo "Nodes with reinstall failures: $reinstall_failed" >> /tmp/pve-config-backup-critical-error
+        echo "Nodes with other failures: $failed" >> /tmp/pve-config-backup-critical-error
+        echo "Please manually install missing modules and restart pve-tools." >> /tmp/pve-config-backup-critical-error
+        
+        return 127
+    fi
+    
+    # Only show dialog if action was taken (installations, starts, or reinstalls)
+    local total_actions=$((installed + started + reinstalled_running + reinstalled_started))
+    if [ "$total_actions" -gt 0 ]; then
+        dialog --msgbox "pve-config-backup setup complete on HA nodes.\n\nTotal nodes:$(sep 6)$total_nodes\nAlready running:$(sep 2)$already_running\nInstalled:$(sep 8)$installed\nStarted:$(sep 10)$started\nReinstalled:$(sep 6)$((reinstalled_running + reinstalled_started))" 13 60
     fi
     
     return 0
+}
+
+# Verify pve-config-backup health and dependencies
+verify_pve_config_backup_health() {
+    local node_ip="$1"
+    
+    log_debug "Verifying pve-config-backup health on $node_ip"
+    
+    # Test if pve-config-backup exists and can execute
+    local health_result
+    health_result=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 root@"$node_ip" "bash -s" << 'ENDSCRIPT'
+# Check if pve-config-backup file exists
+if [ ! -f /usr/local/sbin/pve-config-backup ]; then
+    echo "NOT_INSTALLED"
+    exit 1
+fi
+
+# Test if pve-config-backup can execute (check for dependencies)
+/usr/local/sbin/pve-config-backup status >/dev/null 2>&1
+status_exit_code=$?
+
+case $status_exit_code in
+    0)  # Success - daemon is running
+        echo "RUNNING"
+        ;;
+    1)  # Expected - daemon is stopped but executable works
+        echo "STOPPED_OK"
+        ;;
+    127)  # Command not found or missing dependencies
+        echo "DEPENDENCY_ERROR"
+        exit 127
+        ;;
+    *)  # Other execution error
+        echo "EXECUTION_ERROR:$status_exit_code"
+        exit $status_exit_code
+        ;;
+esac
+ENDSCRIPT
+    ) 2>/dev/null
+    
+    local health_exit_code=$?
+    
+    case "$health_result" in
+        "NOT_INSTALLED")
+            return 1
+            ;;
+        "RUNNING"|"STOPPED_OK")
+            return 0
+            ;;
+        "DEPENDENCY_ERROR")
+            log_error "pve-config-backup has missing dependencies on $node_ip"
+            return 127
+            ;;
+        "EXECUTION_ERROR:"*)
+            local error_code="${health_result#EXECUTION_ERROR:}"
+            log_error "pve-config-backup execution failed on $node_ip with exit code: $error_code"
+            return "$error_code"
+            ;;
+        *)
+            log_error "Unknown pve-config-backup health status on $node_ip: $health_result (exit: $health_exit_code)"
+            return 2
+            ;;
+    esac
 }
 
 # Cleanup unused disks in VM/CT configs
@@ -3782,7 +3964,7 @@ else
     echo "DOWNLOAD_FAILED"
 fi
 ENDSCRIPT
-        2>/dev/null)
+        ) 2>/dev/null
         
         case "$result" in
             "UPDATE_SUCCESS")
@@ -4581,6 +4763,10 @@ check_background_status() {
             local completed_time="${status_info#COMPLETED:}"
             PVE_CONFIG_BACKUP_STATUS="completed"
             PVE_CONFIG_BACKUP_RESULT="✓ pve-config-backup check completed at $completed_time"
+        elif [[ "$status_info" == CRITICAL_ERROR:* ]]; then
+            local error_time="${status_info#CRITICAL_ERROR:}"
+            PVE_CONFIG_BACKUP_STATUS="critical_error"
+            PVE_CONFIG_BACKUP_RESULT="⚠ CRITICAL: pve-config-backup has dependency errors (at $error_time)"
         fi
     elif [ -n "$PVE_CONFIG_BACKUP_PID" ]; then
         if ! kill -0 "$PVE_CONFIG_BACKUP_PID" 2>/dev/null; then
@@ -4596,6 +4782,9 @@ check_background_status() {
 # System checkup summary
 checkup_summary() {
     log_info "Starting system checkup summary"
+    
+    # Initialize critical error flag
+    local CRITICAL_ERROR_OCCURRED=false
     
     # Status display variables - customize these to change status appearance
     local PASSED='PASSED'
@@ -4754,15 +4943,39 @@ checkup_summary() {
         log_info "Checking pve-config-backup status on node: $node ($ip)"
         
         local status_output
-        status_output=$(timeout 5 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 root@"$ip" "
+        status_output=$(timeout 10 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 root@"$ip" "
             if [ -f /usr/local/sbin/pve-config-backup ]; then
-                if pve-config-backup status >/dev/null 2>&1; then
+                # Capture both output and exit code of status command
+                status_result=\$(pve-config-backup status 2>&1)
+                status_exit_code=\$?
+                
+                # Check if status command succeeded
+                if [ \$status_exit_code -eq 0 ]; then
                     echo 'active (running)'
                 else
-                    echo 'inactive (dead)'
+                    # Check if the error is specifically about service not being found
+                    if echo \"\$status_result\" | grep -q 'Unit.*could not be found\|Unit.*not found\|service could not be found'; then
+                        echo 'SERVICE_NOT_FOUND'
+                    elif echo \"\$status_result\" | grep -q 'inactive\|dead'; then
+                        echo 'inactive (dead)'
+                    else
+                        # Try to start it and check for installation issues
+                        start_result=\$(ensure_pve_config_backup_running 2>&1)
+                        if echo \"\$start_result\" | grep -q 'INSTALL_FAILED'; then
+                            echo 'INSTALL_FAILED'
+                        else
+                            echo 'inactive (dead)'
+                        fi
+                    fi
                 fi
             else
-                echo 'not-installed'
+                # Try to install and start
+                install_result=\$(ensure_pve_config_backup_running 2>&1)
+                if echo \"\$install_result\" | grep -q 'INSTALL_FAILED'; then
+                    echo 'INSTALL_FAILED'
+                else
+                    echo 'not-installed'
+                fi
             fi" < /dev/null 2>/dev/null)
         
         if [ -z "$status_output" ]; then
@@ -4774,12 +4987,46 @@ checkup_summary() {
         
         # Determine overall status
         local node_status="$PASSED"
-        if [ "$status_output" != "active (running)" ]; then
+        if [ "$status_output" = "INSTALL_FAILED" ]; then
+            node_status="$FAILED"
+            log_error "Node $node: Failed to ensure pve-config-backup is running - INSTALL_FAILED"
+            
+            # Check if we should ignore errors or show critical dialog
+            if [ "$IGNORE_ERRORS" != "true" ]; then
+                # Show critical error dialog
+                dialog --title "CRITICAL ERROR" \
+                       --msgbox "CRITICAL ERROR: pve-config-backup failure\n\nNode $node: Failed to ensure pve-config-backup is running - INSTALL_FAILED\n\nThis error indicates missing dependencies or installation issues.\npve-tools cannot continue safely without working VM config backup.\n\nTo ignore this error and continue, run the script with:\n    pve-tools --ignore-errors" 15 70
+                
+                # Set flag to indicate critical error occurred
+                CRITICAL_ERROR_OCCURRED=true
+            else
+                log_info "INSTALL_FAILED error ignored due to --ignore-errors flag"
+            fi
+        elif [ "$status_output" = "SERVICE_NOT_FOUND" ]; then
+            node_status="$FAILED"
+            log_error "Node $node: pve-config-backup service not found - likely uninstalled or repository disabled"
+            
+            # Check if we should ignore errors or show critical dialog
+            if [ "$IGNORE_ERRORS" != "true" ]; then
+                # Show critical error dialog
+                dialog --title "CRITICAL ERROR" \
+                       --msgbox "CRITICAL ERROR: pve-config-backup service not found\n\nNode $node: The pve-config-backup service could not be found.\n\nThis indicates the service is uninstalled or the repository is disabled.\npve-tools cannot continue safely without working VM config backup.\n\nPlease reinstall pve-config-backup or enable the repository.\n\nTo ignore this error and continue, run the script with:\n    pve-tools --ignore-errors" 16 70
+                
+                # Set flag to indicate critical error occurred
+                CRITICAL_ERROR_OCCURRED=true
+            else
+                log_info "SERVICE_NOT_FOUND error ignored due to --ignore-errors flag"
+            fi
+        elif [ "$status_output" != "active (running)" ]; then
             node_status="$STOPPED"
         fi
         
-        # Format with right-aligned status
-        local info_text="   ${node}:    ${status_output}"
+        # Format with right-aligned status - make display text user-friendly
+        local display_status="$status_output"
+        if [ "$status_output" = "SERVICE_NOT_FOUND" ]; then
+            display_status="service not found"
+        fi
+        local info_text="   ${node}:    ${display_status}"
         local text_length=${#info_text}
         local status_length=${#node_status}
         local total_width=94
@@ -4791,7 +5038,7 @@ checkup_summary() {
         
         printf "%s%*s%s\n" "$info_text" $padding "" "$node_status" >> "$cluster_temp_file"
         log_debug "Added to temp file: '$info_text' with status '$node_status'"
-        log_info "Node $node: pve-config-backup is $(echo "$status_output" | sed 's/active (running)/running/; s/inactive (dead)/not running/; s/not-installed/not installed/')"
+        log_info "Node $node: pve-config-backup is $(echo "$status_output" | sed 's/active (running)/running/; s/inactive (dead)/not running/; s/not-installed/not installed/; s/INSTALL_FAILED/installation failed/; s/SERVICE_NOT_FOUND/service not found/')"
     done < <(echo "$node_list")
     
     log_info "TESTING: Exited while loop. Total iterations: $node_count"
@@ -5197,6 +5444,13 @@ checkup_summary() {
         rm -f "$temp_file"
     fi
     
+    # Check if critical error occurred and exit if needed
+    if [ "$CRITICAL_ERROR_OCCURRED" = "true" ]; then
+        log_error "Critical error occurred during checkup - exiting pve-tools"
+        rm -f "$temp_file"
+        exit 1
+    fi
+    
     # Display the summary
     echo -e "$summary" > "$temp_file"
     dialog --title "System Checkup Summary" \
@@ -5387,10 +5641,23 @@ help_about_dialog() {
     help_text+="- Concurrent VM disk move count optimization\n"
     help_text+="- HA cluster size settings\n"
     help_text+="- OODP backup destination and scheduling configuration\n"
+    help_text+="\n"
+    help_text+="COMMAND-LINE ARGUMENTS:\n"
+    help_text+="-----------------------\n"
+    help_text+="help, -h         Display detailed help information and exit\n"
+    help_text+="debug            Enable debug mode with comprehensive error capture\n"
+    help_text+="ignore-errors    Continue execution even when encountering errors\n"
+    help_text+="test-update      Test update functionality with simulated version\n"
+    help_text+="version          Display version number only and exit\n"
+    help_text+="\n"
+    help_text+="Examples:\n"
+    help_text+="  ./pve-tools help        # Show detailed help\n"
+    help_text+="  ./pve-tools debug       # Run with debug mode enabled\n"
+    help_text+="  ./pve-tools version     # Show version only\n"
     
     dialog --keep-tite --title "Help & About pve-tools" \
            --ok-label "Close" \
-           --msgbox "$help_text" 35 80
+           --msgbox "$help_text" 40 85
     
     return 0
 }
@@ -18852,7 +19119,7 @@ cleanup_background_processes() {
     fi
     
     # Clean up temporary files
-    rm -f /tmp/pve-config-backup-status /tmp/pve-config-backup-check.log
+    rm -f /tmp/pve-config-backup-status /tmp/pve-config-backup-check.log /tmp/pve-config-backup-critical-error
 }
 
 # Install/update PveToolsDiskMigration Perl module
@@ -19822,11 +20089,18 @@ main() {
     
     log_info "Starting PVE Tools script"
     
+    # Clean up any leftover files from previous runs
+    rm -f /tmp/pve-config-backup-status /tmp/pve-config-backup-check.log /tmp/pve-config-backup-critical-error
+    log_debug "Cleaned up leftover temporary files from previous runs"
+    
     # Initialize debug error capture system if in debug mode
     init_debug_error_capture
     
     # Check and install all required dependencies
     check_and_install_dependencies
+    
+    # Show "Please wait..." dialog during initialization to prevent blank screen
+    dialog --infobox "Please wait..." 5 20 &
     
     # Initialize configuration
     if ! init_config; then
@@ -19867,16 +20141,97 @@ main() {
     # Start pve-config-backup check in background
     PVE_CONFIG_BACKUP_STATUS="checking"
     PVE_CONFIG_BACKUP_RESULT=""
+    log_info "Starting pve-config-backup check in background"
     (
+        log_info "Background process: Starting ensure_pve_config_backup_running"
         ensure_pve_config_backup_running > /tmp/pve-config-backup-check.log 2>&1
-        echo "COMPLETED:$(date '+%H:%M:%S')" > /tmp/pve-config-backup-status
+        backup_check_result=$?
+        log_info "Background process: ensure_pve_config_backup_running completed with exit code: $backup_check_result"
+        
+        if [ $backup_check_result -eq 127 ]; then
+            log_info "Background process: Setting CRITICAL_ERROR status"
+            echo "CRITICAL_ERROR:$(date '+%H:%M:%S')" > /tmp/pve-config-backup-status
+        else
+            log_info "Background process: Setting COMPLETED status"
+            echo "COMPLETED:$(date '+%H:%M:%S')" > /tmp/pve-config-backup-status
+        fi
     ) &
     PVE_CONFIG_BACKUP_PID=$!
     
     log_info "Started pve-config-backup check in background (PID: $PVE_CONFIG_BACKUP_PID)"
     
-    # Setup cleanup on exit
-    trap 'cleanup_background_processes' EXIT
+    # Wait for background process to complete (with reasonable timeout)
+    local wait_count=0
+    local max_wait=30  # Maximum 30 seconds
+    log_info "Waiting for pve-config-backup check to complete (max ${max_wait}s)"
+    
+    while [ $wait_count -lt $max_wait ]; do
+        # Check if background process is still running
+        if ! kill -0 "$PVE_CONFIG_BACKUP_PID" 2>/dev/null; then
+            log_info "Background pve-config-backup check completed after ${wait_count}s"
+            break
+        fi
+        
+        # Check if critical error file was created (early detection)
+        if [ -f /tmp/pve-config-backup-critical-error ]; then
+            log_info "Critical error detected during background check at ${wait_count}s"
+            break
+        fi
+        
+        sleep 1
+        wait_count=$((wait_count + 1))
+    done
+    
+    if [ $wait_count -ge $max_wait ]; then
+        log_info "Background pve-config-backup check timed out after ${max_wait}s - continuing anyway"
+    fi
+    
+    # Check for critical errors after background process completes
+    log_info "Checking for critical errors after background process completion"
+    if [ -f /tmp/pve-config-backup-critical-error ]; then
+        log_info "Critical error file detected: /tmp/pve-config-backup-critical-error"
+        log_error "Critical pve-config-backup error detected during startup"
+        
+        # Read error details
+        local error_details
+        error_details=$(cat /tmp/pve-config-backup-critical-error)
+        
+        # Show critical error dialog (startup errors need dialog too)
+        local dialog_msg="CRITICAL ERROR: pve-config-backup failure\n\n${error_details}\n\npve-tools cannot continue safely without working VM config backup.\nPlease resolve the dependency issues and restart pve-tools.\n\nTo ignore this error and continue, run the script with:\n    pve-tools --ignore-errors"
+        
+        # Check if ignore errors flag is set
+        if [ "$IGNORE_ERRORS" != "true" ]; then
+            dialog --title "CRITICAL ERROR" --msgbox "$dialog_msg" 20 80
+            
+            # Clean up background process
+            if kill -0 "$PVE_CONFIG_BACKUP_PID" 2>/dev/null; then
+                kill "$PVE_CONFIG_BACKUP_PID" 2>/dev/null
+            fi
+            
+            # Clean up temp files
+            rm -f /tmp/pve-config-backup-critical-error /tmp/pve-config-backup-status /tmp/pve-config-backup-check.log
+            
+            exit 127
+        else
+            log_info "Critical pve-config-backup error ignored due to --ignore-errors flag"
+            # Clean up and continue to main menu
+            rm -f /tmp/pve-config-backup-critical-error /tmp/pve-config-backup-status /tmp/pve-config-backup-check.log
+            # Kill background process if still running
+            if kill -0 "$PVE_CONFIG_BACKUP_PID" 2>/dev/null; then
+                kill "$PVE_CONFIG_BACKUP_PID" 2>/dev/null
+            fi
+            # Continue to main menu (don't exit)
+        fi
+    else
+        log_info "No critical error file found - proceeding to main menu setup"
+    fi
+    
+    # Setup cleanup on exit - moved here to avoid clearing critical error messages during startup
+    # Combined cleanup function that handles both terminal cleanup and background processes
+    trap 'cleanup_background_processes; cleanup_and_exit' EXIT
+    trap 'cleanup_background_processes; cleanup_and_exit' SIGINT
+    trap 'cleanup_background_processes; cleanup_and_exit' SIGTERM
+    trap 'cleanup_background_processes; cleanup_and_exit' SIGTSTP
     
     # Main application loop
     clear
@@ -19885,18 +20240,97 @@ main() {
     done
 }
 
+# Display command-line help information
+show_help() {
+    cat << EOF
+pve-tools - Proxmox VE administration tool with JovianDSS integration
+Version: $VERSION (Released: $RELEASE_DATE)
+
+USAGE:
+    $(basename "$0") [OPTIONS]
+    $(basename "$0") version
+    $(basename "$0") help
+    $(basename "$0") debug
+    $(basename "$0") ignore-errors
+    $(basename "$0") test-update
+
+DESCRIPTION:
+    A comprehensive menu-driven tool for managing NFS storage, VM/CT operations,
+    and system maintenance tasks in Proxmox VE environments with JovianDSS storage.
+
+OPTIONS:
+    help, -h            Display this help message and exit
+    debug               Enable debug mode with comprehensive error capture
+    ignore-errors       Continue execution even when encountering errors
+    test-update         Test update functionality with simulated version
+    version             Display version number only and exit
+
+FEATURES:
+    • NFS storage management and configuration
+    • VM/CT bulk operations (start, stop, reboot, migrate)
+    • Disk migration with snapshot preservation
+    • HA resource management integration  
+    • System tuning and optimization
+    • OODP backup task management
+    • Comprehensive logging and debugging
+
+REQUIREMENTS:
+    • Proxmox VE cluster environment
+    • Open-E JovianDSS storage system
+    • Dialog package for terminal interface
+    • REST API access to JovianDSS
+
+LOG FILES:
+    Main log: /var/log/pve-tools/pve-tools.log
+    Config:   /etc/pve-tools/config.conf
+
+For more detailed help, run the tool and select "Help & About pve-tools" from the menu.
+
+EOF
+}
+
 # Only run main if this script is executed directly (not sourced)
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
-    # Handle version argument before any terminal operations
-    if [ "$1" = "version" ]; then
-        VERSION_MODE=true
-        echo "$VERSION"
-        exit 0
-    fi
+    # Parse command-line arguments
+    IGNORE_ERRORS=false
     
-    # Handle test-update argument for testing update functionality
-    if [ "$1" = "--test-update" ]; then
-        TEST_UPDATE_MODE=true
+    # Process all arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            version)
+                VERSION_MODE=true
+                echo "$VERSION"
+                exit 0
+                ;;
+            help|-h)
+                show_help
+                exit 0
+                ;;
+            debug)
+                DEBUG_MODE=true
+                echo "Debug mode enabled - comprehensive error capture activated"
+                shift
+                ;;
+            ignore-errors)
+                IGNORE_ERRORS=true
+                echo "Ignore errors mode enabled"
+                shift
+                ;;
+            test-update)
+                TEST_UPDATE_MODE=true
+                shift
+                break  # Handle test-update separately below
+                ;;
+            *)
+                echo "Unknown argument: $1"
+                echo "Use 'help' for usage information"
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Handle test-update mode if enabled
+    if [ "$TEST_UPDATE_MODE" = "true" ]; then
         # Initialize logging for test
         init_logging
         log_info "Running in TEST UPDATE MODE"
